@@ -1,0 +1,6 @@
+rules:
+  - id: headless-eval-test
+    message: Dynamic eval detected by the headless validation fixture.
+    severity: ERROR
+    languages: [javascript]
+    pattern: eval(...)

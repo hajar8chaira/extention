@@ -1,0 +1,9 @@
+.vscode/**
+.gitignore
+test/**
+scripts/**
+coverage/**
+*.log
+security-reports/**
+outputs/**
+work/**

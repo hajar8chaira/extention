@@ -1,0 +1,34 @@
+rules:
+  - id: company.javascript.no-dynamic-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: L’usage de eval permet l’exécution de code dynamique. Utiliser un parseur ou une table de fonctions autorisées.
+    patterns:
+      - pattern: eval(...)
+
+  - id: company.javascript.no-hardcoded-jwt-secret
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Le secret JWT doit provenir d’un gestionnaire de secrets ou d’une variable d’environnement.
+    patterns:
+      - pattern-either:
+          - pattern: jwt.sign($DATA, "...")
+          - pattern: jwt.verify($DATA, "...")
+
+  - id: company.express.validate-redirect-target
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Une redirection construite directement depuis la requête doit être validée par une allowlist locale.
+    patterns:
+      - pattern-either:
+          - pattern: $RES.redirect($REQ.query.$PARAM)
+          - pattern: $RES.redirect($REQ.body.$PARAM)
+
+  - id: company.javascript.no-shell-from-request
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Ne jamais transmettre une entrée HTTP directement à une commande système.
+    patterns:
+      - pattern-either:
+          - pattern: child_process.exec($REQ.query.$PARAM, ...)
+          - pattern: child_process.exec($REQ.body.$PARAM, ...)

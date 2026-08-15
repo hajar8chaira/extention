@@ -1,0 +1,41 @@
+.runtime-python/
+backend/data/
+__pycache__/
+.pytest_cache/
+security-reports/
+
+# Node / builds
+node_modules/
+coverage/
+dist/
+out/
+.vscode-test/
+*.log
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python envs
+.venv/
+venv/
+
+# OS/editor temp
+.DS_Store
+Thumbs.db
+
+# Local scanner/model artifacts
+models/
+scanner-tools/*/bin/
+scanner-tools/*/*.exe
+scanner-tools/*/*.zip

@@ -1,0 +1,16 @@
+title = "Security Center company rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "company-internal-api-key"
+description = "Internal company API key"
+regex = '''(?i)INTERNAL_API_KEY[_-]?[A-Z0-9]{16,64}'''
+keywords = ["INTERNAL_API_KEY"]
+
+[[rules]]
+id = "company-service-token"
+description = "Internal service token"
+regex = '''SC_SERVICE_[A-Za-z0-9_-]{24,80}'''
+keywords = ["SC_SERVICE_"]

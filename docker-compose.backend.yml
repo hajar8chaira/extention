@@ -1,0 +1,17 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    image: security-center/backend:local
+    container_name: security-center-backend
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      SECURITY_CENTER_API_KEY: "${SECURITY_CENTER_API_KEY:-}"
+    volumes:
+      - security-center-data:/data
+    restart: unless-stopped
+
+volumes:
+  security-center-data:
+    name: security-center-data

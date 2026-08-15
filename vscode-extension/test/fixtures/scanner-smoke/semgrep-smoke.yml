@@ -1,0 +1,6 @@
+rules:
+  - id: security-center-smoke-eval
+    message: Dynamic eval detected by smoke test
+    severity: WARNING
+    languages: [javascript]
+    pattern: eval(...)

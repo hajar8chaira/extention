@@ -1,0 +1,8 @@
+Security Center UI backup before dashboard/status-bar redesign
+Created: 2026-08-14T18:56:07.8331842+01:00
+Scope: presentation files only
+src/extension.js
+src/dashboard.js
+src/live/liveStatus.js
+test/dashboard.test.js
+test/live-status.test.js
