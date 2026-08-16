@@ -12,6 +12,7 @@ pfa-start/
 │   └── juice-shop/            Code source OWASP Juice Shop
 ├── docker-compose.backend.yml
 ├── docker-compose.security-lab.yml
+├── docker-compose.sonarqube.yml
 ├── PROJECT_SCOPE.md
 └── SECURITY_LAB.md
 ```
@@ -47,6 +48,30 @@ docker compose -f docker-compose.security-lab.yml up -d
 ```
 
 Juice Shop est accessible uniquement sur `http://127.0.0.1:3000`.
+
+## SonarQube
+
+SonarQube est désactivé par défaut : il exige un serveur joignable et un jeton. Activez-le avec `securityCenter.sonar.enabled`.
+
+**Serveur SonarQube Community Build local (développement)**
+
+```powershell
+docker compose -f docker-compose.sonarqube.yml up -d
+```
+
+Le serveur écoute sur `http://127.0.0.1:9000` et met une à deux minutes à démarrer. Connectez-vous avec le compte `admin` initial, changez le mot de passe imposé par SonarQube, puis créez un jeton dans **Mon compte > Sécurité**. Enregistrez-le avec **Security Center: Configurer le jeton SonarQube** : il est conservé dans le SecretStorage de VS Code et n’est jamais écrit dans `security-center.yml`, `settings.json`, `sonar-project.properties`, les journaux ni les rapports.
+
+**Option A — SonarScanner CLI local**
+
+Vérifiez l’installation avec `sonar-scanner --version`. **Security Center: Vérifier la configuration SonarQube** affiche l’état du serveur, la version du scanner détectée et la présence du jeton.
+
+**Option B — SonarScanner via Docker**
+
+Aucune installation locale n’est nécessaire : l’image `sonarsource/sonar-scanner-cli` est utilisée automatiquement lorsque le CLI local est absent. Le workspace est monté en lecture seule et le répertoire de travail du scanner reste hors du dépôt. Un serveur SonarQube reste requis dans les deux cas.
+
+Le mode `securityCenter.sonar.mode` accepte `auto` (CLI local puis Docker), `local` ou `docker`, comme les autres scanners. `securityCenter.sonar.hostUrl` n’est lu que depuis les paramètres VS Code : un `security-center.yml` versionné ne peut pas rediriger l’analyse ni le jeton vers un autre serveur. En headless, le jeton provient uniquement de la variable d’environnement `SONAR_TOKEN`.
+
+Si le dépôt contient déjà un `sonar-project.properties`, il fait autorité et n’est pas modifié. Sinon Security Center construit les propriétés minimales à la volée, sans créer de fichier dans le projet.
 
 ## Burp Suite et revalidation
 
@@ -88,7 +113,11 @@ scanners:
   gitleaks: true
   trivy: true
   osv: true
+  sonarqube: true
   zap: true
+sonarqube:
+  mode: auto
+  include_code_smells: false
 policy:
   fail_on: HIGH
   max_active: 0

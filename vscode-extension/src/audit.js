@@ -475,6 +475,8 @@ function renderAuditLogHtml(events, nonce) {
           scanners.add('Trivy');
         } else if (e.action.includes('OSV')) {
           scanners.add('OSV-Scanner');
+        } else if (e.action.includes('SonarQube')) {
+          scanners.add('SonarQube');
         }
       });
 
@@ -582,6 +584,8 @@ function renderAuditLogHtml(events, nonce) {
           } else if (e.action.includes('Trivy') && scannerVal === 'Trivy') {
             matchesScanner = true;
           } else if (e.action.includes('OSV') && scannerVal === 'OSV-Scanner') {
+            matchesScanner = true;
+          } else if (e.action.includes('SonarQube') && scannerVal === 'SonarQube') {
             matchesScanner = true;
           }
           if (!matchesScanner) return false;

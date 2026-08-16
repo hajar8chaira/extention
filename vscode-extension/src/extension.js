@@ -10,13 +10,17 @@ const { runTrivy, generateSbom } = require('./trivy');
 const { runOsv } = require('./osv');
 const { runZap } = require('./zap');
 const { detectLocalZap } = require('./zap-local');
-const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeZapOutput, normalizeOsvOutput, deduplicateFindings } = require('./findings');
+const { ensureDockerAvailable } = require('./docker');
+const { runSonarQube, detectLocalScanner: detectLocalSonarScanner } = require('./sonarqube');
+const { checkServerStatus: checkSonarServer, validateToken: validateSonarToken, normalizeHostUrl: normalizeSonarHostUrl } = require('./sonarqube-api');
+const { SERVER_URL: SONAR_LOCAL_SERVER_URL, inspectLocalServer, localServerState, startLocalServer, stopLocalServer, waitForLocalServer } = require('./sonarqube-server');
+const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeZapOutput, normalizeOsvOutput, normalizeSonarQubeOutput, deduplicateFindings } = require('./findings');
 const { groupFindings, summarizeFindings } = require('./tree');
 const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpStatus, updateFindingStatus, listAuditEvents, createAuditEvent, listScans, getScan, requestText, scanExportUrl } = require('./backend');
 const { CACHE_KEY: LOCAL_SCAN_CACHE_KEY, createLocalScanCache, restoreLocalScanCache } = require('./local-scan-cache');
 const { createExecution, snapshotFromLegacy, normalizeSnapshot, beginRefresh, updateRefresh, completeExecution, projectSnapshot } = require('./security-snapshot');
 const { HISTORY_KEY: LOCAL_SCAN_HISTORY_KEY, appendLocalHistory, renderScanHistoryHtml } = require('./scan-history-page');
-const { buildDashboardModel, renderDashboardHtml, buildSafeHttpPreview, linkedFindingsForScenario } = require('./dashboard');
+const { buildDashboardModel, renderDashboardHtml, buildSafeHttpPreview, linkedFindingsForScenario, summarizeScannerError } = require('./dashboard');
 const { normalizeTargetUrl, checkTargetReachability } = require('./dynamic-target');
 const { renderFindingDetailsHtml } = require('./finding-details');
 const { correlateFindings } = require('./correlation');
@@ -56,10 +60,34 @@ const { SentinelEditorPresence } = require('./live/sentinelEditorPresence');
 const { LiveSecurityPageProvider } = require('./live/livePage');
 const { ThemeController } = require('./theme-controller');
 const { ScannerToolManager, TOOLS: MANAGED_SCANNER_TOOLS } = require('./scanner-tool-manager');
-const { renderScannerSetupHtml } = require('./scanner-setup-page');
+const { renderScannerSetupHtml, sonarDiagnosis } = require('./scanner-setup-page');
+const { SCANNER_RUNTIMES, diagnoseScanner, normalizeMode } = require('./scanner-diagnostics');
 const execFileAsync = promisify(execFile);
+const SONAR_TOKEN_SECRET_KEY = 'securityCenter.sonar.token';
+// Scanners that can be switched off from the settings, so the dashboard can
+// report « Désactivé » instead of leaving them silently absent.
+const OPTIONAL_SCANNERS = Object.freeze([
+  ['Gitleaks', 'gitleaks.enabled', true],
+  ['Trivy', 'trivy.enabled', true],
+  ['OSV-Scanner', 'osv.enabled', true],
+  ['SonarQube', 'sonar.enabled', false],
+  ['ZAP', 'zap.enabled', true]
+]);
+
+function configuredDisabledScanners() {
+  try {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    return OPTIONAL_SCANNERS.filter(([, key, fallback]) => cfg.get(key, fallback) !== true).map(([tool]) => tool);
+  } catch { return []; }
+}
+
+function cfgHostUrlOrEmpty() {
+  try { return vscode.workspace.getConfiguration('securityCenter').get('sonar.hostUrl', '') || ''; }
+  catch { return ''; }
+}
 
 let liveSecurityService;
+let sonarServerBusy = false;
 
 function burpExecutableCandidates() {
   if (process.platform !== 'win32') return [];
@@ -180,7 +208,7 @@ class DashboardProvider {
         return;
       }
       if (message?.type === 'command' && allowed.has(message.command)) this.onCommand(message.command);
-      if (message?.type === 'retryScanner' && ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'ZAP'].includes(message.tool)) {
+      if (message?.type === 'retryScanner' && ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'].includes(message.tool)) {
         this.onCommand('securityCenter.retryScanner', message.tool);
       }
       if (message?.type === 'finding' && Number.isInteger(message.index)) {
@@ -276,6 +304,7 @@ class DashboardProvider {
   setData(findings, scanners, options) {
     this.model = buildDashboardModel(findings, scanners, {
       ...options,
+      disabledScanners: options?.disabledScanners ?? configuredDisabledScanners(),
       scanHistory: this.getLocalHistory()
     });
     this.onModelChange?.(this.model);
@@ -354,7 +383,9 @@ class FindingsProvider {
         : triageStatus === 'confirmed' ? 'verified-filled'
           : finding.severity === 'error' ? 'error' : finding.severity === 'warning' ? 'warning' : 'info';
     node.iconPath = new vscode.ThemeIcon(findingIcon);
-    if (finding.tool === 'ZAP' || finding.tool === 'OSV-Scanner' || (finding.tool === 'Trivy' && (!finding.absolutePath || !fs.existsSync(finding.absolutePath)))) {
+    if (finding.tool === 'ZAP' || finding.tool === 'OSV-Scanner'
+      || (finding.tool === 'SonarQube' && !finding.absolutePath)
+      || (finding.tool === 'Trivy' && (!finding.absolutePath || !fs.existsSync(finding.absolutePath)))) {
       node.command = { command: 'securityCenter.showFindingDetails', title: 'Afficher les détails', arguments: [finding] };
     } else if (finding.absolutePath && fs.existsSync(finding.absolutePath)) {
       node.command = { command: 'securityCenter.openFindingCode', title: 'Ouvrir le code', arguments: [finding] };
@@ -1062,10 +1093,100 @@ async function activate(context) {
   let scannerSetupConfirmation;
   let scannerInstallationRunning = false;
   const scannerSetupOperations = {};
+  /**
+   * Real SonarQube diagnosis for the setup page. Never returns the token
+   * itself, only whether one is stored.
+   */
+  async function collectSonarDiagnostic() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const hostUrl = cfg.get('sonar.hostUrl', 'http://127.0.0.1:9000');
+    const diagnostic = {
+      enabled: cfg.get('sonar.enabled', false),
+      mode: cfg.get('sonar.mode', 'auto'),
+      hostUrl,
+      tokenConfigured: Boolean(await context.secrets.get(SONAR_TOKEN_SECRET_KEY)),
+      busy: sonarServerBusy,
+      scannerVersion: '',
+      dockerAvailable: false,
+      serverOnline: null,
+      serverVersion: '',
+      serverMessage: ''
+    };
+    const [scanner, docker] = await Promise.all([
+      detectLocalSonarScanner({ timeoutMs: 20000 }).catch(() => null),
+      ensureDockerAvailable(8000).then(() => true).catch(() => false)
+    ]);
+    diagnostic.scannerVersion = scanner?.version || '';
+    diagnostic.scannerPath = scanner?.path || '';
+    diagnostic.dockerAvailable = docker;
+
+    // A managed container that already exists classifies the server as local
+    // even before the user made an explicit choice.
+    const containerStatus = docker ? await inspectLocalServer({}) : null;
+    const configuredType = cfg.get('sonar.serverType', '');
+    // A configured URL pointing at the managed container is the local server,
+    // whatever the stored type says. Nothing is deleted or recreated.
+    const pointsAtManagedServer = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):9000\/?$/i.test(String(hostUrl).trim());
+    diagnostic.serverType = containerStatus && pointsAtManagedServer
+      ? 'local'
+      : configuredType || (containerStatus ? 'local' : '');
+    let health = null;
+    try {
+      health = await checkSonarServer(hostUrl, { timeoutMs: 8000 });
+      diagnostic.serverOnline = true;
+      diagnostic.serverVersion = health.version;
+    } catch (error) {
+      diagnostic.serverOnline = false;
+      diagnostic.serverMessage = summarizeScannerError(error.message);
+    }
+    if (diagnostic.serverType === 'local') {
+      diagnostic.localServerState = localServerState({ dockerAvailable: docker, containerStatus, health });
+    }
+    // The token is only probed when a server actually answers.
+    if (diagnostic.tokenConfigured && diagnostic.serverOnline) {
+      diagnostic.authenticationValid = await validateSonarToken(hostUrl, await context.secrets.get(SONAR_TOKEN_SECRET_KEY) || '', { timeoutMs: 8000 }).catch(() => null);
+    }
+    // The versioned policy has the final say on what the pipeline runs.
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (folder) {
+      const policy = await loadProjectPolicy(folder.uri.fsPath).catch(() => null);
+      diagnostic.blockedByProjectPolicy = policy?.scanners?.SonarQube === false;
+    }
+    diagnostic.effectiveEnabled = diagnostic.enabled && !diagnostic.blockedByProjectPolicy;
+    return diagnostic;
+  }
+  /**
+   * Enriches each managed scanner status with the mode actually resolved by its
+   * own runner, so the page can never disagree with the analysis pipeline.
+   */
+  async function withScannerDiagnostics(statuses) {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+    return Promise.all(statuses.map(async (status) => {
+      const runtime = SCANNER_RUNTIMES[status.id];
+      if (!runtime) return status;
+      try {
+        const diagnostic = await diagnoseScanner(status.id, {
+          configuredMode: cfg.get(runtime.settingKey, 'auto'),
+          enabled: runtime.enabledKey ? cfg.get(runtime.enabledKey, true) : true,
+          workspacePath,
+          status
+        });
+        return { ...status, diagnostic };
+      } catch { return status; }
+    }));
+  }
   async function renderScannerSetup() {
     if (!scannerSetupPanel) return;
-    const statuses = await scannerToolManager.statuses();
-    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation);
+    const [rawStatuses, sonar] = await Promise.all([scannerToolManager.statuses(), collectSonarDiagnostic()]);
+    // SonarScanner is presented inside the SonarQube card, not as a fifth
+    // managed scanner, so its status and install progress are routed there.
+    const sonarScannerStatus = rawStatuses.find((item) => item.id === 'sonarscanner');
+    sonar.managedScannerInstalled = Boolean(sonarScannerStatus?.installed);
+    sonar.installing = scannerSetupOperations.sonarscanner;
+    const statuses = await withScannerDiagnostics(rawStatuses.filter((item) => item.id !== 'sonarscanner'));
+    if (!scannerSetupPanel) return;
+    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar);
   }
   async function installManagedScanners(ids) {
     const tools = ids.filter((id) => MANAGED_SCANNER_TOOLS[id]);
@@ -1110,7 +1231,20 @@ async function activate(context) {
           await renderScannerSetup();
         }
         if (message?.type === 'requestInstallAll' && !scannerInstallationRunning) {
-          const missing = (await scannerToolManager.statuses()).filter((item) => !item.installed).map((item) => item.id);
+          const cfg = vscode.workspace.getConfiguration('securityCenter');
+          const missing = (await scannerToolManager.statuses())
+            .filter((item) => {
+              if (item.installed) return false;
+              // SonarScanner is only "missing" when SonarQube is enabled and
+              // explicitly pinned to Local. Auto keeps Docker as a valid
+              // fallback, and Docker never needs the local CLI.
+              if (item.id === 'sonarscanner') {
+                return cfg.get('sonar.enabled', false) && cfg.get('sonar.mode', 'auto') === 'local';
+              }
+              // A scanner pinned to Docker does not need a local binary.
+              return cfg.get(SCANNER_RUNTIMES[item.id]?.settingKey || '', 'auto') !== 'docker';
+            })
+            .map((item) => item.id);
           if (missing.length) {
             scannerSetupConfirmation = { ids: missing, labels: missing.map((id) => MANAGED_SCANNER_TOOLS[id].label), destination: scannerToolManager.root };
             await renderScannerSetup();
@@ -1125,6 +1259,158 @@ async function activate(context) {
         if (message?.type === 'setAuto' && MANAGED_SCANNER_TOOLS[message.tool]) {
           await vscode.workspace.getConfiguration('securityCenter').update(`${message.tool}.command`, 'auto', vscode.ConfigurationTarget.Global).catch(() => {});
           vscode.window.showInformationMessage(`${MANAGED_SCANNER_TOOLS[message.tool].label} utilisera le mode local automatique.`);
+          await renderScannerSetup();
+        }
+        // Writes the historical `<tool>.command` setting the runners already
+        // read, then re-runs the diagnostic so the card shows the mode that
+        // was actually selected.
+        if (message?.type === 'setScannerMode' && SCANNER_RUNTIMES[message.tool] && ['auto', 'local', 'docker'].includes(message.mode)) {
+          const runtime = SCANNER_RUNTIMES[message.tool];
+          const label = MANAGED_SCANNER_TOOLS[message.tool]?.label || message.tool;
+          await vscode.workspace.getConfiguration('securityCenter').update(runtime.settingKey, message.mode, vscode.ConfigurationTarget.Global).catch(() => {});
+          await renderScannerSetup();
+          const diagnostic = await diagnoseScanner(message.tool, {
+            configuredMode: message.mode,
+            workspacePath: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd()
+          }).catch(() => null);
+          if (diagnostic?.resolvedMode) vscode.window.showInformationMessage(`${label} : mode ${normalizeMode(message.mode) === 'auto' ? 'Auto' : diagnostic.configuredModeLabel} enregistré — exécution ${diagnostic.resolvedModeLabel}.`);
+          else vscode.window.showWarningMessage(`${label} : mode enregistré, mais ${diagnostic?.hint || 'aucun moteur d’exécution disponible'}.`);
+        }
+        // SonarQube is never installed by the managed downloader: only its
+        // execution mode and its token can be changed from this page.
+        if (message?.type === 'setSonarMode' && ['auto', 'local', 'docker'].includes(message.mode)) {
+          await vscode.workspace.getConfiguration('securityCenter').update('sonar.mode', message.mode, vscode.ConfigurationTarget.Global).catch(() => {});
+          vscode.window.showInformationMessage(`SonarQube utilisera le mode ${message.mode}.`);
+          await renderScannerSetup();
+        }
+        if (message?.type === 'configureSonarToken') {
+          await vscode.commands.executeCommand('securityCenter.configureSonarToken');
+          await renderScannerSetup();
+        }
+        // Enabling and disabling write the very settings the analysis pipeline
+        // reads, so the page and the orchestrator can never disagree.
+        if (message?.type === 'setScannerEnabled' && SCANNER_RUNTIMES[message.tool]?.enabledKey && typeof message.enabled === 'boolean') {
+          const runtime = SCANNER_RUNTIMES[message.tool];
+          const label = MANAGED_SCANNER_TOOLS[message.tool]?.label || message.tool;
+          await vscode.workspace.getConfiguration('securityCenter').update(runtime.enabledKey, message.enabled, vscode.ConfigurationTarget.Global).catch(() => {});
+          await renderScannerSetup();
+          dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+          vscode.window.showInformationMessage(`${label} ${message.enabled ? 'sera inclus' : 'ne sera plus inclus'} dans les prochaines analyses.`);
+        }
+        // Choosing a server type never starts anything by itself.
+        if (message?.type === 'chooseSonarServer' && ['local', 'existing'].includes(message.serverType)) {
+          const configuration = vscode.workspace.getConfiguration('securityCenter');
+          if (message.serverType === 'local') {
+            await configuration.update('sonar.serverType', 'local', vscode.ConfigurationTarget.Global).catch(() => {});
+            await configuration.update('sonar.hostUrl', SONAR_LOCAL_SERVER_URL, vscode.ConfigurationTarget.Global).catch(() => {});
+          } else {
+            const entered = await vscode.window.showInputBox({
+              title: 'Adresse du serveur SonarQube existant',
+              prompt: 'Exemple : https://sonarqube.company.com. Security Center n’utilise qu’une URL et un jeton, jamais de compte administrateur.',
+              value: cfgHostUrlOrEmpty(),
+              ignoreFocusOut: true,
+              validateInput: (value) => { try { normalizeSonarHostUrl(value); return undefined; } catch (error) { return error.message; } }
+            });
+            if (entered === undefined) return;
+            await configuration.update('sonar.hostUrl', normalizeSonarHostUrl(entered), vscode.ConfigurationTarget.Global).catch(() => {});
+            await configuration.update('sonar.serverType', 'existing', vscode.ConfigurationTarget.Global).catch(() => {});
+          }
+          // Switching server never deletes the local server data.
+          await renderScannerSetup();
+        }
+        if (message?.type === 'configureSonarHostUrl') {
+          const entered = await vscode.window.showInputBox({
+            title: 'Adresse du serveur SonarQube',
+            value: cfgHostUrlOrEmpty(),
+            ignoreFocusOut: true,
+            validateInput: (value) => { try { normalizeSonarHostUrl(value); return undefined; } catch (error) { return error.message; } }
+          });
+          if (entered === undefined) return;
+          await vscode.workspace.getConfiguration('securityCenter').update('sonar.hostUrl', normalizeSonarHostUrl(entered), vscode.ConfigurationTarget.Global).catch(() => {});
+          await renderScannerSetup();
+        }
+        if (message?.type === 'openSonarServer') {
+          const target = cfgHostUrlOrEmpty();
+          if (target) await vscode.env.openExternal(vscode.Uri.parse(target));
+        }
+        if (message?.type === 'startSonarServer' && !sonarServerBusy) {
+          const status = await inspectLocalServer({});
+          const confirmed = await vscode.window.showWarningMessage(
+            status ? 'Démarrer le serveur SonarQube local ?' : 'Créer et démarrer le serveur SonarQube local ?',
+            {
+              modal: true,
+              detail: `Conteneur : security-center-sonarqube (image sonarqube:community)\nPort : 127.0.0.1:9000 uniquement\nVolumes persistants : données, journaux, extensions\nAucun privilège Docker supplémentaire, aucun socket Docker monté.\n\nSonarQube consomme environ 2 Go de mémoire.`
+            },
+            'Démarrer'
+          );
+          if (confirmed !== 'Démarrer') return;
+          sonarServerBusy = true;
+          await renderScannerSetup();
+          try {
+            await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Security Center : serveur SonarQube local', cancellable: true }, async (progress, token) => {
+              const controller = new AbortController();
+              token.onCancellationRequested(() => controller.abort());
+              progress.report({ message: status ? 'Démarrage du conteneur…' : 'Création du conteneur…' });
+              await startLocalServer({});
+              progress.report({ message: 'Attente de la disponibilité du serveur…' });
+              const outcome = await waitForLocalServer({
+                checkStatus: () => checkSonarServer(SONAR_LOCAL_SERVER_URL, { timeoutMs: 5000 }),
+                signal: controller.signal,
+                onProgress: (state) => progress.report({ message: state === 'initializing' ? 'Initialisation de SonarQube…' : 'Démarrage…' })
+              });
+              if (outcome.state !== 'ready') {
+                throw new Error(outcome.reason === 'cancelled'
+                  ? 'Attente annulée : le serveur continue de démarrer en arrière-plan.'
+                  : 'Le serveur SonarQube n’a pas répondu dans le délai imparti. Réessayez « Revérifier » dans quelques instants.');
+              }
+            });
+            const action = await vscode.window.showInformationMessage(
+              'Serveur SonarQube local prêt sur http://127.0.0.1:9000. Terminez la configuration initiale dans SonarQube, créez un jeton, puis revenez ici.',
+              'Ouvrir SonarQube', 'Configurer le token'
+            );
+            if (action === 'Ouvrir SonarQube') await vscode.env.openExternal(vscode.Uri.parse(SONAR_LOCAL_SERVER_URL));
+            if (action === 'Configurer le token') await vscode.commands.executeCommand('securityCenter.configureSonarToken');
+          } catch (error) {
+            vscode.window.showWarningMessage(`Security Center : ${summarizeScannerError(error.message)}`);
+          } finally {
+            sonarServerBusy = false;
+            await renderScannerSetup();
+          }
+        }
+        // Stop only. Volumes are never removed here.
+        if (message?.type === 'stopSonarServer' && !sonarServerBusy) {
+          const confirmed = await vscode.window.showWarningMessage(
+            'Arrêter le serveur SonarQube local ?',
+            { modal: true, detail: 'Le conteneur est arrêté, pas supprimé. Les données, journaux et extensions sont conservés et seront retrouvés au prochain démarrage.' },
+            'Arrêter'
+          );
+          if (confirmed !== 'Arrêter') return;
+          sonarServerBusy = true;
+          await renderScannerSetup();
+          try {
+            const result = await stopLocalServer({});
+            vscode.window.showInformationMessage(result.action === 'stopped'
+              ? 'Serveur SonarQube local arrêté. Les données sont conservées.'
+              : 'Le serveur SonarQube local n’était pas démarré.');
+          } catch (error) {
+            vscode.window.showWarningMessage(`Security Center : ${summarizeScannerError(error.message)}`);
+          } finally {
+            sonarServerBusy = false;
+            await renderScannerSetup();
+          }
+        }
+        if (message?.type === 'setSonarEnabled' && typeof message.enabled === 'boolean') {
+          await vscode.workspace.getConfiguration('securityCenter').update('sonar.enabled', message.enabled, vscode.ConfigurationTarget.Global).catch(() => {});
+          // Re-render first so the new state is visible immediately, then let
+          // the diagnostic report what is still missing without ever
+          // switching SonarQube back off.
+          await renderScannerSetup();
+          dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+          if (!message.enabled) return vscode.window.showInformationMessage('SonarQube ne sera plus exécuté lors des prochaines analyses.');
+          const diagnosis = sonarDiagnosis(await collectSonarDiagnostic());
+          vscode.window.showInformationMessage(diagnosis.state === 'ready'
+            ? `SonarQube activé — ${diagnosis.label}.`
+            : `SonarQube activé, mais ${diagnosis.label} : ${diagnosis.hint}`);
         }
       });
       scannerSetupPanel.onDidDispose(() => { scannerSetupPanel = undefined; scannerSetupConfirmation = undefined; });
@@ -1162,6 +1448,52 @@ async function activate(context) {
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showLogs', () => {
     scanLog.show(true);
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureSonarToken', async () => {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const hostUrl = cfg.get('sonar.hostUrl', 'http://127.0.0.1:9000');
+    const value = await vscode.window.showInputBox({
+      title: `Jeton SonarQube pour ${hostUrl}`,
+      prompt: 'Généré dans SonarQube via Mon compte > Sécurité. Conservé par VS Code SecretStorage, jamais dans le projet. Laissez vide pour le supprimer.',
+      password: true,
+      ignoreFocusOut: true
+    });
+    if (value === undefined) return;
+    const token = value.trim();
+    if (!token) {
+      await context.secrets.delete(SONAR_TOKEN_SECRET_KEY);
+      return vscode.window.showInformationMessage('Security Center : jeton SonarQube supprimé du stockage sécurisé.');
+    }
+    await context.secrets.store(SONAR_TOKEN_SECRET_KEY, token);
+    // The token value is never echoed back, only the reachability of the server.
+    try {
+      const server = await checkSonarServer(hostUrl, { timeoutMs: 8000 });
+      vscode.window.showInformationMessage(`Security Center : jeton SonarQube enregistré. Serveur ${hostUrl} disponible (version ${server.version || 'inconnue'}).`);
+    } catch (error) {
+      vscode.window.showWarningMessage(`Security Center : jeton enregistré, mais ${summarizeScannerError(error.message)}`);
+    }
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.checkSonarQube', async () => {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const hostUrl = cfg.get('sonar.hostUrl', 'http://127.0.0.1:9000');
+    const hasToken = Boolean(await context.secrets.get(SONAR_TOKEN_SECRET_KEY));
+    const local = await detectLocalSonarScanner({ timeoutMs: 20000 });
+    let serverState = '';
+    try {
+      const server = await checkSonarServer(hostUrl, { timeoutMs: 8000 });
+      serverState = `serveur disponible (version ${server.version || 'inconnue'})`;
+    } catch (error) {
+      serverState = summarizeScannerError(error.message);
+    }
+    const scannerState = local ? `SonarScanner local ${local.version}` : 'SonarScanner local absent — Docker sera utilisé';
+    const tokenState = hasToken ? 'jeton enregistré' : 'aucun jeton enregistré';
+    const action = await vscode.window.showInformationMessage(
+      `Security Center — SonarQube : ${serverState} • ${scannerState} • ${tokenState}.`,
+      ...(hasToken ? [] : ['Configurer le jeton'])
+    );
+    if (action === 'Configurer le jeton') await vscode.commands.executeCommand('securityCenter.configureSonarToken');
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureBackendApiKey', async () => {
@@ -1667,6 +1999,7 @@ async function activate(context) {
       ...(cfg.get('gitleaks.enabled', true) ? [{ label: 'Gitleaks', description: 'Détection de secrets' }] : []),
       ...(cfg.get('trivy.enabled', true) ? [{ label: 'Trivy', description: 'Dépendances, images et configurations' }] : []),
       ...(cfg.get('osv.enabled', true) ? [{ label: 'OSV-Scanner', description: 'Validation complémentaire des dépendances' }] : []),
+      ...(cfg.get('sonar.enabled', false) ? [{ label: 'SonarQube', description: 'Qualité et sécurité du code via le serveur SonarQube' }] : []),
       ...(cfg.get('zap.enabled', true) ? [{ label: 'ZAP', description: 'Analyse dynamique passive de la cible locale' }] : [])
     ];
     const selected = await vscode.window.showQuickPick(available, {
@@ -1679,7 +2012,7 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.retryScanner', async (tool) => {
-    const supported = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'ZAP'];
+    const supported = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'];
     if (!supported.includes(tool)) return;
     if (tool === 'ZAP') return vscode.commands.executeCommand('securityCenter.scanZap');
     await vscode.commands.executeCommand('securityCenter.scanWorkspace', [tool]);
@@ -1961,6 +2294,28 @@ async function activate(context) {
           execute: () => runOsv({ workspacePath: analysisPath, mode: cfg.get('osv.command', 'auto'), timeoutMs, signal: abortController.signal }),
           normalize: normalizeOsvOutput
         });
+        // SonarQube analyses the whole project against a server, so it is
+        // skipped on incremental runs where only changed files are copied.
+        if (cfg.get('sonar.enabled', false) && !incrementalFiles.length) {
+          const sonarToken = await context.secrets.get(SONAR_TOKEN_SECRET_KEY) || '';
+          scans.push({
+            tool: 'SonarQube',
+            execute: () => runSonarQube({
+              workspacePath: analysisPath,
+              mode: projectPolicy?.sonarMode || cfg.get('sonar.mode', 'auto'),
+              // The host URL never comes from the versioned policy file.
+              hostUrl: cfg.get('sonar.hostUrl', 'http://127.0.0.1:9000'),
+              projectKey: cfg.get('sonar.projectKey', ''),
+              token: sonarToken,
+              includeCodeSmells: projectPolicy?.sonarIncludeCodeSmells ?? cfg.get('sonar.includeCodeSmells', false),
+              exclusions: projectPolicy?.exclusions.global_files || [],
+              timeoutMs: Math.max(timeoutMs, cfg.get('sonar.timeoutSeconds', 900) * 1000),
+              taskTimeoutMs: cfg.get('sonar.timeoutSeconds', 900) * 1000,
+              signal: abortController.signal
+            }),
+            normalize: normalizeSonarQubeOutput
+          });
+        }
         const zapRequested = cfg.get('zap.enabled', true)
           && (!requested || requested.has('ZAP'))
           && projectPolicy?.scanners?.ZAP !== false;
@@ -2049,7 +2404,7 @@ async function activate(context) {
         activeExecution = createExecution({
           executionId: `local-execution-${executionSequence}`,
           requestedTools: scans.map((scan) => scan.tool),
-          allTools: ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'ZAP'],
+          allTools: ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'],
           parentExecutionId: currentSecuritySnapshot.lastExecutionId
         });
         currentSecuritySnapshot = beginRefresh(currentSecuritySnapshot, activeExecution);

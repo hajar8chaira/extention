@@ -4,7 +4,8 @@ const { runGitleaks } = require('./gitleaks');
 const { runTrivy } = require('./trivy');
 const { runOsv } = require('./osv');
 const { runZap } = require('./zap');
-const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeOsvOutput, normalizeZapOutput, deduplicateFindings } = require('./findings');
+const { runSonarQube } = require('./sonarqube');
+const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeOsvOutput, normalizeZapOutput, normalizeSonarQubeOutput, deduplicateFindings } = require('./findings');
 const { correlateFindings } = require('./correlation');
 const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
 const { runWithConcurrency } = require('./scheduler');
@@ -13,7 +14,11 @@ function defaultOptions(options = {}) {
   return {
     semgrepMode: 'docker', semgrepConfig: 'p/security-audit', gitleaksMode: 'docker',
     trivyMode: 'docker', trivyImage: '', timeoutMs: 600000, targetUrl: 'http://127.0.0.1:3000',
-    selectedTools: [], zapAuthorized: false, ...options
+    selectedTools: [], zapAuthorized: false,
+    // SonarQube needs an external server and a token, so it stays opt-in.
+    sonarEnabled: false, sonarMode: 'auto', sonarHostUrl: 'http://127.0.0.1:9000',
+    sonarProjectKey: '', sonarToken: '', sonarIncludeCodeSmells: false,
+    ...options
   };
 }
 
@@ -35,6 +40,23 @@ function buildScans(workspacePath, policy, options, signal) {
     execute: () => runOsv({ workspacePath, timeoutMs: options.timeoutMs, signal }),
     normalize: normalizeOsvOutput
   }];
+  // SonarQube joins the static phase and the shared scheduler, but only when it
+  // is explicitly enabled: it is the one scanner that requires a live server.
+  if (options.sonarEnabled) scans.push({
+    tool: 'SonarQube',
+    execute: () => runSonarQube({
+      workspacePath,
+      mode: policy?.sonarMode || options.sonarMode,
+      hostUrl: options.sonarHostUrl,
+      projectKey: options.sonarProjectKey,
+      token: options.sonarToken,
+      includeCodeSmells: options.sonarIncludeCodeSmells,
+      exclusions: policy?.exclusions.global_files || [],
+      timeoutMs: Math.max(options.timeoutMs, 900000),
+      signal
+    }),
+    normalize: normalizeSonarQubeOutput
+  });
   const zapMode = policy?.zapOpenapi ? 'openapi' : policy?.zapActive ? 'active' : 'baseline';
   if (zapMode === 'baseline' || options.zapAuthorized) scans.push({
     tool: 'ZAP', dynamic: true,

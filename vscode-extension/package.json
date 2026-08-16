@@ -52,6 +52,8 @@
     "onCommand:securityCenter.focusLiveSecurity",
     "onCommand:securityCenter.openLiveSecurityPage",
     "onCommand:securityCenter.openScannerSetup",
+    "onCommand:securityCenter.configureSonarToken",
+    "onCommand:securityCenter.checkSonarQube",
     "onView:securityCenter.findings",
     "onView:securityCenter.dashboard",
     "onView:securityCenter.liveCompanion"
@@ -93,6 +95,8 @@
       { "command": "securityCenter.generateSbom", "title": "Security Center: Exporter le SBOM CycloneDX", "icon": "$(package)" },
       { "command": "securityCenter.checkLicenses", "title": "Security Center: Contrôler les licences", "icon": "$(law)" },
       { "command": "securityCenter.configureBackendApiKey", "title": "Security Center: Configurer la clé API backend", "icon": "$(key)" },
+      { "command": "securityCenter.configureSonarToken", "title": "Security Center: Configurer le jeton SonarQube", "icon": "$(key)" },
+      { "command": "securityCenter.checkSonarQube", "title": "Security Center: Vérifier la configuration SonarQube", "icon": "$(pulse)" },
       { "command": "securityCenter.installPreCommitHook", "title": "Security Center: Protéger les commits avec Gitleaks", "icon": "$(git-commit)" },
       { "command": "securityCenter.showTrends", "title": "Security Center: Tendances et MTTR", "icon": "$(graph-line)" },
       { "command": "securityCenter.enableLiveSecurity", "title": "Security Center: Enable Live Security", "icon": "$(eye)" },
@@ -210,6 +214,46 @@
           "enum": ["auto", "local", "docker"],
           "description": "Mode d’exécution d’OSV-Scanner. Auto essaie OSV local puis Docker."
         },
+        "securityCenter.sonar.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Active l’analyse SonarQube. Nécessite un serveur SonarQube joignable et un jeton enregistré via « Configurer le jeton SonarQube »."
+        },
+        "securityCenter.sonar.mode": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "local", "docker"],
+          "description": "Mode d’exécution de SonarScanner. Auto essaie le CLI local puis l’image Docker sonarsource/sonar-scanner-cli."
+        },
+        "securityCenter.sonar.serverType": {
+          "type": "string",
+          "default": "",
+          "enum": ["", "local", "existing"],
+          "enumDescriptions": ["Aucun serveur choisi", "Serveur local géré par Security Center avec Docker", "Serveur SonarQube existant"],
+          "description": "Origine du serveur SonarQube. Indépendant du mode d’exécution de SonarScanner."
+        },
+        "securityCenter.sonar.hostUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:9000",
+          "description": "URL du serveur SonarQube. Lue uniquement ici : security-center.yml ne peut pas la redéfinir."
+        },
+        "securityCenter.sonar.projectKey": {
+          "type": "string",
+          "default": "",
+          "description": "Clé du projet SonarQube. Vide : Security Center reprend sonar-project.properties, sinon le dépôt Git distant, sinon le nom du dossier."
+        },
+        "securityCenter.sonar.includeCodeSmells": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ajoute les code smells aux vulnérabilités et bugs remontés. Désactivé par défaut pour rester centré sur la sécurité."
+        },
+        "securityCenter.sonar.timeoutSeconds": {
+          "type": "number",
+          "default": 900,
+          "minimum": 60,
+          "maximum": 3600,
+          "description": "Durée maximale de l’analyse SonarScanner et de l’attente du traitement serveur."
+        },
         "securityCenter.zap.enabled": {
           "type": "boolean",
           "default": true,
@@ -266,6 +310,6 @@
     "benchmark:ai": "node scripts/ai-remediation-benchmark.js",
     "scan:real": "node scripts/run-real-scan.js ../test-application/juice-shop ../security-reports",
     "package:vsix": "npx --yes @vscode/vsce package --out ../security-center-vscode.vsix",
-    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/license-compliance.js && node --check src/dashboard.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/remediation-result.js"
+    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/license-compliance.js && node --check src/dashboard.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/remediation-result.js"
   }
 }

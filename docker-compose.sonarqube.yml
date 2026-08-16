@@ -1,0 +1,28 @@
+services:
+  sonarqube:
+    image: sonarqube:community
+    pull_policy: missing
+    container_name: security-center-sonarqube
+    ports:
+      # Développement local uniquement : jamais 0.0.0.0.
+      - "127.0.0.1:9000:9000"
+    environment:
+      # Base H2 embarquée : suffisante pour tester Security Center, pas pour la production.
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonarqube-data:/opt/sonarqube/data
+      - sonarqube-logs:/opt/sonarqube/logs
+      - sonarqube-extensions:/opt/sonarqube/extensions
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    restart: unless-stopped
+
+volumes:
+  sonarqube-data:
+    name: security-center-sonarqube-data
+  sonarqube-logs:
+    name: security-center-sonarqube-logs
+  sonarqube-extensions:
+    name: security-center-sonarqube-extensions

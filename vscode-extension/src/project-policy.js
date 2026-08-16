@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const TOOL_KEYS = Object.freeze({ semgrep: 'Semgrep', gitleaks: 'Gitleaks', trivy: 'Trivy', osv: 'OSV-Scanner', zap: 'ZAP' });
+const TOOL_KEYS = Object.freeze({ semgrep: 'Semgrep', gitleaks: 'Gitleaks', trivy: 'Trivy', osv: 'OSV-Scanner', sonarqube: 'SonarQube', zap: 'ZAP' });
 const SEVERITY_RANK = Object.freeze({ INFORMATION: 0, INFO: 0, LOW: 1, WARNING: 2, MEDIUM: 2, HIGH: 3, ERROR: 3, CRITICAL: 4 });
 
 function scalar(value) {
@@ -94,11 +94,22 @@ function validatePolicy(raw) {
     }
     exclusions[key] = [...new Set(values.map((item) => item.trim()))];
   }
+  // Only the execution mode is versionable. `sonar.host_url` and the token stay
+  // in VS Code settings/SecretStorage so an untrusted repository can never
+  // redirect the analysis and its credentials to another server.
+  // An absent key stays empty so the VS Code setting keeps applying: a policy
+  // file without a `sonarqube:` section must not silently override it.
+  const sonarMode = raw.sonarqube?.mode === undefined ? '' : String(raw.sonarqube.mode).trim().toLowerCase();
+  if (sonarMode && !['auto', 'local', 'docker'].includes(sonarMode)) throw new Error('sonarqube.mode doit être auto, local ou docker.');
+  const sonarIncludeCodeSmells = raw.sonarqube?.include_code_smells;
+  if (sonarIncludeCodeSmells !== undefined && typeof sonarIncludeCodeSmells !== 'boolean') {
+    throw new Error('sonarqube.include_code_smells doit être true ou false.');
+  }
   const maxParallelScanners = Number(raw.execution?.max_parallel_scanners ?? 2);
   if (!Number.isInteger(maxParallelScanners) || maxParallelScanners < 1 || maxParallelScanners > 4) {
     throw new Error('execution.max_parallel_scanners doit être un entier entre 1 et 4.');
   }
-  return { version: Number(raw.version || 1), scanners, failOn, maxActive, includeTests, licensesDenied, gitleaksHistory, gitleaksHistoryIncremental, gitleaksConfig, semgrepCustomRules, zapActive, zapOpenapi, zapContext, zapUser, zapEngine, zapLocalPath, zapPolicyMinSeverity, zapAuth, exclusions, maxParallelScanners };
+  return { version: Number(raw.version || 1), scanners, failOn, maxActive, includeTests, licensesDenied, gitleaksHistory, gitleaksHistoryIncremental, gitleaksConfig, semgrepCustomRules, zapActive, zapOpenapi, zapContext, zapUser, zapEngine, zapLocalPath, zapPolicyMinSeverity, zapAuth, sonarMode, sonarIncludeCodeSmells, exclusions, maxParallelScanners };
 }
 
 async function loadProjectPolicy(workspacePath) {

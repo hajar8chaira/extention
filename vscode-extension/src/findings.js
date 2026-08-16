@@ -365,8 +365,171 @@ function normalizeZapOutput(payload, _workspacePath = '', displayTargetUrl = '')
   return deduplicateFindings(findings);
 }
 
+// SonarQube exposes two severity models at the same time. The legacy scale is
+// used when the newer clean-code `impacts` array is absent, so both are mapped
+// explicitly onto the Security Center scale rather than mixed silently.
+//
+//   legacy severity   BLOCKER  CRITICAL  MAJOR   MINOR  INFO
+//   Security Center   CRITICAL HIGH      MEDIUM  LOW    INFO
+//
+//   impact severity   BLOCKER  HIGH      MEDIUM  LOW    INFO
+//   Security Center   CRITICAL HIGH      MEDIUM  LOW    INFO
+const SONARQUBE_LEGACY_SEVERITY = Object.freeze({
+  BLOCKER: 'CRITICAL', CRITICAL: 'HIGH', MAJOR: 'MEDIUM', MINOR: 'LOW', INFO: 'INFO'
+});
+const SONARQUBE_IMPACT_SEVERITY = Object.freeze({
+  BLOCKER: 'CRITICAL', HIGH: 'HIGH', MEDIUM: 'MEDIUM', LOW: 'LOW', INFO: 'INFO'
+});
+const SONARQUBE_CATEGORY = Object.freeze({
+  VULNERABILITY: 'security', SECURITY_HOTSPOT: 'security-hotspot',
+  BUG: 'reliability', CODE_SMELL: 'maintainability'
+});
+const SONARQUBE_SEVERITY_ORDER = Object.freeze(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']);
+
+/** Highest clean-code impact wins; falls back to the legacy severity. */
+function sonarQubeSeverity(issue) {
+  const impacts = Array.isArray(issue?.impacts) ? issue.impacts : [];
+  const mapped = impacts
+    .map((impact) => SONARQUBE_IMPACT_SEVERITY[String(impact?.severity || '').toUpperCase()])
+    .filter(Boolean);
+  if (mapped.length) return SONARQUBE_SEVERITY_ORDER.find((value) => mapped.includes(value)) || 'MEDIUM';
+  return SONARQUBE_LEGACY_SEVERITY[String(issue?.severity || '').toUpperCase()] || 'MEDIUM';
+}
+
+/** `securityStandards` carries entries such as `cwe:89` and `owaspTop10:a3`. */
+function sonarQubeCwe(securityStandards) {
+  const values = (Array.isArray(securityStandards) ? securityStandards : [])
+    .filter((value) => /^cwe:\d+$/i.test(String(value)))
+    .map((value) => `CWE-${String(value).split(':')[1]}`);
+  return [...new Set(values)].join(', ');
+}
+
+function sonarQubeComponentPath(componentKey, componentsByKey) {
+  const known = componentsByKey.get(componentKey)?.path;
+  if (known) return normalizePath(known);
+  const key = String(componentKey || '');
+  const separator = key.indexOf(':');
+  return separator >= 0 ? normalizePath(key.slice(separator + 1)) : '';
+}
+
+function sonarQubeLocation(item, relativePath, workspacePath) {
+  const range = item?.textRange || {};
+  const line = Number(range.startLine || item?.line || 0);
+  const endLine = Number(range.endLine || range.startLine || item?.line || 0);
+  const startColumn = Math.max(0, Number(range.startOffset || 0));
+  const startLine = Math.max(0, line - 1);
+  return {
+    file: relativePath,
+    absolutePath: relativePath ? path.resolve(workspacePath, relativePath) : '',
+    startLine,
+    startColumn,
+    endLine: Math.max(startLine, endLine - 1),
+    endColumn: Math.max(startColumn + 1, Number(range.endOffset || 0) || startColumn + 1),
+    hasLocation: Boolean(relativePath) && line > 0
+  };
+}
+
+function normalizeSonarQubeIssue(issue, context) {
+  const { componentsByKey, rules, workspacePath, serverUrl, projectKey } = context;
+  const relativePath = sonarQubeComponentPath(issue.component, componentsByKey);
+  const { hasLocation, ...location } = sonarQubeLocation(issue, relativePath, workspacePath);
+  const rule = rules[issue.rule] || {};
+  const rawSeverity = sonarQubeSeverity(issue);
+  const type = String(issue.type || '').toUpperCase();
+  return {
+    // The SonarQube issue key is tracked server-side across code movement, so
+    // it is a stable identity and no line number is embedded here.
+    id: `sonarqube:${issue.key}`,
+    fingerprint: String(issue.key || ''),
+    tool: 'SonarQube',
+    ruleId: issue.rule || 'sonarqube-issue',
+    title: cleanScannerText(issue.message) || rule.name || issue.rule || 'Problème SonarQube',
+    severity: commonSeverityMap[rawSeverity] || 'warning',
+    rawSeverity,
+    category: SONARQUBE_CATEGORY[type] || 'security',
+    cwe: sonarQubeCwe(rule.securityStandards),
+    ...location,
+    helpUri: serverUrl && projectKey
+      ? `${serverUrl}/project/issues?id=${encodeURIComponent(projectKey)}&open=${encodeURIComponent(issue.key)}`
+      : '',
+    sourceContext: classifySourceContext(relativePath),
+    confidence: type === 'VULNERABILITY' ? 'high' : 'medium',
+    description: rule.name || '',
+    issueType: type,
+    sonarStatus: String(issue.status || ''),
+    effort: String(issue.effort || issue.debt || ''),
+    tags: Array.isArray(issue.tags) ? issue.tags : [],
+    cleanCodeAttribute: String(issue.cleanCodeAttribute || ''),
+    softwareQualities: (Array.isArray(issue.impacts) ? issue.impacts : [])
+      .map((impact) => String(impact?.softwareQuality || '')).filter(Boolean),
+    securityStandards: Array.isArray(rule.securityStandards) ? rule.securityStandards : [],
+    createdAt: String(issue.creationDate || ''),
+    unlocated: !hasLocation
+  };
+}
+
+function normalizeSonarQubeHotspot(hotspot, context) {
+  const { componentsByKey, rules, workspacePath, serverUrl, projectKey } = context;
+  const relativePath = sonarQubeComponentPath(hotspot.component, componentsByKey);
+  const { hasLocation, ...location } = sonarQubeLocation(hotspot, relativePath, workspacePath);
+  const rule = rules[hotspot.ruleKey] || {};
+  // Hotspots are graded by exploitation probability rather than by severity.
+  const rawSeverity = SONARQUBE_IMPACT_SEVERITY[String(hotspot.vulnerabilityProbability || '').toUpperCase()] || 'MEDIUM';
+  return {
+    id: `sonarqube:hotspot:${hotspot.key}`,
+    fingerprint: String(hotspot.key || ''),
+    tool: 'SonarQube',
+    ruleId: hotspot.ruleKey || 'sonarqube-hotspot',
+    title: cleanScannerText(hotspot.message) || rule.name || 'Security hotspot SonarQube',
+    severity: commonSeverityMap[rawSeverity] || 'warning',
+    rawSeverity,
+    category: 'security-hotspot',
+    cwe: sonarQubeCwe(rule.securityStandards),
+    ...location,
+    helpUri: serverUrl && projectKey
+      ? `${serverUrl}/security_hotspots?id=${encodeURIComponent(projectKey)}&hotspots=${encodeURIComponent(hotspot.key)}`
+      : '',
+    sourceContext: classifySourceContext(relativePath),
+    // A hotspot is a place to review, not a confirmed vulnerability.
+    confidence: 'low',
+    description: rule.name || '',
+    issueType: 'SECURITY_HOTSPOT',
+    sonarStatus: String(hotspot.status || ''),
+    securityCategory: String(hotspot.securityCategory || ''),
+    vulnerabilityProbability: String(hotspot.vulnerabilityProbability || ''),
+    securityStandards: Array.isArray(rule.securityStandards) ? rule.securityStandards : [],
+    createdAt: String(hotspot.creationDate || ''),
+    unlocated: !hasLocation
+  };
+}
+
+function normalizeSonarQubeOutput(payload, workspacePath = '') {
+  const componentsByKey = new Map((Array.isArray(payload?.components) ? payload.components : [])
+    .filter((component) => component?.key)
+    .map((component) => [component.key, component]));
+  const context = {
+    componentsByKey,
+    rules: payload?.rules && typeof payload.rules === 'object' ? payload.rules : {},
+    workspacePath,
+    serverUrl: String(payload?.serverUrl || '').replace(/\/+$/, ''),
+    projectKey: String(payload?.projectKey || '')
+  };
+  const findings = [
+    ...(Array.isArray(payload?.issues) ? payload.issues : [])
+      .filter((issue) => issue?.key)
+      .map((issue) => normalizeSonarQubeIssue(issue, context)),
+    ...(Array.isArray(payload?.hotspots) ? payload.hotspots : [])
+      .filter((hotspot) => hotspot?.key)
+      .map((hotspot) => normalizeSonarQubeHotspot(hotspot, context))
+  ];
+  return deduplicateFindings(findings);
+}
+
 module.exports = {
   normalizeScannerPath, classifySourceContext, deduplicateFindings, cleanScannerText, zapConfidence,
+  SONARQUBE_LEGACY_SEVERITY, SONARQUBE_IMPACT_SEVERITY, SONARQUBE_CATEGORY,
+  sonarQubeSeverity, sonarQubeCwe, sonarQubeComponentPath,
+  normalizeSonarQubeOutput, normalizeSonarQubeIssue, normalizeSonarQubeHotspot,
   normalizeSemgrepOutput, normalizeSemgrepResult,
   normalizeGitleaksOutput, normalizeGitleaksResult,
   normalizeTrivyOutput, normalizeTrivyVulnerability, normalizeTrivyMisconfiguration,

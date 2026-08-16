@@ -30,7 +30,7 @@ function parseArgs(argv) {
 }
 
 function help() {
-  return `Security Center headless\n\nUsage:\n  security-center scan --workspace . --format sarif --output results.sarif\n\nOptions:\n  --tools Semgrep,Gitleaks,Trivy,OSV-Scanner,ZAP\n  --incremental --base-ref <SHA ou ref>\n  --semgrep-config p/security-audit\n  --fail-on HIGH\n  --zap-authorized --actor <nom> --justification <raison>\n  --target-url http://127.0.0.1:3000\n`;
+  return `Security Center headless\n\nUsage:\n  security-center scan --workspace . --format sarif --output results.sarif\n\nOptions:\n  --tools Semgrep,Gitleaks,Trivy,OSV-Scanner,SonarQube,ZAP\n  --incremental --base-ref <SHA ou ref>\n  --semgrep-config p/security-audit\n  --fail-on HIGH\n  --zap-authorized --actor <nom> --justification <raison>\n  --target-url http://127.0.0.1:3000\n  --sonar-host-url http://127.0.0.1:9000 --sonar-project-key <cle>\n    Le jeton provient uniquement de la variable d'environnement SONAR_TOKEN.\n`;
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -56,7 +56,18 @@ async function main(argv = process.argv.slice(2)) {
   const report = selectedTools.length || (!incremental && !args.tools.length) ? await runSecurityScan({
     workspacePath,
     policy,
-    options: { selectedTools, targetUrl: args.targetUrl || 'http://127.0.0.1:3000', zapAuthorized: args.zapAuthorized, semgrepConfig: args.semgrepConfig || 'p/security-audit', semgrepTargets: incremental?.sourceFiles || [], gitleaksHistory: incremental ? true : undefined, gitleaksSinceCommit: incremental ? args.baseRef : '' },
+    options: {
+      selectedTools, targetUrl: args.targetUrl || 'http://127.0.0.1:3000', zapAuthorized: args.zapAuthorized,
+      semgrepConfig: args.semgrepConfig || 'p/security-audit', semgrepTargets: incremental?.sourceFiles || [],
+      gitleaksHistory: incremental ? true : undefined, gitleaksSinceCommit: incremental ? args.baseRef : '',
+      // SonarQube runs headless only when the caller asked for it and supplied a
+      // token through the environment. It is never derived from the workspace.
+      sonarEnabled: selectedTools.includes('SonarQube') && !incremental,
+      sonarMode: args.sonarMode || 'auto',
+      sonarHostUrl: args.sonarHostUrl || process.env.SONAR_HOST_URL || 'http://127.0.0.1:9000',
+      sonarProjectKey: args.sonarProjectKey || '',
+      sonarToken: process.env.SONAR_TOKEN || ''
+    },
     onScannerUpdate: (event) => process.stderr.write(`[${event.tool}] ${event.status}${event.details ? ` — ${event.details}` : ''}\n`)
   }) : { workspace: workspacePath, findings: [], scanners: [], correlations: [], policyResult: policy ? { passed: true, activeCount: 0, blockingCount: 0, reasons: [], policy } : null, failures: [], finishedAt: new Date().toISOString() };
   if (incremental) report.incremental = incremental;

@@ -48,6 +48,10 @@ function buildDashboardModel(findings = [], scanners = [], options = {}) {
     scanDurationMs: Number(options.scanDurationMs || 0),
     scanStartedAt: options.scanStartedAt || '',
     scanners,
+    // Scanners knowingly turned off in the configuration. They are reported as
+    // « Désactivé » and never as a scanner that ran and found nothing.
+    disabledScanners: (Array.isArray(options.disabledScanners) ? options.disabledScanners : [])
+      .filter((tool) => tool && !scanners.some((scanner) => scanner.tool === tool)),
     workspace: options.workspace || 'Aucun workspace',
     scanStatus: options.scanStatus || 'idle',
     backendStatus: options.backendStatus || 'unknown',
@@ -122,6 +126,7 @@ const SCANNER_PRESENTATION = {
   Gitleaks: ['Détection de secrets', 'key'],
   Trivy: ['Dépendances, conteneurs et IaC', 'cube'],
   'OSV-Scanner': ['Vulnérabilités des dépendances', 'shield'],
+  SonarQube: ['Qualité et sécurité du code (SAST)', 'code'],
   ZAP: ['Analyse dynamique (DAST)', 'pulse']
 };
 
@@ -987,6 +992,11 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         <span class="status ${scanner.status}">${escapeHtml(scanner.status)}</span>
       </div>`).join('')
     : '<div class="empty">Aucun scanner exécuté</div>';
+  const disabledScannerRows = model.disabledScanners.map((tool) => `<div class="scanner disabled">
+        <div class="scanner-index disabled">–</div>
+        <div class="scanner-copy"><strong>${escapeHtml(tool)}</strong><small>Non inclus dans cette analyse</small></div>
+        <span class="status disabled">Désactivé</span>
+      </div>`).join('');
   const overviewScannerRows = model.scanners.length
     ? model.scanners.map((scanner) => {
       const count = currentFindings.filter((finding) => finding.tool === scanner.tool).length;
@@ -1005,6 +1015,19 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       </div>`;
     }).join('')
     : '<div class="empty">Aucun scanner exécuté.</div>';
+  // No finding count and no duration: these scanners never ran.
+  const overviewDisabledRows = model.disabledScanners.map((tool) => {
+    const [description, icon] = SCANNER_PRESENTATION[tool] || ['Scanner de sécurité', 'shield'];
+    return `<div class="overview-scanner disabled">
+        <span class="scanner-logo disabled">${compactIcon(icon)}</span>
+        <div class="scanner-identity"><strong>${escapeHtml(tool)}</strong><small>${escapeHtml(description)}</small></div>
+        <span class="scanner-ready disabled">Désactivé</span>
+        <span class="scanner-value"><strong>—</strong><small>alertes</small></span>
+        <span class="scanner-value"><strong>—</strong><small>durée</small></span>
+        <time>—</time>
+        <button class="scanner-chevron" data-command="securityCenter.openScannerSetup" aria-label="Configurer ${escapeHtml(tool)}">›</button>
+      </div>`;
+  }).join('');
   const correlationRows = model.correlations.length
     ? model.correlations.map((correlation) => `<div class="correlation">
         <strong>${escapeHtml(correlation.title)}</strong>
@@ -1332,6 +1355,9 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .scanner-logo { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--vscode-widget-border); border-radius: 50%; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
     .scanner-logo.completed { color: var(--vscode-testing-iconPassed); background: color-mix(in srgb, var(--vscode-testing-iconPassed) 10%, var(--vscode-editor-background)); }
     .scanner-logo.failed { color: var(--vscode-testing-iconFailed); }
+    .scanner-logo.disabled, .scanner-index.disabled { opacity: .55; }
+    .overview-scanner.disabled, .scanner.disabled { opacity: .78; }
+    .status.disabled, .scanner-ready.disabled { color: var(--vscode-descriptionForeground); }
     .scanner-identity strong, .scanner-identity small, .scanner-value strong, .scanner-value small { display: block; }
     .scanner-identity small, .scanner-value small, .overview-scanner time { color: var(--vscode-descriptionForeground); }
     .scanner-identity small { margin-top: 2px; line-height: 1.25; }
@@ -1828,7 +1854,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   ${policyBanner}
   <h3 class="sidebar-keep">Pipeline d’analyse</h3>
   <div class="pipeline-panel">${renderPipeline(model.scanners, model.scanStatus, model.scanDurationMs, model.findings.filter((finding) => !finding.staleFromPreviousScan))}</div>
-  ${surface === 'full' ? `<div class="overview-split"><section class="overview-panel"><div class="overview-panel-head"><strong>Scanners</strong><button data-command="securityCenter.openScansPage">Voir les détails →</button></div>${overviewScannerRows}</section><section class="overview-panel"><div class="overview-panel-head"><strong>Activité de sécurité</strong><button data-command="securityCenter.showTrends">Tendances →</button></div><div class="activity-overview"><div class="activity-summary"><div class="activity-stat"><strong>${newCount}</strong><span>Nouvelles</span></div><div class="activity-stat resolved"><strong>${resolvedCount}</strong><span>Corrigées</span></div><div class="activity-stat accepted"><strong>${acceptedCount}</strong><span>Acceptées</span></div></div>${historyChart}<div class="activity-footer"><div class="activity-col"><span class="activity-col-title">Tendance globale</span><strong class="activity-col-val">${escapeHtml(trendTop)}</strong><span class="activity-col-sub">${escapeHtml(trendBottom)}</span></div><div class="activity-divider"></div><div class="activity-col"><span class="activity-col-title">Temps moyen de correction</span><strong class="activity-col-val">${escapeHtml(mttrTop)}</strong><span class="activity-col-sub">${escapeHtml(mttrBottom)}</span></div></div></div></section></div><div class="overview-bottom"><section class="overview-panel"><div class="overview-panel-head"><strong>Priority Findings</strong><button data-command="securityCenter.openFindingsPage">Voir tout →</button></div><div class="priority-summary-grid"><div class="priority-summary-item critical"><strong>${prioritySummary.critical}</strong><span>Critical</span></div><div class="priority-summary-item high"><strong>${prioritySummary.high}</strong><span>High</span></div><div class="priority-summary-item medium"><strong>${prioritySummary.medium}</strong><span>Medium</span></div><div class="priority-summary-item low"><strong>${prioritySummary.low}</strong><span>Low</span></div></div></section><section class="overview-panel"><div class="overview-panel-head"><strong>Dernières analyses</strong><button data-command="securityCenter.showScanHistoryPage">Voir tout l'historique →</button></div><div class="recent-scans">${recentScanRows}</div></section></div>` : ''}
+  ${surface === 'full' ? `<div class="overview-split"><section class="overview-panel"><div class="overview-panel-head"><strong>Scanners</strong><button data-command="securityCenter.openScansPage">Voir les détails →</button></div>${overviewScannerRows}${overviewDisabledRows}</section><section class="overview-panel"><div class="overview-panel-head"><strong>Activité de sécurité</strong><button data-command="securityCenter.showTrends">Tendances →</button></div><div class="activity-overview"><div class="activity-summary"><div class="activity-stat"><strong>${newCount}</strong><span>Nouvelles</span></div><div class="activity-stat resolved"><strong>${resolvedCount}</strong><span>Corrigées</span></div><div class="activity-stat accepted"><strong>${acceptedCount}</strong><span>Acceptées</span></div></div>${historyChart}<div class="activity-footer"><div class="activity-col"><span class="activity-col-title">Tendance globale</span><strong class="activity-col-val">${escapeHtml(trendTop)}</strong><span class="activity-col-sub">${escapeHtml(trendBottom)}</span></div><div class="activity-divider"></div><div class="activity-col"><span class="activity-col-title">Temps moyen de correction</span><strong class="activity-col-val">${escapeHtml(mttrTop)}</strong><span class="activity-col-sub">${escapeHtml(mttrBottom)}</span></div></div></div></section></div><div class="overview-bottom"><section class="overview-panel"><div class="overview-panel-head"><strong>Priority Findings</strong><button data-command="securityCenter.openFindingsPage">Voir tout →</button></div><div class="priority-summary-grid"><div class="priority-summary-item critical"><strong>${prioritySummary.critical}</strong><span>Critical</span></div><div class="priority-summary-item high"><strong>${prioritySummary.high}</strong><span>High</span></div><div class="priority-summary-item medium"><strong>${prioritySummary.medium}</strong><span>Medium</span></div><div class="priority-summary-item low"><strong>${prioritySummary.low}</strong><span>Low</span></div></div></section><section class="overview-panel"><div class="overview-panel-head"><strong>Dernières analyses</strong><button data-command="securityCenter.showScanHistoryPage">Voir tout l'historique →</button></div><div class="recent-scans">${recentScanRows}</div></section></div>` : ''}
   ${zapCard}
   <div class="cards">
     <div class="card"><strong>${currentActiveFindings.length}</strong><span>Alertes actives</span></div>
@@ -1858,7 +1884,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     <div class="findings-count"><strong id="visible-findings">${model.findings.length}</strong> vulnérabilité(s) affichée(s)</div>
     <div class="finding-layout"><div class="finding-list">${findingCards}</div><aside class="finding-preview" aria-live="polite"><div class="finding-preview-label">Aperçu de l’alerte</div><h4 id="preview-title">Sélectionnez une vulnérabilité</h4><span id="preview-location">Le fichier ou l’endpoint apparaîtra ici.</span><small id="preview-rule">Utilisez « Voir les détails » pour ouvrir toutes les preuves et recommandations.</small></aside></div>
   </section></section>
-  <section class="page-scans"><header class="dynamic-page-header"><div><h1>Scans</h1><p>État, résultats et exécution des scanners.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header><h3>Scanners</h3>${scannerRows}</section>
+  <section class="page-scans"><header class="dynamic-page-header"><div><h1>Scans</h1><p>État, résultats et exécution des scanners.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header><h3>Scanners</h3>${scannerRows}${disabledScannerRows}</section>
   <section class="page-analytics"><header class="dynamic-page-header"><div><h1>Analytics</h1><p>Répartition des alertes et signaux de sécurité.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header><div class="analytics-grid"><section class="analytics-panel"><h3>Répartition par outil</h3>${renderDonutChart(model.byTool, 'Répartition des alertes par outil')}</section><section class="analytics-panel"><h3>Répartition par sévérité</h3>${renderDonutChart(model.bySeverity, 'Répartition des alertes par sévérité')}</section></div>
   <h3>Par contexte</h3>${renderMetricRows(model.byContext, 'Aucun résultat')}
   <h3>Suivi de correction</h3>${renderMetricRows(model.byStatus, 'Aucun statut')}

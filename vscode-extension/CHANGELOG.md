@@ -1,5 +1,11 @@
 # Changelog
 
+## Non publié
+
+- SonarQube intégré comme scanner de première classe : modes `auto`, `local` et `docker`, preflight du serveur, attente bornée du traitement Compute Engine, récupération paginée des issues et des security hotspots, normalisation dans le modèle de finding commun.
+- Jeton SonarQube conservé dans le SecretStorage de VS Code, transmis par variable d’environnement ou `--env-file` et masqué dans tous les messages.
+- `docker-compose.sonarqube.yml` pour lancer SonarQube Community Build en local sur `127.0.0.1:9000`.
+
 ## 0.2.0
 
 - ZAP local automatisé : détection, démarrage protégé, scan actif/JWT et arrêt propre.

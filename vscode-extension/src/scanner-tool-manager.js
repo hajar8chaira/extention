@@ -9,11 +9,38 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 
+// SonarScanner CLI is published by SonarSource on its own binaries host rather
+// than on GitHub releases. Each artifact ships an official `.sha256` next to
+// it, so the same download → verify → extract → check contract applies.
+const SONARSCANNER_BASE = 'https://binaries.sonarsource.com/Distribution/sonar-scanner-cli';
+const SONARSCANNER_LISTING = 'https://binaries.sonarsource.com/s3api?prefix=Distribution/sonar-scanner-cli/&delimiter=/&max-keys=5000';
+// Verified fallback used when the official listing cannot be read.
+const SONARSCANNER_PINNED_VERSION = '8.1.0.6389';
+
+/** Official artifact suffix for the running platform, or '' when unsupported. */
+function sonarScannerPlatform(platform = process.platform, arch = process.arch) {
+  if (platform === 'win32') return arch === 'x64' ? 'windows-x64' : '';
+  if (platform === 'darwin') return arch === 'arm64' ? 'macosx-aarch64' : 'macosx-x64';
+  if (platform === 'linux') return arch === 'arm64' ? 'linux-aarch64' : 'linux-x64';
+  return '';
+}
+
+function compareVersions(left, right) {
+  const a = String(left).split('.').map(Number);
+  const b = String(right).split('.').map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const difference = (a[index] || 0) - (b[index] || 0);
+    if (difference) return difference;
+  }
+  return 0;
+}
+
 const TOOLS = Object.freeze({
   semgrep: { label: 'Semgrep', kind: 'python', command: 'semgrep', repo: 'semgrep/semgrep', purpose: 'Analyse statique du code (SAST)' },
   gitleaks: { label: 'Gitleaks', kind: 'github', command: 'gitleaks', repo: 'gitleaks/gitleaks', purpose: 'Détection de secrets', asset: /gitleaks_.*_windows_x64\.zip$/i, checksum: /checksums\.txt$/i },
   trivy: { label: 'Trivy', kind: 'github', command: 'trivy', repo: 'aquasecurity/trivy', purpose: 'Dépendances, conteneurs et IaC', asset: /trivy_.*_windows-64bit\.zip$/i, checksum: /checksums\.txt$/i },
-  osv: { label: 'OSV-Scanner', kind: 'github', command: 'osv-scanner', repo: 'google/osv-scanner', purpose: 'Vulnérabilités des dépendances', asset: /osv-scanner_windows_amd64\.exe$/i, checksum: /(checksums|sha256).*\.txt$/i }
+  osv: { label: 'OSV-Scanner', kind: 'github', command: 'osv-scanner', repo: 'google/osv-scanner', purpose: 'Vulnérabilités des dépendances', asset: /osv-scanner_windows_amd64\.exe$/i, checksum: /(checksums|sha256).*\.txt$/i },
+  sonarscanner: { label: 'SonarScanner', kind: 'sonarsource', command: 'sonar-scanner', purpose: 'Analyse SonarQube du code', base: SONARSCANNER_BASE, version: SONARSCANNER_PINNED_VERSION }
 });
 
 function request(url, headers = {}) {
@@ -62,11 +89,29 @@ async function sha256(file) {
   const data = await fs.readFile(file); hash.update(data); return hash.digest('hex');
 }
 
+/**
+ * Node refuses to spawn .bat/.cmd wrappers directly, so those go through the
+ * interpreter with an argument array rather than `shell: true`.
+ */
+function versionInvocation(executable, platform = process.platform) {
+  if (platform === 'win32' && /\.(bat|cmd)$/i.test(executable)) {
+    return { executable: process.env.COMSPEC || 'cmd.exe', args: ['/d', '/s', '/c', executable, '--version'] };
+  }
+  return { executable, args: ['--version'] };
+}
+
 async function commandVersion(executable, timeout = 30000) {
+  const invocation = versionInvocation(executable);
   try {
-    const { stdout, stderr } = await execFileAsync(executable, ['--version'], { windowsHide: true, timeout });
-    return String(stdout || stderr).trim().split(/\r?\n/)[0] || 'installé';
-  } catch { return ''; }
+    const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, { windowsHide: true, timeout, maxBuffer: 4 * 1024 * 1024 });
+    const output = String(stdout || stderr);
+    // SonarScanner prints a banner before the version line.
+    return output.match(/SonarScanner\s+(?:CLI\s+)?v?[0-9][\w.-]*/i)?.[0]
+      || output.trim().split(/\r?\n/).find((line) => line.trim()) || 'installé';
+  } catch (error) {
+    const output = `${error.stdout || ''}\n${error.stderr || ''}`;
+    return output.match(/SonarScanner\s+(?:CLI\s+)?v?[0-9][\w.-]*/i)?.[0] || '';
+  }
 }
 
 class ScannerToolManager {
@@ -74,6 +119,9 @@ class ScannerToolManager {
   toolDirectory(id) { return path.join(this.root, id); }
   managedExecutable(id) {
     if (id === 'semgrep') return path.join(this.toolDirectory(id), 'venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'semgrep.exe' : 'semgrep');
+    // The SonarSource archive keeps its own bin/ layout. It is normalised to a
+    // fixed « current » directory so this path stays deterministic.
+    if (id === 'sonarscanner') return path.join(this.toolDirectory(id), 'current', 'bin', process.platform === 'win32' ? 'sonar-scanner.bat' : 'sonar-scanner');
     return path.join(this.toolDirectory(id), process.platform === 'win32' ? `${TOOLS[id].command}.exe` : TOOLS[id].command);
   }
   async exists(file) { try { await fs.access(file); return true; } catch { return false; } }
@@ -108,11 +156,98 @@ class ScannerToolManager {
     if (!asset) throw new Error(`Aucun binaire Windows compatible trouvé dans la publication officielle ${release.tag_name}.`);
     return { version: release.tag_name, asset, checksum };
   }
+  /** Highest published version, falling back to the pinned one. */
+  async latestSonarScannerVersion(fallback = SONARSCANNER_PINNED_VERSION) {
+    try {
+      const listing = await downloadText(SONARSCANNER_LISTING);
+      const versions = [...listing.matchAll(/sonar-scanner-cli-(\d+(?:\.\d+)+)-windows-x64\.zip(?!\.)/g)].map((match) => match[1]);
+      return versions.sort(compareVersions).at(-1) || fallback;
+    } catch { return fallback; }
+  }
+
+  /**
+   * Installs the official SonarScanner CLI into the extension's private
+   * storage. Nothing is written outside that directory and the system PATH is
+   * never modified.
+   */
+  async installSonarScanner(tool, onProgress, platform = sonarScannerPlatform()) {
+    if (!platform) throw new Error(`SonarScanner CLI n’est pas distribué pour ${process.platform}/${process.arch}. Utilisez le mode Docker.`);
+    const version = await this.latestSonarScannerVersion(tool.version);
+    const name = `sonar-scanner-cli-${version}-${platform}.zip`;
+    const archiveUrl = `${tool.base}/${name}`;
+    onProgress({ phase: 'metadata', message: `${version} (${platform}) depuis binaries.sonarsource.com` });
+    const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'security-center-sonarscanner-'));
+    const archive = path.join(temporary, name);
+    try {
+      await download(archiveUrl, archive, onProgress);
+      const expected = String(await downloadText(`${archiveUrl}.sha256`)).match(/[a-f0-9]{64}/i)?.[0]?.toLowerCase();
+      if (!expected) throw new Error(`SonarSource ne publie pas d’empreinte SHA-256 pour ${name}. Installation refusée par sécurité.`);
+      const actual = await sha256(archive);
+      if (actual !== expected) throw new Error('Échec de vérification SHA-256 de l’archive SonarScanner. Le fichier téléchargé a été supprimé.');
+      onProgress({ phase: 'verify', message: 'Empreinte SHA-256 officielle vérifiée' });
+
+      const extracted = path.join(temporary, 'extract');
+      await fs.mkdir(extracted, { recursive: true });
+      await this.extractArchive(archive, extracted);
+      await this.assertNoPathEscape(extracted);
+
+      const entries = await fs.readdir(extracted, { withFileTypes: true });
+      const root = entries.find((entry) => entry.isDirectory() && /^sonar-scanner/i.test(entry.name));
+      if (!root) throw new Error('L’archive SonarScanner ne contient pas le dossier attendu.');
+
+      const destination = path.join(this.toolDirectory('sonarscanner'), 'current');
+      await fs.rm(destination, { recursive: true, force: true });
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.rename(path.join(extracted, root.name), destination).catch(async () => {
+        await fs.cp(path.join(extracted, root.name), destination, { recursive: true });
+      });
+      const executable = this.managedExecutable('sonarscanner');
+      if (!await this.exists(executable)) throw new Error('SonarScanner installé, mais son lanceur est introuvable dans l’archive.');
+      if (process.platform !== 'win32') await fs.chmod(executable, 0o755).catch(() => {});
+
+      await fs.writeFile(path.join(this.toolDirectory('sonarscanner'), 'provenance.json'), JSON.stringify({
+        source: archiveUrl, version, asset: name, sha256: actual, platform, installedAt: new Date().toISOString()
+      }, null, 2));
+      await this.activateManagedPath();
+      onProgress({ phase: 'verify', message: 'Vérification de sonar-scanner --version' });
+      const result = await this.status('sonarscanner');
+      if (!result.installed) throw new Error('SonarScanner installé, mais « sonar-scanner --version » n’a rien renvoyé. Un runtime Java est peut-être requis pour cette variante.');
+      return result;
+    } finally { await fs.rm(temporary, { recursive: true, force: true }).catch(() => {}); }
+  }
+
+  async extractArchive(archive, destination) {
+    if (process.platform === 'win32') {
+      return execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        `Expand-Archive -LiteralPath '${archive.replaceAll("'", "''")}' -DestinationPath '${destination.replaceAll("'", "''")}' -Force`],
+      { windowsHide: true, timeout: 300000 });
+    }
+    return execFileAsync('unzip', ['-q', '-o', archive, '-d', destination], { timeout: 300000 })
+      .catch(() => { throw new Error('Extraction impossible : la commande « unzip » est requise sur cette plateforme.'); });
+  }
+
+  /** Zip Slip guard: nothing may resolve outside the extraction directory. */
+  async assertNoPathEscape(root) {
+    const base = path.resolve(root);
+    const walk = async (directory) => {
+      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        const candidate = path.join(directory, entry.name);
+        const resolved = await fs.realpath(candidate).catch(() => path.resolve(candidate));
+        if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
+          throw new Error('Archive refusée : elle tente d’écrire en dehors du dossier d’installation.');
+        }
+        if (entry.isDirectory()) await walk(candidate);
+      }
+    };
+    await walk(base);
+  }
+
   async install(id, onProgress = () => {}) {
     const tool = TOOLS[id];
     if (!tool) throw new Error('Scanner inconnu.');
     await fs.mkdir(this.toolDirectory(id), { recursive: true });
     if (tool.kind === 'python') return this.installSemgrep(onProgress);
+    if (tool.kind === 'sonarsource') return this.installSonarScanner(tool, onProgress);
     const release = await this.githubRelease(tool);
     onProgress({ phase: 'metadata', message: `${release.version} trouvé sur ${tool.repo}` });
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), `security-center-${id}-`));
@@ -166,4 +301,4 @@ class ScannerToolManager {
   }
 }
 
-module.exports = { ScannerToolManager, TOOLS, sha256, commandVersion };
+module.exports = { ScannerToolManager, TOOLS, sha256, commandVersion, versionInvocation, sonarScannerPlatform, compareVersions, SONARSCANNER_BASE, SONARSCANNER_PINNED_VERSION };

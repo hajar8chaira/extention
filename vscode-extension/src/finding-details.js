@@ -66,11 +66,55 @@ function renderGitleaksContent(finding) {
   <h2>Action recommandée</h2><div class="block">Révoquer ou faire tourner le secret auprès du fournisseur, supprimer son usage du code et nettoyer l’historique Git si la politique de l’équipe l’exige. Supprimer seulement la chaîne du fichier courant ne révoque pas un secret déjà exposé.</div>`;
 }
 
+const SONARQUBE_ISSUE_TYPES = Object.freeze({
+  VULNERABILITY: 'Vulnérabilité', BUG: 'Bug', CODE_SMELL: 'Code smell', SECURITY_HOTSPOT: 'Security hotspot'
+});
+
+function sonarValue(value, emptyLabel = 'Non fourni par SonarQube') {
+  return value ? escapeHtml(value) : `<span class="muted">${escapeHtml(emptyLabel)}</span>`;
+}
+
+/**
+ * SonarQube findings are static code results: showing the generic endpoint and
+ * ZAP evidence fields for them would be misleading.
+ */
+function renderSonarQubeContent(finding) {
+  const isHotspot = finding.category === 'security-hotspot';
+  const tags = Array.isArray(finding.tags) && finding.tags.length ? finding.tags.join(', ') : '';
+  const standards = Array.isArray(finding.securityStandards) && finding.securityStandards.length
+    ? finding.securityStandards.join(', ') : '';
+  return `<div class="explanation"><span class="eyebrow">${isHotspot ? 'Security hotspot signalé par SonarQube' : 'Résultat SonarQube'}</span>
+    <p>${escapeHtml(finding.title)}</p>
+    <small class="provenance">${isHotspot
+      ? 'Un security hotspot est un emplacement à revoir manuellement, pas une vulnérabilité confirmée.'
+      : 'Résultat produit par le serveur SonarQube et normalisé par Security Center.'}</small></div>
+  <h2>Emplacement analysé</h2>
+  <div class="grid block">
+    <div class="label">Règle</div><div><code>${escapeHtml(finding.ruleId)}</code></div>
+    <div class="label">Fichier</div><div>${finding.file ? `<code>${escapeHtml(finding.file)}</code>` : '<span class="muted">Résultat au niveau du projet — aucun fichier associé</span>'}</div>
+    <div class="label">Ligne</div><div>${finding.unlocated ? '<span class="muted">Aucune ligne fournie</span>' : Number(finding.startLine || 0) + 1}</div>
+    <div class="label">Type</div><div>${escapeHtml(SONARQUBE_ISSUE_TYPES[finding.issueType] || finding.category || 'Non précisé')}</div>
+    <div class="label">Sévérité</div><div><strong>${escapeHtml(finding.rawSeverity)}</strong></div>
+    ${isHotspot ? `<div class="label">Probabilité</div><div>${sonarValue(finding.vulnerabilityProbability)}</div>` : ''}
+    <div class="label">CWE</div><div>${sonarValue(finding.cwe, 'Aucun CWE associé à cette règle')}</div>
+    <div class="label">Normes</div><div>${sonarValue(standards, 'Aucune norme de sécurité référencée')}</div>
+    <div class="label">Tags</div><div>${sonarValue(tags, 'Aucun tag')}</div>
+    <div class="label">Effort estimé</div><div>${sonarValue(finding.effort, 'Non estimé')}</div>
+    <div class="label">Statut SonarQube</div><div>${sonarValue(finding.sonarStatus)}</div>
+  </div>
+  <h2>Action recommandée</h2>
+  <div class="block">${isHotspot
+    ? 'Examiner le contexte d’utilisation, puis marquer le hotspot comme sûr ou le convertir en vulnérabilité dans SonarQube. Security Center conserve la preuve d’origine dans les deux cas.'
+    : 'Ouvrir la ligne concernée, appliquer la correction indiquée par la règle, puis relancer l’analyse : le résultat disparaîtra du prochain scan s’il est corrigé.'}</div>`;
+}
+
 function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
   const reference = finding.helpUri
     ? `<a href="${escapeHtml(finding.helpUri)}">${escapeHtml(finding.helpUri)}</a>`
     : '<span class="muted">Aucune référence fournie</span>';
-  const content = ['Trivy', 'OSV-Scanner'].includes(finding.tool) ? renderTrivyContent(finding) : finding.tool === 'Gitleaks' ? renderGitleaksContent(finding) : `
+  const content = ['Trivy', 'OSV-Scanner'].includes(finding.tool) ? renderTrivyContent(finding)
+    : finding.tool === 'Gitleaks' ? renderGitleaksContent(finding)
+      : finding.tool === 'SonarQube' ? renderSonarQubeContent(finding) : `
   <div class="explanation">
     <span class="eyebrow">Synthèse Security Center pour le développeur</span>
     <p>${escapeHtml(developerExplanation(finding))}</p>
@@ -199,4 +243,4 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
 </html>`;
 }
 
-module.exports = { escapeHtml, renderFindingDetailsHtml };
+module.exports = { escapeHtml, renderFindingDetailsHtml, renderSonarQubeContent, SONARQUBE_ISSUE_TYPES };

@@ -1686,6 +1686,7 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
       if (tool === 'OSV') return 'Dependencies';
       if (tool === 'ZAP' || tool === 'BURP') return 'Dynamic Security';
       if (tool === 'SEMGREP') return 'Code';
+      if (tool === 'SONARQUBE') return 'Code';
       if (tool === 'TRIVY') {
         if (f.imageName || f.dockerImage) return 'Containers';
         if (String(f.ruleId || '').includes('AVD-') || String(f.title || '').includes('Misconfig')) return 'IaC / Cloud';
