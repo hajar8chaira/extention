@@ -9,11 +9,20 @@ const JAVASCRIPT_LIVE_RULES = Object.freeze([
   },
   {
     id: 'sql-string-concatenation', title: 'Potential SQL injection', description: 'A SQL query appears to concatenate request-controlled data.', recommendation: 'Use a parameterized query.', cwe: 'CWE-89', severity: 'high', confidence: 'high',
-    pattern: /\b(?:query|execute|raw)\s*\(\s*(?:["'`][^\n)]*\b(?:select|insert|update|delete)\b[^\n)]*(?:\+\s*(?:req\.(?:params|query|body)|request\.|ctx\.)|\$\{\s*(?:req\.|request\.|ctx\.))[^\n)]*)/gi
+    // Two shapes are equally common and equally dangerous: the query built
+    // inline inside query()/execute(), and the query assembled into a variable
+    // first and executed later. Only matching the first missed the second.
+    // Each quoting style is matched with its own delimiter, because a SQL
+    // literal legitimately contains the other quote:
+    //   "SELECT * FROM users WHERE id = '" + req.query.id
+    pattern: /\b(?:query|execute|raw)\s*\(\s*["'`][^\n)]*\b(?:select|insert|update|delete)\b[^\n)]*(?:\+\s*(?:req\.(?:params|query|body)|request\.|ctx\.)|\$\{\s*(?:req\.|request\.|ctx\.))[^\n)]*|(?:"[^"\n]*\b(?:select|insert|update|delete)\b[^"\n]*"|'[^'\n]*\b(?:select|insert|update|delete)\b[^'\n]*')\s*\+\s*[^;\n]*\b(?:req|request|ctx)\.(?:params|query|body)\b|`[^`\n]*\b(?:select|insert|update|delete)\b[^`\n]*\$\{\s*(?:req|request|ctx)\.(?:params|query|body)/gi
   },
   {
     id: 'dynamic-command-execution', title: 'Potential command injection', description: 'A system command appears to include request-controlled data.', recommendation: 'Use a fixed executable and pass validated values as separate arguments.', cwe: 'CWE-78', severity: 'high', confidence: 'high',
-    pattern: /\b(?:exec|execSync)\s*\(\s*(?:[^\n)]*\+\s*(?:req\.|request\.|ctx\.)|`[^`]*\$\{\s*(?:req\.|request\.|ctx\.))/g
+    // Request data passed straight through — `exec(req.query.cmd)` — is the
+    // most direct form of this bug and was not matched at all: the pattern
+    // required a concatenation or a template literal.
+    pattern: /\b(?:exec|execSync)\s*\(\s*(?:[^\n)]*\+\s*(?:req\.|request\.|ctx\.)|`[^`]*\$\{\s*(?:req\.|request\.|ctx\.)|(?:req|request|ctx)\.(?:params|query|body)\b)/g
   },
   {
     id: 'unsafe-innerhtml', title: 'Potential DOM XSS', description: 'Untrusted-looking data is assigned directly to innerHTML.', recommendation: 'Use textContent or a trusted sanitization mechanism.', cwe: 'CWE-79', severity: 'medium', confidence: 'medium',

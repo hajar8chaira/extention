@@ -73,6 +73,32 @@ Le mode `securityCenter.sonar.mode` accepte `auto` (CLI local puis Docker), `loc
 
 Si le dépôt contient déjà un `sonar-project.properties`, il fait autorité et n’est pas modifié. Sinon Security Center construit les propriétés minimales à la volée, sans créer de fichier dans le projet.
 
+## Snyk
+
+Snyk est désactivé par défaut : il exige un compte Snyk et un jeton. Activez-le avec `securityCenter.snyk.enabled` ou depuis la carte Snyk de **Configuration des scanners**.
+
+Créez le jeton dans Snyk via **Account settings > Auth Token**, puis enregistrez-le avec **Security Center: Configurer le jeton Snyk**. Il est conservé dans le SecretStorage de VS Code et n’est jamais écrit dans `security-center.yml`, `settings.json`, les journaux, les findings ni les rapports. Il est transmis aux processus uniquement par la variable d’environnement `SNYK_TOKEN`, jamais dans la ligne de commande.
+
+**Option A — CLI Snyk local**
+
+Le bouton **Installer Snyk CLI** télécharge l’exécutable officiel depuis `downloads.snyk.io`, vérifie son empreinte SHA-256 publiée par Snyk et l’installe dans le stockage privé de l’extension, sans droit administrateur et sans modifier le PATH système. Un CLI Snyk déjà présent sur le PATH est réutilisé tel quel.
+
+**Option B — Snyk via Docker**
+
+L’image officielle `snyk/snyk:linux` est utilisée automatiquement lorsque le CLI local est absent. Le workspace est monté en lecture seule, sans privilège supplémentaire ni socket Docker, et le bootstrap de build de l’image (`npm install`, `mvn install`, `pip install`) est neutralisé pour qu’aucune commande de build ne soit exécutée dans le projet analysé.
+
+Le mode `securityCenter.snyk.mode` accepte `auto` (CLI local puis Docker), `local` ou `docker`. Trois capacités sont disponibles :
+
+| Capacité | Réglage | Catégorie Security Center | Disponibilité |
+| --- | --- | --- | --- |
+| Snyk Open Source | `securityCenter.snyk.includeOpenSource` (activé) | SCA / dépendances | tout compte Snyk |
+| Snyk Code | `securityCenter.snyk.includeCode` | SAST | selon l’offre et l’activation de l’organisation |
+| Snyk IaC | `securityCenter.snyk.includeIaC` | mauvaises configurations | selon l’offre |
+
+Si Snyk Code ou Snyk IaC n’est pas disponible pour le compte, la capacité est signalée explicitement dans la carte Snyk et Snyk Open Source continue de s’exécuter normalement. En headless, le jeton provient uniquement de `SNYK_TOKEN` : `node src/cli.js scan --tools Snyk --snyk-mode auto`.
+
+Les résultats Snyk Open Source désignent un manifeste et non une ligne de code : ils restent visibles dans Security Center avec le manifeste comme localisation, sans être épinglés à une fausse ligne dans le panneau Problems.
+
 ## Burp Suite et revalidation
 
 Burp est optionnel. Dans le dashboard, **Installer / configurer Burp** détecte si Burp est installé ou démarré, propose le téléchargement Community officiel et affiche le connecteur Java inclus. La capture automatique accepte uniquement `localhost`, `127.0.0.1` et `::1`, masque les en-têtes sensibles et déduplique durablement les requêtes identiques.

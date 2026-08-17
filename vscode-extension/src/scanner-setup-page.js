@@ -220,10 +220,115 @@ function renderSonarServerSection(sonar, busy, { serverUrl, connection }) {
       <div class="actions"><button data-sonar-server-start ${disabled}>Démarrer le serveur</button><button class="secondary" data-sonar-server="existing" ${disabled}>Utiliser un serveur existant</button></div>`;
 }
 
-function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {}, confirmation = null, sonar = null) {
+/** Engine the Snyk runner would actually pick, from the configured mode. */
+function usedSnykMode(snyk) {
+  const mode = SONAR_MODES.some(([value]) => value === snyk.mode) ? snyk.mode : 'auto';
+  if (mode === 'local') return snyk.cliVersion ? 'Local' : '';
+  if (mode === 'docker') return snyk.dockerAvailable ? 'Docker' : '';
+  return snyk.cliVersion ? 'Local' : snyk.dockerAvailable ? 'Docker' : '';
+}
+
+/**
+ * Snyk needs an account, so an incomplete setup is reported rather than
+ * silently switched off. Snyk Code or IaC being unavailable on the plan never
+ * marks the whole scanner as broken: Open Source alone makes it useful.
+ */
+function snykDiagnosis(snyk) {
+  const mode = SONAR_MODES.some(([value]) => value === snyk.mode) ? snyk.mode : 'auto';
+  if (!snyk.enabled) {
+    return { state: 'disabled', label: 'Désactivé', hint: 'Snyk ne participe pas au pipeline. Activez-le depuis cette carte pour l’y intégrer.' };
+  }
+  if (snyk.blockedByProjectPolicy) {
+    return {
+      state: 'disabled',
+      label: 'Désactivé par la politique projet',
+      hint: 'Activé dans VS Code, mais security-center.yml contient scanners.snyk: false. Modifiez le fichier du dépôt pour l’exécuter.'
+    };
+  }
+  const blockers = [];
+  if (mode === 'local' && !snyk.cliVersion) blockers.push({ label: 'CLI absent', hint: 'Le mode Local est sélectionné mais le CLI Snyk n’est pas installé. Installez-le depuis cette carte, ou choisissez Auto ou Docker.' });
+  if (mode === 'docker' && !snyk.dockerAvailable) blockers.push({ label: 'Docker indisponible', hint: 'Le mode Docker est sélectionné mais Docker ne répond pas.' });
+  if (mode === 'auto' && !snyk.cliVersion && !snyk.dockerAvailable) blockers.push({ label: 'CLI absent', hint: 'Ni le CLI Snyk local ni Docker ne sont disponibles pour exécuter l’analyse.' });
+  if (!snyk.tokenConfigured) blockers.push({ label: 'Token manquant', hint: 'Un jeton Snyk est nécessaire : Snyk résout les vulnérabilités via son service.' });
+  else if (snyk.authenticationValid === false) blockers.push({ label: 'Token refusé', hint: 'Snyk a rejeté le jeton enregistré. Remplacez-le depuis cette carte.' });
+  if (blockers.length > 1) {
+    return { state: 'missing', label: 'Activé — configuration incomplète', hint: blockers.map((blocker) => blocker.label).join(' • ') };
+  }
+  if (blockers.length === 1) {
+    return { state: blockers[0].label === 'Token manquant' ? 'missing' : 'failed', ...blockers[0] };
+  }
+  if (!snyk.cliVersion) {
+    return { state: 'ready', label: 'Prêt — Docker', hint: 'CLI Snyk local absent : l’image officielle snyk/snyk sera utilisée.' };
+  }
+  return { state: 'ready', label: 'Prêt', hint: '' };
+}
+
+/**
+ * Capability line. `null` means « pas encore vérifié » and is deliberately not
+ * presented as a failure: only a scan or an explicit probe can decide.
+ */
+function snykCapabilityLabel(enabled, available) {
+  if (!enabled) return '<span class="muted">Non activé</span>';
+  if (available === true) return 'Disponible';
+  if (available === false) return 'Indisponible pour ce compte/configuration';
+  return '<span class="muted">Non vérifié</span>';
+}
+
+function renderSnykCard(snyk, pageBusy) {
+  const busy = Boolean(pageBusy || snyk.busy);
+  const diagnosis = snykDiagnosis(snyk);
+  const mode = SONAR_MODES.some(([value]) => value === snyk.mode) ? snyk.mode : 'auto';
+  const used = usedSnykMode(snyk);
+  const capabilities = snyk.capabilities || {};
+  const execution = used === 'Local'
+    ? (snyk.cliPath || 'CLI Snyk local détecté')
+    : used === 'Docker' ? 'snyk/snyk:linux' : 'Aucun moteur d’exécution disponible';
+  const installing = snyk.installing?.state === 'installing';
+  // Docker mode never needs the local binary, so the install action disappears
+  // instead of proposing a download the user does not need.
+  const installAction = snyk.cliVersion || mode === 'docker'
+    ? ''
+    : `<button data-snyk-install ${busy || installing ? 'disabled' : ''}>${installing ? 'Installation du CLI Snyk…' : 'Installer Snyk CLI'}</button>`;
+  const installProgress = snyk.installing
+    ? `<div class="operation ${escapeHtml(snyk.installing.state || '')}">${installing ? '<span class="spinner" aria-hidden="true"></span>' : ''}<div><strong>${escapeHtml(snyk.installing.title || 'Installation du CLI Snyk')}</strong><p>${escapeHtml(snyk.installing.message || '')}</p>${Number.isFinite(snyk.installing.percent) ? `<progress max="100" value="${snyk.installing.percent}"></progress>` : ''}</div></div>`
+    : '';
+  return `<article class="tool ${diagnosis.state}" data-tool="snyk">
+      <div class="tool-head"><div><h2>Snyk</h2><p>Analyse SCA / SAST / IaC</p></div><span class="status">${escapeHtml(diagnosis.label)}</span></div>
+      ${diagnosis.hint ? `<div class="operation ${diagnosis.state === 'failed' ? 'failed' : ''}"><div><strong>${escapeHtml(diagnosis.label)}</strong><p>${escapeHtml(diagnosis.hint)}</p></div></div>` : ''}
+
+      <h3 class="sonar-section">CLI Snyk<small>Exécute l’analyse sur le workspace</small></h3>
+      <dl>
+        <div><dt>État</dt><dd>${escapeHtml(diagnosis.label)}</dd></div>
+        <div><dt>Mode configuré</dt><dd>${escapeHtml(SONAR_MODES.find(([value]) => value === mode)[1])}</dd></div>
+        <div><dt>Mode utilisé</dt><dd>${used ? escapeHtml(used) : '<span class="muted">Aucun moteur disponible</span>'}</dd></div>
+        <div><dt>Version</dt><dd>${escapeHtml(snyk.cliVersion || 'Non détectée')}</dd></div>
+        <div><dt>Exécution</dt><dd class="path">${escapeHtml(execution)}</dd></div>
+      </dl>
+      ${installProgress}
+      <div class="actions">${installAction}${modeButtons('data-snyk-mode', '', mode, { auto: true, local: true, docker: true }, busy)}</div>
+
+      <h3 class="sonar-section">Capacités<small>Open Source est la base, Code et IaC dépendent du compte</small></h3>
+      <dl>
+        <div><dt>Open Source</dt><dd>${snykCapabilityLabel(snyk.includeOpenSource !== false, capabilities.openSource)}</dd></div>
+        <div><dt>Code</dt><dd>${snykCapabilityLabel(Boolean(snyk.includeCode), capabilities.code)}</dd></div>
+        <div><dt>IaC</dt><dd>${snykCapabilityLabel(Boolean(snyk.includeIaC), capabilities.iac)}</dd></div>
+      </dl>
+
+      <h3 class="sonar-section">Authentification<small>Jeton conservé par VS Code SecretStorage</small></h3>
+      <dl>
+        <div><dt>Token</dt><dd>${snyk.tokenConfigured ? `Configuré${snyk.authenticationValid === false ? ' <span class="muted">(refusé par Snyk)</span>' : snyk.authenticationValid === true ? ' <span class="muted">(validé)</span>' : ''}` : '<span class="muted">Non configuré</span>'}</dd></div>
+      </dl>
+      <div class="actions"><button class="secondary" data-snyk-token ${busy ? 'disabled' : ''}>${snyk.tokenConfigured ? 'Remplacer le token' : 'Configurer le token'}</button></div>
+
+      <div class="actions sonar-footer"><button data-snyk-enabled="${snyk.enabled ? 'false' : 'true'}" ${busy ? 'disabled' : ''}>${snyk.enabled ? 'Désactiver Snyk' : 'Activer Snyk'}</button><button class="secondary" data-snyk-recheck ${busy ? 'disabled' : ''}>Revérifier</button></div>
+    </article>`;
+}
+
+function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {}, confirmation = null, sonar = null, snyk = null) {
   const busy = Object.values(operations).some((operation) => operation?.state === 'installing');
   const cards = statuses.map((tool) => renderManagedCard(tool, busy, operations[tool.id])).join('')
-    + (sonar ? renderSonarCard(sonar, busy) : '');
+    + (sonar ? renderSonarCard(sonar, busy) : '')
+    + (snyk ? renderSnykCard(snyk, busy) : '');
   const confirmationHtml = confirmation ? `<div class="confirm-backdrop" role="presentation"><section class="confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
     <div class="confirm-icon" aria-hidden="true">↓</div><div class="confirm-content"><p class="eyebrow">INSTALLATION LOCALE SÉCURISÉE</p><h2 id="confirm-title">Autoriser l’installation ?</h2>
     <p>Security Center installera uniquement les outils sélectionnés dans le stockage privé de l’extension.</p><div class="tool-chips">${confirmation.labels.map((label) => `<span>${escapeHtml(label)}</span>`).join('')}</div>
@@ -234,7 +339,11 @@ function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {
     :root{color-scheme:light;--bg:#f7f8fb;--card:#fff;--text:#26344a;--muted:#687386;--border:#d8deea;--accent:#5577d8;--ok:#2f9e62;--warn:#c58a19;--bad:#d9534f;--overlay:rgba(21,28,40,.34)}html[data-theme=dark]{color-scheme:dark;--bg:#181818;--card:#222;--text:#ddd;--muted:#aaa;--border:#444;--accent:#7aa2ff;--ok:#75ce91;--warn:#e0ad4f;--bad:#ff7b72;--overlay:rgba(0,0,0,.6)}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px var(--vscode-font-family,Segoe UI);padding:28px}.wrap{max-width:1120px;margin:auto}.hero{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;border-bottom:1px solid var(--border);padding-bottom:18px;margin-bottom:20px}h1{font-size:28px;margin:0 0 7px}p{color:var(--muted);margin:4px 0;line-height:1.5}.hero-actions,.actions{display:flex;gap:8px;flex-wrap:wrap}.notice{border:1px solid var(--border);border-left:3px solid var(--accent);background:var(--card);padding:14px 16px;margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.tool{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:17px}.tool-head{display:flex;justify-content:space-between;gap:15px}.tool h2{font-size:17px;margin:0}.status{font-weight:700;color:var(--muted)}.ready .status{color:var(--ok)}.failed .status{color:var(--bad)}.installing .status{color:var(--accent)}dl{margin:15px 0}dl>div{display:grid;grid-template-columns:110px 1fr;padding:7px 0;border-top:1px solid var(--border)}dt{color:var(--muted)}dd{margin:0}.path{overflow-wrap:anywhere;font-family:var(--vscode-editor-font-family,monospace);font-size:12px}.operation{display:flex;gap:10px;background:color-mix(in srgb,var(--accent) 9%,var(--card));padding:10px;border-radius:5px;margin:12px 0}.operation.failed{background:color-mix(in srgb,var(--bad) 9%,var(--card))}.spinner{width:15px;height:15px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;flex:none;margin-top:2px}.operation.failed .spinner{animation:none;border-color:var(--bad)}progress{width:100%;accent-color:var(--accent)}button{border:0;border-radius:4px;padding:8px 12px;background:var(--accent);color:#fff;font:inherit;cursor:pointer}button.secondary{background:var(--vscode-button-secondaryBackground,#e8eaf0);color:var(--vscode-button-secondaryForeground,var(--text))}button:disabled{opacity:.55;cursor:wait}button:focus-visible{outline:2px solid var(--vscode-focusBorder,var(--accent));outline-offset:2px}.footer{margin-top:18px;color:var(--muted)}.tool.disabled .status{color:var(--muted)}.tool.missing .status{color:var(--warn)}.sonar-note{font-size:12px;margin:0 0 12px}.sonar-section{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:18px 0 0;padding-top:12px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:10px;align-items:baseline}.sonar-section small{text-transform:none;letter-spacing:0;font-weight:400}.sonar-footer{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}.sonar-note code{font-family:var(--vscode-editor-font-family,monospace)}.muted{color:var(--muted)}.confirm-backdrop{position:fixed;inset:0;z-index:10;background:var(--overlay);display:grid;place-items:center;padding:24px}.confirm{width:min(620px,100%);display:grid;grid-template-columns:auto 1fr;gap:16px;background:var(--card);border:1px solid var(--vscode-focusBorder,var(--accent));border-radius:10px;padding:22px;box-shadow:0 12px 38px var(--overlay)}.confirm-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--accent) 13%,var(--card));color:var(--accent);font-size:22px;font-weight:700}.eyebrow{color:var(--accent);font-size:11px;font-weight:800;letter-spacing:.08em}.confirm h2{font-size:21px;margin:2px 0 8px}.tool-chips{display:flex;gap:7px;flex-wrap:wrap;margin:14px 0}.tool-chips span{border:1px solid var(--border);border-radius:99px;padding:4px 9px;font-weight:700}.confirm-details{border:1px solid var(--border);border-radius:6px;margin:12px 0}.confirm-details>div:first-child{border-top:0}.confirm-note{font-size:12px}.confirm-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:760px){body{padding:16px}.grid{grid-template-columns:1fr}.hero{display:block}.hero-actions{margin-top:12px}.confirm{grid-template-columns:1fr}.confirm-icon{display:none}}
   </style></head><body><main class="wrap"><header class="hero"><div><h1>Configuration des scanners</h1><p>Des analyses locales fiables, sans dépendre de Docker Desktop.</p></div><div class="hero-actions"><button id="install-all" ${busy ? 'disabled' : ''}>Installer les outils manquants</button><button id="refresh" class="secondary" ${busy ? 'disabled' : ''}>Actualiser le diagnostic</button></div></header>
   <section class="notice"><strong>Vous gardez le contrôle.</strong><p>Aucune installation n’est lancée sans votre confirmation. Les outils sont placés dans le stockage privé de l’extension, sans droits administrateur. Les scanners déjà disponibles sont réutilisés et un échec n’empêche pas les autres analyses.</p></section><section class="grid">${cards}</section><p class="footer">Sources officielles uniquement · vérification SHA-256 des binaires · provenance enregistrée · Docker reste disponible comme secours facultatif.</p></main>${confirmationHtml}
-  <script nonce="${nonce}">const vscode=acquireVsCodeApi();document.getElementById('refresh').onclick=()=>vscode.postMessage({type:'refresh'});document.getElementById('install-all').onclick=()=>vscode.postMessage({type:'requestInstallAll'});document.querySelectorAll('[data-install]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'requestInstall',tool:b.dataset.install}));document.querySelectorAll('[data-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setAuto',tool:b.dataset.mode}));document.querySelectorAll('[data-scanner-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerMode',tool:b.dataset.scanner,mode:b.dataset.scannerMode}));document.querySelectorAll('[data-sonar-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSonarMode',mode:b.dataset.sonarMode}));document.querySelectorAll('[data-scanner-enabled]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerEnabled',tool:b.dataset.scanner,enabled:b.dataset.scannerEnabled==='true'}));document.querySelector('[data-sonar-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSonarEnabled',enabled:e.currentTarget.dataset.sonarEnabled==='true'}));document.querySelector('[data-sonar-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarToken'}));document.querySelectorAll('[data-sonar-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-sonar-server]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'chooseSonarServer',serverType:b.dataset.sonarServer}));document.querySelector('[data-sonar-server-start]')?.addEventListener('click',()=>vscode.postMessage({type:'startSonarServer'}));document.querySelector('[data-sonar-server-stop]')?.addEventListener('click',()=>vscode.postMessage({type:'stopSonarServer'}));document.querySelector('[data-sonar-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'sonarscanner'}));document.querySelector('[data-sonar-server-url]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarHostUrl'}));document.querySelector('[data-sonar-open]')?.addEventListener('click',()=>vscode.postMessage({type:'openSonarServer'}));document.getElementById('approve-install')?.addEventListener('click',()=>vscode.postMessage({type:'approveInstall'}));document.getElementById('cancel-install')?.addEventListener('click',()=>vscode.postMessage({type:'cancelInstall'}));</script></body></html>`;
+  <script nonce="${nonce}">const vscode=acquireVsCodeApi();document.getElementById('refresh').onclick=()=>vscode.postMessage({type:'refresh'});document.getElementById('install-all').onclick=()=>vscode.postMessage({type:'requestInstallAll'});document.querySelectorAll('[data-install]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'requestInstall',tool:b.dataset.install}));document.querySelectorAll('[data-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setAuto',tool:b.dataset.mode}));document.querySelectorAll('[data-scanner-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerMode',tool:b.dataset.scanner,mode:b.dataset.scannerMode}));document.querySelectorAll('[data-sonar-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSonarMode',mode:b.dataset.sonarMode}));document.querySelectorAll('[data-scanner-enabled]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerEnabled',tool:b.dataset.scanner,enabled:b.dataset.scannerEnabled==='true'}));document.querySelector('[data-sonar-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSonarEnabled',enabled:e.currentTarget.dataset.sonarEnabled==='true'}));document.querySelector('[data-sonar-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarToken'}));document.querySelectorAll('[data-sonar-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-sonar-server]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'chooseSonarServer',serverType:b.dataset.sonarServer}));document.querySelector('[data-sonar-server-start]')?.addEventListener('click',()=>vscode.postMessage({type:'startSonarServer'}));document.querySelector('[data-sonar-server-stop]')?.addEventListener('click',()=>vscode.postMessage({type:'stopSonarServer'}));document.querySelector('[data-sonar-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'sonarscanner'}));document.querySelector('[data-sonar-server-url]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarHostUrl'}));document.querySelector('[data-sonar-open]')?.addEventListener('click',()=>vscode.postMessage({type:'openSonarServer'}));document.querySelectorAll('[data-snyk-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSnykMode',mode:b.dataset.snykMode}));document.querySelector('[data-snyk-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSnykEnabled',enabled:e.currentTarget.dataset.snykEnabled==='true'}));document.querySelector('[data-snyk-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSnykToken'}));document.querySelector('[data-snyk-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'snyk'}));document.querySelectorAll('[data-snyk-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.getElementById('approve-install')?.addEventListener('click',()=>vscode.postMessage({type:'approveInstall'}));document.getElementById('cancel-install')?.addEventListener('click',()=>vscode.postMessage({type:'cancelInstall'}));</script></body></html>`;
 }
 
-module.exports = { renderScannerSetupHtml, renderManagedCard, renderSonarCard, renderSonarServerSection, usedScannerMode, modeButtons, sonarDiagnosis, safeServerUrl, SONAR_MODES, escapeHtml };
+module.exports = {
+  renderScannerSetupHtml, renderManagedCard, renderSonarCard, renderSonarServerSection,
+  renderSnykCard, snykDiagnosis, usedSnykMode, snykCapabilityLabel,
+  usedScannerMode, modeButtons, sonarDiagnosis, safeServerUrl, SONAR_MODES, escapeHtml
+};

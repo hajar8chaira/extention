@@ -477,6 +477,8 @@ function renderAuditLogHtml(events, nonce) {
           scanners.add('OSV-Scanner');
         } else if (e.action.includes('SonarQube')) {
           scanners.add('SonarQube');
+        } else if (e.action.includes('Snyk')) {
+          scanners.add('Snyk');
         }
       });
 
@@ -586,6 +588,8 @@ function renderAuditLogHtml(events, nonce) {
           } else if (e.action.includes('OSV') && scannerVal === 'OSV-Scanner') {
             matchesScanner = true;
           } else if (e.action.includes('SonarQube') && scannerVal === 'SonarQube') {
+            matchesScanner = true;
+          } else if (e.action.includes('Snyk') && scannerVal === 'Snyk') {
             matchesScanner = true;
           }
           if (!matchesScanner) return false;

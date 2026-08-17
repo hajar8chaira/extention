@@ -5,9 +5,24 @@
   "version": "0.2.0",
   "publisher": "pfa-security-center",
   "license": "MIT",
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Linters", "Testing", "Other"],
-  "keywords": ["security", "semgrep", "gitleaks", "trivy", "sast", "sca", "secrets", "devsecops"],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Linters",
+    "Testing",
+    "Other"
+  ],
+  "keywords": [
+    "security",
+    "semgrep",
+    "gitleaks",
+    "trivy",
+    "sast",
+    "sca",
+    "secrets",
+    "devsecops"
+  ],
   "activationEvents": [
     "onCommand:securityCenter.scanWorkspace",
     "onCommand:securityCenter.scanZap",
@@ -54,70 +69,286 @@
     "onCommand:securityCenter.openScannerSetup",
     "onCommand:securityCenter.configureSonarToken",
     "onCommand:securityCenter.checkSonarQube",
+    "onCommand:securityCenter.configureSnykToken",
+    "onCommand:securityCenter.checkSnyk",
+    "onCommand:securityCenter.openSecurityPipeline",
     "onView:securityCenter.findings",
-    "onView:securityCenter.dashboard",
-    "onView:securityCenter.liveCompanion"
+    "onView:securityCenter.dashboard"
   ],
   "main": "./src/extension.js",
-  "bin": { "security-center": "./src/cli.js" },
+  "bin": {
+    "security-center": "./src/cli.js"
+  },
   "contributes": {
     "commands": [
-      { "command": "securityCenter.configureZap", "title": "Security Center: Installer ou configurer OWASP ZAP", "icon": "$(tools)" },
-      { "command": "securityCenter.configureZapCredentials", "title": "Security Center: Configurer le compte de test ZAP", "icon": "$(key)" },
-      { "command": "securityCenter.scanZap", "title": "Security Center: Relancer ZAP uniquement", "icon": "$(debug-restart)" },
-      { "command": "securityCenter.scanWorkspace", "title": "Security Center: Lancer ou relancer l’analyse", "icon": "$(shield)" },
-      { "command": "securityCenter.scanSelected", "title": "Security Center: Choisir les scanners", "icon": "$(list-selection)" },
-      { "command": "securityCenter.showLogs", "title": "Security Center: Afficher le journal des scans", "icon": "$(output)" },
-      { "command": "securityCenter.configureBurp", "title": "Security Center: Configurer Burp Suite", "icon": "$(plug)" },
-      { "command": "securityCenter.clearFindings", "title": "Security Center: Clear Findings", "icon": "$(clear-all)" },
-      { "command": "securityCenter.setFindingStatus", "title": "Security Center: Changer le statut" },
-      { "command": "securityCenter.importHttpCapture", "title": "Security Center: Importer une capture HTTP (HAR)" },
-      { "command": "securityCenter.replayHttpScenario", "title": "Security Center: Rejouer un scénario HTTP" },
-      { "command": "securityCenter.applyFindingFix", "title": "Security Center: Appliquer la correction Semgrep proposée", "icon": "$(wand)" },
-      { "command": "securityCenter.configureTeamIntegrations", "title": "Security Center: Configurer Slack ou Jira", "icon": "$(broadcast)" },
-      { "command": "securityCenter.configureOllama", "title": "Security Center: Configurer Ollama local", "icon": "$(hubot)" },
-      { "command": "securityCenter.generateAiFix", "title": "Security Center: Proposer une correction avec Ollama", "icon": "$(sparkle)" },
-      { "command": "securityCenter.rollbackAiFix", "title": "Security Center: Annuler le dernier patch Ollama", "icon": "$(discard)" },
-      { "command": "securityCenter.openDashboard", "title": "Security Center: Ouvrir le dashboard complet", "icon": "$(open-preview)" },
-      { "command": "securityCenter.openFindingsPage", "title": "Security Center: Ouvrir la page Findings", "icon": "$(issues)" },
-      { "command": "securityCenter.openScansPage", "title": "Security Center: Ouvrir la page Scans", "icon": "$(pulse)" },
-      { "command": "securityCenter.openDynamicPage", "title": "Security Center: Ouvrir Dynamic Security", "icon": "$(globe)" },
-      { "command": "securityCenter.checkDynamicTarget", "title": "Security Center: Vérifier la cible dynamique", "icon": "$(pulse)" },
-      { "command": "securityCenter.changeDynamicTarget", "title": "Security Center: Modifier la cible dynamique", "icon": "$(edit)" },
-      { "command": "securityCenter.openAnalyticsPage", "title": "Security Center: Ouvrir Analytics", "icon": "$(graph)" },
-      { "command": "securityCenter.openScannerSetup", "title": "Security Center: Configurer les scanners locaux", "icon": "$(tools)" },
-      { "command": "securityCenter.showScanHistory", "title": "Security Center: Historique et exports", "icon": "$(history)" },
-      { "command": "securityCenter.showScanHistoryPage", "title": "Security Center: Ouvrir la page d’historique des scans", "icon": "$(history)" },
-      { "command": "securityCenter.compareScans", "title": "Security Center: Comparer les scans", "icon": "$(compare-changes)" },
-      { "command": "securityCenter.scanIncremental", "title": "Security Center: Scan rapide des fichiers modifiés", "icon": "$(git-compare)" },
-      { "command": "securityCenter.showAuditLog", "title": "Security Center: Journal d’audit", "icon": "$(notebook)" },
-      { "command": "securityCenter.openProjectPolicy", "title": "Security Center: Configurer la politique projet", "icon": "$(settings-gear)" },
-      { "command": "securityCenter.generateSbom", "title": "Security Center: Exporter le SBOM CycloneDX", "icon": "$(package)" },
-      { "command": "securityCenter.checkLicenses", "title": "Security Center: Contrôler les licences", "icon": "$(law)" },
-      { "command": "securityCenter.configureBackendApiKey", "title": "Security Center: Configurer la clé API backend", "icon": "$(key)" },
-      { "command": "securityCenter.configureSonarToken", "title": "Security Center: Configurer le jeton SonarQube", "icon": "$(key)" },
-      { "command": "securityCenter.checkSonarQube", "title": "Security Center: Vérifier la configuration SonarQube", "icon": "$(pulse)" },
-      { "command": "securityCenter.installPreCommitHook", "title": "Security Center: Protéger les commits avec Gitleaks", "icon": "$(git-commit)" },
-      { "command": "securityCenter.showTrends", "title": "Security Center: Tendances et MTTR", "icon": "$(graph-line)" },
-      { "command": "securityCenter.enableLiveSecurity", "title": "Security Center: Enable Live Security", "icon": "$(eye)" },
-      { "command": "securityCenter.disableLiveSecurity", "title": "Security Center: Disable Live Security", "icon": "$(eye-closed)" },
-      { "command": "securityCenter.toggleLiveSecurity", "title": "Security Center: Toggle Live Security", "icon": "$(shield)" }
-      ,{ "command": "securityCenter.explainLiveFinding", "title": "Security Center: Explain Live Security Warning", "icon": "$(info)" }
-      ,{ "command": "securityCenter.applyLiveQuickFix", "title": "Security Center: Apply Live Security Quick Fix", "icon": "$(lightbulb)" }
-      ,{ "command": "securityCenter.generateLiveAiFix", "title": "Security Center: Generate Live Fix with Ollama", "icon": "$(sparkle)" }
-      ,{ "command": "securityCenter.openLiveFinding", "title": "Security Center: Open Live Security Warning", "icon": "$(go-to-file)" }
-      ,{ "command": "securityCenter.ignoreLiveFindingForSession", "title": "Security Center: Ignore Live Warning for Session", "icon": "$(mute)" }
-      ,{ "command": "securityCenter.focusLiveSecurity", "title": "Security Center: Focus Live Security", "icon": "$(shield)" }
-      ,{ "command": "securityCenter.openLiveSecurityPage", "title": "Security Center: Open Live Security", "icon": "$(shield)" }
+      {
+        "command": "securityCenter.configureZap",
+        "title": "Security Center: Installer ou configurer OWASP ZAP",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "securityCenter.configureZapCredentials",
+        "title": "Security Center: Configurer le compte de test ZAP",
+        "icon": "$(key)"
+      },
+      {
+        "command": "securityCenter.scanZap",
+        "title": "Security Center: Relancer ZAP uniquement",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "securityCenter.scanWorkspace",
+        "title": "Security Center: Lancer ou relancer l’analyse",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "securityCenter.scanSelected",
+        "title": "Security Center: Choisir les scanners",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "securityCenter.showLogs",
+        "title": "Security Center: Afficher le journal des scans",
+        "icon": "$(output)"
+      },
+      {
+        "command": "securityCenter.configureBurp",
+        "title": "Security Center: Configurer Burp Suite",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "securityCenter.clearFindings",
+        "title": "Security Center: Clear Findings",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "securityCenter.setFindingStatus",
+        "title": "Security Center: Changer le statut"
+      },
+      {
+        "command": "securityCenter.importHttpCapture",
+        "title": "Security Center: Importer une capture HTTP (HAR)"
+      },
+      {
+        "command": "securityCenter.replayHttpScenario",
+        "title": "Security Center: Rejouer un scénario HTTP"
+      },
+      {
+        "command": "securityCenter.applyFindingFix",
+        "title": "Security Center: Appliquer la correction Semgrep proposée",
+        "icon": "$(wand)"
+      },
+      {
+        "command": "securityCenter.configureTeamIntegrations",
+        "title": "Security Center: Configurer Slack ou Jira",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "securityCenter.configureOllama",
+        "title": "Security Center: Configurer Ollama local",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "securityCenter.generateAiFix",
+        "title": "Security Center: Proposer une correction avec Ollama",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "securityCenter.rollbackAiFix",
+        "title": "Security Center: Annuler le dernier patch Ollama",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "securityCenter.openDashboard",
+        "title": "Security Center: Ouvrir le dashboard complet",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "securityCenter.openFindingsPage",
+        "title": "Security Center: Ouvrir la page Findings",
+        "icon": "$(issues)"
+      },
+      {
+        "command": "securityCenter.openScansPage",
+        "title": "Security Center: Ouvrir la page Scans",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "securityCenter.openDynamicPage",
+        "title": "Security Center: Ouvrir Dynamic Security",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "securityCenter.checkDynamicTarget",
+        "title": "Security Center: Vérifier la cible dynamique",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "securityCenter.changeDynamicTarget",
+        "title": "Security Center: Modifier la cible dynamique",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "securityCenter.openAnalyticsPage",
+        "title": "Security Center: Ouvrir Analytics",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "securityCenter.openScannerSetup",
+        "title": "Security Center: Configurer les scanners locaux",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "securityCenter.showScanHistory",
+        "title": "Security Center: Historique et exports",
+        "icon": "$(history)"
+      },
+      {
+        "command": "securityCenter.showScanHistoryPage",
+        "title": "Security Center: Ouvrir la page d’historique des scans",
+        "icon": "$(history)"
+      },
+      {
+        "command": "securityCenter.compareScans",
+        "title": "Security Center: Comparer les scans",
+        "icon": "$(compare-changes)"
+      },
+      {
+        "command": "securityCenter.scanIncremental",
+        "title": "Security Center: Scan rapide des fichiers modifiés",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "securityCenter.showAuditLog",
+        "title": "Security Center: Journal d’audit",
+        "icon": "$(notebook)"
+      },
+      {
+        "command": "securityCenter.openProjectPolicy",
+        "title": "Security Center: Configurer la politique projet",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "securityCenter.generateSbom",
+        "title": "Security Center: Exporter le SBOM CycloneDX",
+        "icon": "$(package)"
+      },
+      {
+        "command": "securityCenter.checkLicenses",
+        "title": "Security Center: Contrôler les licences",
+        "icon": "$(law)"
+      },
+      {
+        "command": "securityCenter.configureBackendApiKey",
+        "title": "Security Center: Configurer la clé API backend",
+        "icon": "$(key)"
+      },
+      {
+        "command": "securityCenter.configureSonarToken",
+        "title": "Security Center: Configurer le jeton SonarQube",
+        "icon": "$(key)"
+      },
+      {
+        "command": "securityCenter.checkSonarQube",
+        "title": "Security Center: Vérifier la configuration SonarQube",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "securityCenter.configureSnykToken",
+        "title": "Security Center: Configurer le jeton Snyk",
+        "icon": "$(key)"
+      },
+      {
+        "command": "securityCenter.checkSnyk",
+        "title": "Security Center: Vérifier la configuration Snyk",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "securityCenter.openSecurityPipeline",
+        "title": "Security Center: Ouvrir le pipeline de sécurité",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "securityCenter.installPreCommitHook",
+        "title": "Security Center: Protéger les commits avec Gitleaks",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "securityCenter.showTrends",
+        "title": "Security Center: Tendances et MTTR",
+        "icon": "$(graph-line)"
+      },
+      {
+        "command": "securityCenter.enableLiveSecurity",
+        "title": "Security Center: Enable Live Security",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "securityCenter.disableLiveSecurity",
+        "title": "Security Center: Disable Live Security",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "securityCenter.toggleLiveSecurity",
+        "title": "Security Center: Toggle Live Security",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "securityCenter.explainLiveFinding",
+        "title": "Security Center: Explain Live Security Warning",
+        "icon": "$(info)"
+      },
+      {
+        "command": "securityCenter.applyLiveQuickFix",
+        "title": "Security Center: Apply Live Security Quick Fix",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "securityCenter.generateLiveAiFix",
+        "title": "Security Center: Generate Live Fix with Ollama",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "securityCenter.openLiveFinding",
+        "title": "Security Center: Open Live Security Warning",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "securityCenter.ignoreLiveFindingForSession",
+        "title": "Security Center: Ignore Live Warning for Session",
+        "icon": "$(mute)"
+      },
+      {
+        "command": "securityCenter.focusLiveSecurity",
+        "title": "Security Center: Focus Live Security",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "securityCenter.openLiveSecurityPage",
+        "title": "Security Center: Open Live Security",
+        "icon": "$(shield)"
+      }
     ],
     "viewsContainers": {
-      "activitybar": [{ "id": "securityCenter", "title": "Security Center", "icon": "media/shield.svg" }]
+      "activitybar": [
+        {
+          "id": "securityCenter",
+          "title": "Security Center",
+          "icon": "media/shield.svg"
+        }
+      ]
     },
     "views": {
       "securityCenter": [
-        { "id": "securityCenter.dashboard", "name": "Dashboard", "type": "webview" },
-        { "id": "securityCenter.liveCompanion", "name": "Security Companion", "type": "webview", "when": "config.securityCenter.live.companion.enabled" },
-        { "id": "securityCenter.findings", "name": "Vulnérabilités" }
+        {
+          "id": "securityCenter.dashboard",
+          "name": "Dashboard",
+          "type": "webview"
+        },
+        {
+          "id": "securityCenter.findings",
+          "name": "Vulnérabilités"
+        }
       ]
     },
     "viewsWelcome": [
@@ -128,15 +359,51 @@
     ],
     "menus": {
       "view/title": [
-        { "command": "securityCenter.scanWorkspace", "when": "view == securityCenter.findings", "group": "navigation@1" },
-        { "command": "securityCenter.scanSelected", "when": "view == securityCenter.findings", "group": "navigation@2" },
-        { "command": "securityCenter.clearFindings", "when": "view == securityCenter.findings", "group": "navigation@3" },
-        { "command": "securityCenter.scanWorkspace", "when": "view == securityCenter.dashboard", "group": "navigation@1" },
-        { "command": "securityCenter.scanSelected", "when": "view == securityCenter.dashboard", "group": "navigation@2" },
-        { "command": "securityCenter.openDashboard", "when": "view == securityCenter.dashboard", "group": "navigation@3" },
-        { "command": "securityCenter.showLogs", "when": "view == securityCenter.dashboard", "group": "navigation@4" },
-        { "command": "securityCenter.configureBurp", "when": "view == securityCenter.dashboard", "group": "navigation@5" },
-        { "command": "securityCenter.showScanHistory", "when": "view == securityCenter.dashboard", "group": "navigation@6" }
+        {
+          "command": "securityCenter.scanWorkspace",
+          "when": "view == securityCenter.findings",
+          "group": "navigation@1"
+        },
+        {
+          "command": "securityCenter.scanSelected",
+          "when": "view == securityCenter.findings",
+          "group": "navigation@2"
+        },
+        {
+          "command": "securityCenter.clearFindings",
+          "when": "view == securityCenter.findings",
+          "group": "navigation@3"
+        },
+        {
+          "command": "securityCenter.scanWorkspace",
+          "when": "view == securityCenter.dashboard",
+          "group": "navigation@1"
+        },
+        {
+          "command": "securityCenter.scanSelected",
+          "when": "view == securityCenter.dashboard",
+          "group": "navigation@2"
+        },
+        {
+          "command": "securityCenter.openDashboard",
+          "when": "view == securityCenter.dashboard",
+          "group": "navigation@3"
+        },
+        {
+          "command": "securityCenter.showLogs",
+          "when": "view == securityCenter.dashboard",
+          "group": "navigation@4"
+        },
+        {
+          "command": "securityCenter.configureBurp",
+          "when": "view == securityCenter.dashboard",
+          "group": "navigation@5"
+        },
+        {
+          "command": "securityCenter.showScanHistory",
+          "when": "view == securityCenter.dashboard",
+          "group": "navigation@6"
+        }
       ],
       "view/item/context": [
         {
@@ -162,7 +429,11 @@
         "securityCenter.semgrep.command": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "local", "docker"],
+          "enum": [
+            "auto",
+            "local",
+            "docker"
+          ],
           "description": "Mode d’exécution de Semgrep. Auto essaie Semgrep local puis Docker."
         },
         "securityCenter.semgrep.config": {
@@ -178,7 +449,11 @@
         "securityCenter.gitleaks.command": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "local", "docker"],
+          "enum": [
+            "auto",
+            "local",
+            "docker"
+          ],
           "description": "Mode d’exécution de Gitleaks. Auto essaie Gitleaks local puis Docker."
         },
         "securityCenter.trivy.enabled": {
@@ -189,7 +464,11 @@
         "securityCenter.trivy.command": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "local", "docker"],
+          "enum": [
+            "auto",
+            "local",
+            "docker"
+          ],
           "description": "Mode d’exécution de Trivy. Auto essaie Trivy local puis Docker."
         },
         "securityCenter.trivy.image": {
@@ -199,8 +478,13 @@
         },
         "securityCenter.licenses.denied": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": ["AGPL-3.0", "GPL-3.0"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "AGPL-3.0",
+            "GPL-3.0"
+          ],
           "description": "Identifiants ou expressions de licences interdits par la politique du projet."
         },
         "securityCenter.osv.enabled": {
@@ -211,7 +495,11 @@
         "securityCenter.osv.command": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "local", "docker"],
+          "enum": [
+            "auto",
+            "local",
+            "docker"
+          ],
           "description": "Mode d’exécution d’OSV-Scanner. Auto essaie OSV local puis Docker."
         },
         "securityCenter.sonar.enabled": {
@@ -222,14 +510,26 @@
         "securityCenter.sonar.mode": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "local", "docker"],
+          "enum": [
+            "auto",
+            "local",
+            "docker"
+          ],
           "description": "Mode d’exécution de SonarScanner. Auto essaie le CLI local puis l’image Docker sonarsource/sonar-scanner-cli."
         },
         "securityCenter.sonar.serverType": {
           "type": "string",
           "default": "",
-          "enum": ["", "local", "existing"],
-          "enumDescriptions": ["Aucun serveur choisi", "Serveur local géré par Security Center avec Docker", "Serveur SonarQube existant"],
+          "enum": [
+            "",
+            "local",
+            "existing"
+          ],
+          "enumDescriptions": [
+            "Aucun serveur choisi",
+            "Serveur local géré par Security Center avec Docker",
+            "Serveur SonarQube existant"
+          ],
           "description": "Origine du serveur SonarQube. Indépendant du mode d’exécution de SonarScanner."
         },
         "securityCenter.sonar.hostUrl": {
@@ -253,6 +553,53 @@
           "minimum": 60,
           "maximum": 3600,
           "description": "Durée maximale de l’analyse SonarScanner et de l’attente du traitement serveur."
+        },
+        "securityCenter.snyk.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Active l’analyse Snyk. Nécessite un compte Snyk et un jeton enregistré via « Configurer le jeton Snyk »."
+        },
+        "securityCenter.snyk.mode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "local",
+            "docker"
+          ],
+          "description": "Mode d’exécution du CLI Snyk. Auto essaie le CLI local puis l’image Docker officielle snyk/snyk."
+        },
+        "securityCenter.snyk.includeOpenSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "Analyse les dépendances vulnérables avec Snyk Open Source (SCA). Disponible avec tout compte Snyk."
+        },
+        "securityCenter.snyk.includeCode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ajoute l’analyse statique Snyk Code (SAST). Nécessite que Snyk Code soit activé pour l’organisation."
+        },
+        "securityCenter.snyk.includeIaC": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ajoute l’analyse des fichiers d’infrastructure as code avec Snyk IaC."
+        },
+        "securityCenter.snyk.timeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 60,
+          "maximum": 3600,
+          "description": "Durée maximale de chaque analyse Snyk."
+        },
+        "securityCenter.cosign.privateKeyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Chemin de la clé privée Cosign utilisée pour signer les artefacts. Le mot de passe est conservé séparément dans VS Code SecretStorage ; ne placez jamais cette clé dans le dépôt."
+        },
+        "securityCenter.cosign.publicKeyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Chemin de la clé publique Cosign utilisée pour vérifier les signatures."
         },
         "securityCenter.zap.enabled": {
           "type": "boolean",
@@ -281,26 +628,117 @@
           "default": "",
           "description": "Nom de l’auteur enregistré dans le journal d’audit. Vide utilise l’utilisateur du système."
         },
-        "securityCenter.live.enabled": { "type": "boolean", "default": false, "description": "Active le mode optionnel Live Security. Aucun scanner profond ni Ollama n’est lancé automatiquement." },
-        "securityCenter.live.debounceMs": { "type": "number", "default": 450, "minimum": 350, "maximum": 2000, "description": "Délai après la frappe avant une future analyse Live Security." },
-        "securityCenter.live.scanOnChange": { "type": "boolean", "default": true, "description": "Autorise Live Security à observer les modifications du document actif lorsqu’il est activé." },
-        "securityCenter.live.slowAnalysisThresholdMs": { "type": "number", "default": 750, "minimum": 300, "maximum": 5000, "description": "Durée à partir de laquelle une analyse Live est considérée lente. Après plusieurs analyses lentes, Live Security passe temporairement en mode sauvegarde uniquement." },
-        "securityCenter.live.debug": { "type": "boolean", "default": false, "description": "Journalise uniquement les mesures de performance Live Security, sans contenu du code." },
-        "securityCenter.live.scanOnSave": { "type": "boolean", "default": true, "description": "Autorise Live Security à observer l’enregistrement du document actif lorsqu’il est activé." },
-        "securityCenter.live.verbose": { "type": "boolean", "default": false, "description": "Affiche aussi les avertissements Live à faible confiance. Désactivé par défaut pour limiter le bruit." },
-        "securityCenter.live.companion.enabled": { "type": "boolean", "default": true, "description": "Affiche le compagnon Live Security compact dans la sidebar. Peut être désactivé indépendamment de l’analyse Live." },
-        "securityCenter.notifications.slack.enabled": { "type": "boolean", "default": false, "description": "Envoie les findings confirmés vers le webhook Slack conservé dans SecretStorage." },
-        "securityCenter.notifications.jira.enabled": { "type": "boolean", "default": false, "description": "Crée un ticket Jira pour les findings confirmés." },
-        "securityCenter.notifications.jira.baseUrl": { "type": "string", "default": "", "description": "URL HTTPS du site Jira Cloud." },
-        "securityCenter.notifications.jira.email": { "type": "string", "default": "", "description": "Adresse du compte Jira utilisé avec le jeton SecretStorage." },
-        "securityCenter.notifications.jira.projectKey": { "type": "string", "default": "", "description": "Clé du projet Jira destinataire." },
-        "securityCenter.notifications.jira.issueType": { "type": "string", "default": "Task", "description": "Type d’issue Jira à créer." }
-        ,"securityCenter.ai.ollama.baseUrl": { "type": "string", "default": "http://127.0.0.1:11434", "description": "URL locale de l’API Ollama. Les hôtes distants sont refusés." }
-        ,"securityCenter.ai.ollama.model": { "type": "string", "default": "", "description": "Ancien réglage du modèle Ollama, conservé pour migration vers les rôles Fast et Advanced." }
-        ,"securityCenter.ai.models.fast": { "type": "string", "default": "", "description": "Modèle local utilisé en priorité pour une correction rapide." }
-        ,"securityCenter.ai.models.advanced": { "type": "string", "default": "", "description": "Modèle local avancé pour les corrections complexes ou refusées." }
-        ,"securityCenter.ai.fallbackToAdvanced": { "type": "boolean", "default": true, "description": "Autorise une tentative unique avec le modèle avancé lorsque la proposition rapide ne passe pas la validation Security Center." }
-        ,"securityCenter.ai.timeoutSeconds": { "type": "number", "default": 90, "minimum": 30, "maximum": 90, "description": "Budget total maximal d’une correction Ollama. Les corrections simples sont limitées à 60 secondes." }
+        "securityCenter.live.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Active le mode optionnel Live Security. Aucun scanner profond ni Ollama n’est lancé automatiquement."
+        },
+        "securityCenter.live.debounceMs": {
+          "type": "number",
+          "default": 450,
+          "minimum": 350,
+          "maximum": 2000,
+          "description": "Délai après la frappe avant une future analyse Live Security."
+        },
+        "securityCenter.live.scanOnChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Autorise Live Security à observer les modifications du document actif lorsqu’il est activé."
+        },
+        "securityCenter.live.slowAnalysisThresholdMs": {
+          "type": "number",
+          "default": 750,
+          "minimum": 300,
+          "maximum": 5000,
+          "description": "Durée à partir de laquelle une analyse Live est considérée lente. Après plusieurs analyses lentes, Live Security passe temporairement en mode sauvegarde uniquement."
+        },
+        "securityCenter.live.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Journalise uniquement les mesures de performance Live Security, sans contenu du code."
+        },
+        "securityCenter.live.scanOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Autorise Live Security à observer l’enregistrement du document actif lorsqu’il est activé."
+        },
+        "securityCenter.live.verbose": {
+          "type": "boolean",
+          "default": false,
+          "description": "Affiche aussi les avertissements Live à faible confiance. Désactivé par défaut pour limiter le bruit."
+        },
+        "securityCenter.live.companion.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Affiche le Security Companion compact dans la page Live Security et le dashboard. Peut être désactivé indépendamment de l’analyse Live, qui continue de fonctionner."
+        },
+        "securityCenter.notifications.slack.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Envoie les findings confirmés vers le webhook Slack conservé dans SecretStorage."
+        },
+        "securityCenter.notifications.jira.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Crée un ticket Jira pour les findings confirmés."
+        },
+        "securityCenter.notifications.jira.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "URL HTTPS du site Jira Cloud."
+        },
+        "securityCenter.notifications.jira.email": {
+          "type": "string",
+          "default": "",
+          "description": "Adresse du compte Jira utilisé avec le jeton SecretStorage."
+        },
+        "securityCenter.notifications.jira.projectKey": {
+          "type": "string",
+          "default": "",
+          "description": "Clé du projet Jira destinataire."
+        },
+        "securityCenter.notifications.jira.issueType": {
+          "type": "string",
+          "default": "Task",
+          "description": "Type d’issue Jira à créer."
+        },
+        "securityCenter.ai.ollama.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "URL locale de l’API Ollama. Les hôtes distants sont refusés."
+        },
+        "securityCenter.ai.ollama.model": {
+          "type": "string",
+          "default": "",
+          "description": "Ancien réglage du modèle Ollama, conservé pour migration vers les rôles Fast et Advanced."
+        },
+        "securityCenter.ai.models.fast": {
+          "type": "string",
+          "default": "",
+          "description": "Modèle local utilisé en priorité pour une correction rapide."
+        },
+        "securityCenter.ai.models.advanced": {
+          "type": "string",
+          "default": "",
+          "description": "Modèle local avancé pour les corrections complexes ou refusées."
+        },
+        "securityCenter.ai.fallbackToAdvanced": {
+          "type": "boolean",
+          "default": true,
+          "description": "Autorise une tentative unique avec le modèle avancé lorsque la proposition rapide ne passe pas la validation Security Center."
+        },
+        "securityCenter.ai.timeoutSeconds": {
+          "type": "number",
+          "default": 90,
+          "minimum": 30,
+          "maximum": 90,
+          "description": "Budget total maximal d’une correction Ollama. Les corrections simples sont limitées à 60 secondes."
+        },
+        "securityCenter.companion.animations": {
+          "type": "boolean",
+          "default": true,
+          "description": "Anime la mascotte Security Companion. Désactivez pour un affichage strictement statique ; la préférence système « animations réduites » est respectée dans tous les cas."
+        }
       }
     }
   },
@@ -310,6 +748,6 @@
     "benchmark:ai": "node scripts/ai-remediation-benchmark.js",
     "scan:real": "node scripts/run-real-scan.js ../test-application/juice-shop ../security-reports",
     "package:vsix": "npx --yes @vscode/vsce package --out ../security-center-vscode.vsix",
-    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/license-compliance.js && node --check src/dashboard.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/remediation-result.js"
+    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/policy-config.js && node --check src/license-compliance.js && node --check src/dashboard.js && node --check src/dynamic-campaign.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/snyk.js && node --check src/snyk-api.js && node --check src/pipeline.js && node --check src/pipeline-page.js && node --check src/intelligence/finding-model.js && node --check src/intelligence/route-map.js && node --check src/intelligence/correlation-v2.js && node --check src/intelligence/reachability.js && node --check src/intelligence/prioritization.js && node --check src/intelligence/policy-gate.js && node --check src/supply-chain/sbom.js && node --check src/supply-chain/cosign.js && node --check src/supply-chain/provenance.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/remediation-result.js && node --check src/live/companionMascot.js && node --check src/live/companionMessages.js && node --check src/live/liveCompanion.js && node --check src/live/companionWidget.js && node --check src/live/livePage.js"
   }
 }

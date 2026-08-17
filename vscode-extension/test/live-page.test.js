@@ -25,9 +25,13 @@ test('montre un conseil une seule fois après répétition de la même règle', 
 });
 
 test('affiche le compagnon animé et le contexte connu uniquement avec preuves', () => {
-  const html = renderLiveSecurityPage({ state: 'analyzing', file: 'src/app.js', findings: [], activity: { detected: 0, resolved: 0, prevented: 0, recent: [], tip: '' }, ollamaModel: '', knownFindings: [{ title: 'Known issue' }] }, 'nonce', 'vscode-resource:/security-companion.png', 'vscode-webview:');
-  assert.match(html, /security-companion\.png/);
-  assert.match(html, /@keyframes float/);
+  const html = renderLiveSecurityPage({ state: 'analyzing', file: 'src/app.js', findings: [], activity: { detected: 0, resolved: 0, prevented: 0, recent: [], tip: '' }, ollamaModel: '', knownFindings: [{ title: 'Known issue' }], companion: { mascotState: 'thinking', message: { kind: 'scanning', headline: 'J’analyse les modifications…' }, liveFindingCount: 0 } }, 'nonce', 'vscode-resource:/security-companion.png', 'vscode-webview:');
+  // Le compagnon décoratif en PNG est remplacé par la vraie mascotte animée,
+  // pilotée par le modèle partagé. Une seule mascotte sur la page.
+  assert.ok(!html.includes('security-companion.png'));
+  assert.equal((html.match(/<svg class="mascot/g) || []).length, 1);
+  assert.match(html, /class="mascot mascot-thinking/);
+  assert.match(html, /@keyframes/);
   assert.match(html, /Checking current file/);
   assert.match(html, /Known findings in this file/);
   assert.match(html, /prefers-reduced-motion:reduce/);

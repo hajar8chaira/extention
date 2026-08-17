@@ -163,7 +163,7 @@ function checkTargetAvailable(targetUrl, timeoutMs = 5000) {
   });
 }
 
-async function runZap({ targetUrl, timeoutMs = 600000, signal, excludedRoutes = [], mode = 'baseline', workspacePath = '', openapi = '', context = '', user = '', auth, authEnv = process.env, engine = 'auto', localPath = '' }) {
+async function runZap({ targetUrl, timeoutMs = 600000, signal, excludedRoutes = [], mode = 'baseline', workspacePath = '', openapi = '', context = '', user = '', auth, authEnv = process.env, engine = 'auto', localPath = '', onLifecycle }) {
   validateLocalTarget(targetUrl);
   await checkTargetAvailable(targetUrl);
   const authResult = await authenticateForZap(targetUrl, auth, authEnv);
@@ -174,7 +174,7 @@ async function runZap({ targetUrl, timeoutMs = 600000, signal, excludedRoutes = 
     if (mode === 'openapi') {
       try { validateLocalTarget(openapi); } catch { localOpenapi = resolveWorkspaceFile(workspacePath, openapi, 'La spécification OpenAPI'); }
     }
-    return runLocalZap({ targetUrl, mode, localPath: detectedLocalPath, timeoutMs, signal, excludedRoutes, authResult, openapi: localOpenapi });
+    return runLocalZap({ targetUrl, mode, localPath: detectedLocalPath, timeoutMs, signal, excludedRoutes, authResult, openapi: localOpenapi, onLifecycle });
   }
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'security-center-zap-'));
   const reportPath = path.join(reportDirectory, 'zap-report.json');

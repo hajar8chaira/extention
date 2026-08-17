@@ -23,8 +23,10 @@ test('associe les états Live aux messages discrets du compagnon', () => {
 test('rend seulement les findings du modèle courant avec les actions mini-panneau', () => {
   const html = renderCompanionHtml({ state: 'issues', file: 'src/app.js', findings: [finding()] }, 'nonce', 'vscode-resource:/security-companion.png', 'vscode-webview:');
   assert.match(html, /Security Companion/);
-  assert.match(html, /security-companion\.png/);
-  assert.match(html, /@keyframes float/);
+  // La mascotte est désormais un SVG original inline : aucun asset externe,
+  // thémable, et rien à autoriser dans la CSP côté images.
+  assert.match(html, /<svg class="mascot mascot-warning /);
+  assert.match(html, /@keyframes sc-breathe/);
   assert.match(html, /img-src vscode-webview:/);
   assert.match(html, /Potential SQL injection/);
   assert.match(html, /Line 42/);

@@ -45,15 +45,60 @@ function startLocalZap(zapPath, { port = 8090, apiKey, authResult } = {}) {
   return spawn(zapPath, args, { cwd: path.dirname(zapPath), env, windowsHide: true, stdio: 'ignore' });
 }
 
-async function waitForProgress(baseUrl, apiKey, component, scanId, timeoutMs, signal) {
+/**
+ * Waits for a ZAP component to finish, reporting its real progress.
+ *
+ * `spider/view/status` and `ascan/view/status` return a genuine 0-100 percentage.
+ * That number used to be fetched and thrown away — only compared against 100 —
+ * so the UI had no progress to show and would have had to invent one. It is now
+ * handed to `onProgress` on every poll.
+ *
+ * The one-second sleep paces the polling of ZAP's own API; it never advances a
+ * percentage by itself.
+ */
+async function waitForProgress(baseUrl, apiKey, component, scanId, timeoutMs, signal, onProgress) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error('Scan ZAP annulé.');
     const result = await zapApi(baseUrl, apiKey, component, 'view', 'status', { scanId });
-    if (Number(result.status) >= 100) return;
+    const percent = Number(result.status);
+    if (Number.isFinite(percent)) onProgress?.(Math.max(0, Math.min(100, percent)));
+    if (percent >= 100) return;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error(`Le scan ZAP local a dépassé ${Math.round(timeoutMs / 1000)} secondes.`);
+}
+
+/**
+ * Waits for the passive-scan queue to drain.
+ *
+ * ZAP exposes `pscan/view/recordsToScan`, a count of records still queued. If the
+ * running build does not answer that view, the queue state is simply unknown:
+ * this returns `{ available: false }` and the caller must skip the passive stage
+ * rather than display it as satisfied. A passive tick that was never observed is
+ * never rendered as a completed one.
+ */
+async function waitForPassiveQueue(baseUrl, apiKey, timeoutMs, signal, onProgress) {
+  let initial = null;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw new Error('Scan ZAP annulé.');
+    let remaining;
+    try {
+      const result = await zapApi(baseUrl, apiKey, 'pscan', 'view', 'recordsToScan', {});
+      remaining = Number(result.recordsToScan);
+    } catch (error) {
+      return { available: false, reason: error.message };
+    }
+    if (!Number.isFinite(remaining)) return { available: false, reason: 'recordsToScan non numérique' };
+    if (initial === null) initial = remaining;
+    // The percentage is derived from ZAP's own two numbers, not from elapsed time.
+    const percent = initial > 0 ? Math.round(((initial - remaining) / initial) * 100) : 100;
+    onProgress?.(Math.max(0, Math.min(100, percent)), remaining);
+    if (remaining <= 0) return { available: true, drained: true, records: initial };
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  return { available: true, drained: false, reason: 'file passive non vidée dans le délai' };
 }
 
 function alertsToReport(alerts = []) {
@@ -86,7 +131,18 @@ function openApiImportRequest(source, targetUrl) {
   }
 }
 
-async function runLocalZap({ targetUrl, mode = 'baseline', localPath = '', timeoutMs = 600000, signal, excludedRoutes = [], authResult, openapi = '' }) {
+/**
+ * Runs a local ZAP scan, reporting its real lifecycle.
+ *
+ * `onLifecycle({ state, progress, detail })` is called only from data ZAP
+ * actually returned. There is no timer-driven progress anywhere: every
+ * percentage comes from `spider/view/status`, `ascan/view/status` or
+ * `pscan/view/recordsToScan`.
+ */
+async function runLocalZap({ targetUrl, mode = 'baseline', localPath = '', timeoutMs = 600000, signal, excludedRoutes = [], authResult, openapi = '', onLifecycle }) {
+  const report = (state, progress = null, detail = '') => {
+    try { onLifecycle?.({ state, progress, detail }); } catch { /* a listener must never break a scan */ }
+  };
   const zapPath = detectLocalZap(localPath);
   if (!zapPath) throw new Error('ZAP local n’est pas installé. Utilisez le bouton Installer/configurer ZAP.');
   const apiKey = crypto.randomBytes(24).toString('hex');
@@ -102,20 +158,34 @@ async function runLocalZap({ targetUrl, mode = 'baseline', localPath = '', timeo
     }
     if (mode === 'openapi') {
       const request = openApiImportRequest(openapi, targetUrl);
+      report('SPIDERING', null, 'Import OpenAPI');
       await zapApi(baseUrl, apiKey, 'openapi', 'action', request.action, request.params, Math.min(timeoutMs, 120000));
     } else {
       const spider = await zapApi(baseUrl, apiKey, 'spider', 'action', 'scan', { url: targetUrl, recurse: true, subtreeOnly: true, maxChildren: 0 });
-      await waitForProgress(baseUrl, apiKey, 'spider', spider.scan, Math.min(timeoutMs, 180000), signal);
+      report('SPIDERING', 0);
+      await waitForProgress(baseUrl, apiKey, 'spider', spider.scan, Math.min(timeoutMs, 180000), signal,
+        (percent) => report('SPIDERING', percent));
     }
+    // The passive queue is only reported when ZAP answered for it.
+    const passive = await waitForPassiveQueue(baseUrl, apiKey, Math.min(timeoutMs, 120000), signal,
+      (percent, remaining) => report('PASSIVE_WAIT', percent, `${remaining} enregistrement(s) en file`));
+    if (!passive.available) report('PASSIVE_WAIT', null, `File passive indisponible : ${passive.reason}`);
     if (mode !== 'baseline') {
       const active = await zapApi(baseUrl, apiKey, 'ascan', 'action', 'scan', { url: targetUrl, recurse: true, inScopeOnly: false });
-      await waitForProgress(baseUrl, apiKey, 'ascan', active.scan, timeoutMs, signal);
+      report('ACTIVE_SCANNING', 0);
+      await waitForProgress(baseUrl, apiKey, 'ascan', active.scan, timeoutMs, signal,
+        (percent) => report('ACTIVE_SCANNING', percent));
     }
+    report('COLLECTING_RESULTS');
     const result = await zapApi(baseUrl, apiKey, 'core', 'view', 'alerts', { baseurl: targetUrl, start: 0, count: 10000 });
-    return { payload: alertsToReport(result.alerts), stderr: '', mode: 'local' };
+    return {
+      payload: alertsToReport(result.alerts), stderr: '', mode: 'local',
+      // What the run really observed, so the caller never has to guess.
+      passiveQueue: passive
+    };
   } finally {
     try { await zapApi(baseUrl, apiKey, 'core', 'action', 'shutdown', {}, 5000); } catch { child.kill(); }
   }
 }
 
-module.exports = { detectLocalZap, zapApi, waitForZap, startLocalZap, waitForProgress, alertsToReport, openApiImportRequest, runLocalZap };
+module.exports = { detectLocalZap, zapApi, waitForZap, startLocalZap, waitForProgress, waitForPassiveQueue, alertsToReport, openApiImportRequest, runLocalZap };

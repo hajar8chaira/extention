@@ -108,13 +108,143 @@ function renderSonarQubeContent(finding) {
     : 'Ouvrir la ligne concernée, appliquer la correction indiquée par la règle, puis relancer l’analyse : le résultat disparaîtra du prochain scan s’il est corrigé.'}</div>`;
 }
 
+function snykValue(value, emptyLabel = 'Non fourni par Snyk') {
+  return value ? escapeHtml(value) : `<span class="muted">${escapeHtml(emptyLabel)}</span>`;
+}
+
+/**
+ * Snyk answers with three very different result shapes. Each one is rendered
+ * with the evidence it actually carries: a dependency chain for Open Source, a
+ * data flow for Code, a resource path for IaC.
+ */
+function renderSnykContent(finding) {
+  const references = Array.isArray(finding.references) && finding.references.length
+    ? `<ul>${finding.references.map((reference) => `<li><a href="${escapeHtml(reference)}">${escapeHtml(reference)}</a></li>`).join('')}</ul>`
+    : snykValue(finding.helpUri, 'Aucune référence fournie');
+  if (finding.snykCapability === 'openSource') {
+    const chain = Array.isArray(finding.dependencyPath) && finding.dependencyPath.length
+      ? `<code>${finding.dependencyPath.map((step) => escapeHtml(step)).join(' → ')}</code>`
+      : '<span class="muted">Dépendance directe</span>';
+    const upgrade = Array.isArray(finding.upgradePath) && finding.upgradePath.length
+      ? `<code>${finding.upgradePath.map((step) => escapeHtml(step)).join(' → ')}</code>`
+      : '<span class="muted">Aucun chemin de mise à niveau proposé</span>';
+    return `<div class="explanation"><span class="eyebrow">Dépendance vulnérable signalée par Snyk</span>
+      <p>${escapeHtml(finding.title)}</p>
+      <small class="provenance">Résultat Snyk Open Source normalisé par Security Center. Aucune ligne de code n’est associée : le manifeste est la localisation réelle.</small></div>
+    <h2>Dépendance concernée</h2>
+    <div class="grid block">
+      <div class="label">Identifiant Snyk</div><div><code>${escapeHtml(finding.ruleId)}</code></div>
+      <div class="label">Package</div><div>${snykValue(finding.packageName)}</div>
+      <div class="label">Version installée</div><div>${snykValue(finding.installedVersion)}</div>
+      <div class="label">Version corrigée</div><div>${finding.fixedVersion ? `<strong>${escapeHtml(finding.fixedVersion)}</strong>` : '<span class="muted">Aucun correctif publié</span>'}</div>
+      <div class="label">Manifeste</div><div><code>${escapeHtml(finding.file || '')}</code></div>
+      <div class="label">Gestionnaire</div><div>${snykValue(finding.packageManager)}</div>
+      <div class="label">Chaîne de dépendance</div><div>${chain}</div>
+      <div class="label">Chemin de mise à niveau</div><div>${upgrade}</div>
+      <div class="label">CVE</div><div>${snykValue((finding.vulnerabilityAliases || []).filter((alias) => alias.startsWith('CVE-')).join(', '), 'Aucune CVE associée')}</div>
+      <div class="label">CWE</div><div>${snykValue(finding.cwe, 'Aucun CWE associé')}</div>
+      <div class="label">Score CVSS</div><div>${snykValue(finding.cvssScore ? String(finding.cvssScore) : '', 'Non fourni')}</div>
+      <div class="label">Maturité d’exploitation</div><div>${snykValue(finding.exploitMaturity, 'Non évaluée')}</div>
+    </div>
+    <h2>Description</h2>
+    <div class="block">${snykValue(finding.description)}</div>
+    <h2>Correction recommandée</h2>
+    <div class="block">${finding.fixedVersion
+      ? `Mettre à niveau <code>${escapeHtml(finding.packageName)}</code> vers <strong>${escapeHtml(finding.fixedVersion)}</strong> ou une version ultérieure compatible.${finding.isUpgradable ? '' : ' Cette dépendance est transitive : la mise à niveau passe par le parent indiqué dans la chaîne.'}`
+      : 'Aucune version corrigée n’est publiée. Évaluer un remplacement de la dépendance ou une mesure de contournement.'}</div>
+    <h2>Références</h2>
+    <div class="block">${references}</div>`;
+  }
+  if (finding.snykCapability === 'iac') {
+    return `<div class="explanation"><span class="eyebrow">Mauvaise configuration signalée par Snyk IaC</span>
+      <p>${escapeHtml(finding.title)}</p>
+      <small class="provenance">Résultat Snyk IaC normalisé par Security Center.</small></div>
+    <h2>Ressource concernée</h2>
+    <div class="grid block">
+      <div class="label">Règle</div><div><code>${escapeHtml(finding.ruleId)}</code></div>
+      <div class="label">Fichier</div><div><code>${escapeHtml(finding.file || '')}</code></div>
+      <div class="label">Ligne</div><div>${finding.unlocated ? '<span class="muted">Aucune ligne fournie</span>' : Number(finding.startLine || 0) + 1}</div>
+      <div class="label">Ressource</div><div>${snykValue(finding.resource, 'Chemin de ressource non fourni')}</div>
+      <div class="label">Type</div><div>${snykValue(finding.resourceType)}</div>
+      <div class="label">Sévérité</div><div><strong>${escapeHtml(finding.rawSeverity)}</strong></div>
+    </div>
+    <h2>Impact</h2>
+    <div class="block">${snykValue(finding.impact, 'Impact non décrit par la règle')}</div>
+    <h2>Correction recommandée</h2>
+    <div class="block">${snykValue(finding.solution, 'Consulter la documentation de la règle.')}</div>
+    <h2>Références</h2>
+    <div class="block">${references}</div>`;
+  }
+  const flow = Array.isArray(finding.dataFlow) && finding.dataFlow.length
+    ? `<ol>${finding.dataFlow.map((step) => `<li><code>${escapeHtml(step.file)}:${Number(step.line) || 1}</code>${step.message ? ` — ${escapeHtml(step.message)}` : ''}</li>`).join('')}</ol>`
+    : '<span class="muted">Aucun flux de données fourni par Snyk Code</span>';
+  return `<div class="explanation"><span class="eyebrow">Résultat Snyk Code</span>
+    <p>${escapeHtml(finding.title)}</p>
+    <small class="provenance">Analyse statique Snyk Code normalisée par Security Center.</small></div>
+  <h2>Emplacement analysé</h2>
+  <div class="grid block">
+    <div class="label">Règle</div><div><code>${escapeHtml(finding.ruleId)}</code></div>
+    <div class="label">Fichier</div><div>${finding.file ? `<code>${escapeHtml(finding.file)}</code>` : '<span class="muted">Aucun fichier associé</span>'}</div>
+    <div class="label">Ligne</div><div>${finding.unlocated ? '<span class="muted">Aucune ligne fournie</span>' : Number(finding.startLine || 0) + 1}</div>
+    <div class="label">Sévérité</div><div><strong>${escapeHtml(finding.rawSeverity)}</strong></div>
+    <div class="label">CWE</div><div>${snykValue(finding.cwe, 'Aucun CWE associé à cette règle')}</div>
+    <div class="label">Score de priorité</div><div>${snykValue(finding.priorityScore ? String(finding.priorityScore) : '', 'Non fourni')}</div>
+  </div>
+  <h2>Flux de données</h2>
+  <div class="block">${flow}</div>
+  <h2>Description</h2>
+  <div class="block">${snykValue(finding.description)}</div>
+  <h2>Références</h2>
+  <div class="block">${references}</div>`;
+}
+
+const REACHABILITY_LABELS = Object.freeze({
+  not_evaluated: 'Non évaluée', present: 'Présente', imported: 'Importée',
+  statically_reachable: 'Atteignable statiquement', dynamically_confirmed: 'Confirmée dynamiquement',
+  not_reachable: 'Non atteignable', unknown: 'Indéterminée',
+  // Public status vocabulary, preferred when the pipeline supplied it.
+  REACHABLE: 'Atteignable', POTENTIALLY_REACHABLE: 'Potentiellement atteignable',
+  NOT_REACHABLE: 'Non atteignable', UNKNOWN: 'Indéterminée'
+});
+
+/**
+ * Security-intelligence block, added above the scanner-specific content.
+ *
+ * It is rendered only from verdicts the pipeline actually produced, and it
+ * never replaces the original scanner evidence below it: the point is to add
+ * the cross-scanner view, not to hide where each fact came from.
+ */
+function renderIntelligenceSection(finding) {
+  const { correlation, reachability, priority } = finding;
+  if (!correlation && !reachability && !priority) return '';
+  const detectedBy = correlation?.tools?.length
+    ? correlation.tools.map((tool) => `<li>✓ ${escapeHtml(tool)}</li>`).join('')
+    : `<li>✓ ${escapeHtml(finding.tool)}</li>`;
+  const clusters = Array.isArray(finding.correlationClusters) ? finding.correlationClusters : [];
+  return `<section class="intelligence">
+    <div class="grid block">
+      ${priority ? `<div class="label">Priorité</div><div><strong>${escapeHtml(priority.code || '')} ${priority.score}/100</strong> — ${escapeHtml(priority.label)}</div>` : ''}
+      <div class="label">Sévérité</div><div>${escapeHtml(finding.rawSeverity || finding.severity || '')}</div>
+      ${reachability ? `<div class="label">Atteignabilité</div><div><strong>${escapeHtml(REACHABILITY_LABELS[reachability.status] || REACHABILITY_LABELS[reachability.state] || reachability.state)}</strong> <span class="muted">(confiance ${escapeHtml(reachability.confidence)})</span></div>` : ''}
+    </div>
+    <h2>Détectée par</h2>
+    <div class="block"><ul class="plain">${detectedBy}</ul></div>
+    ${priority?.reasons?.length ? `<h2>Pourquoi cette priorité</h2><div class="block"><ul class="plain">${priority.reasons.map((reason) => `<li>${reason.points >= 0 ? '✓' : '−'} ${escapeHtml(reason.label)} <span class="muted">(${reason.points >= 0 ? '+' : ''}${reason.points})</span></li>`).join('')}</ul></div>` : ''}
+    ${reachability ? `<h2>Atteignabilité</h2><div class="block"><p>${escapeHtml(reachability.reason)}</p>${reachability.evidence?.length ? `<ul class="plain">${reachability.evidence.slice(0, 5).map((item) => `<li>${escapeHtml(item.type)} : ${item.file ? `<code>${escapeHtml(item.file)}${item.line ? `:${item.line}` : ''}</code> ` : ''}${escapeHtml(item.detail || '')}</li>`).join('')}</ul>` : ''}</div>` : ''}
+    ${correlation ? `<h2>Corrélation <span class="muted">(confiance ${escapeHtml(correlation.confidence)})</span></h2>
+      <div class="block"><ul class="plain">${correlation.reasons.slice(0, 8).map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul>
+      ${clusters.length ? `<p class="muted">Preuves d’origine conservées :</p><ul class="plain">${clusters.flatMap((cluster) => cluster.sources).slice(0, 8).map((source) => `<li><strong>${escapeHtml(source.tool)}</strong> ${escapeHtml(source.ruleId || '')}${source.file ? ` <code>${escapeHtml(source.file)}${source.line ? `:${source.line}` : ''}</code>` : ''}${source.endpoint ? ` <code>${escapeHtml(source.endpoint)}</code>` : ''}</li>`).join('')}</ul>` : ''}</div>` : ''}
+  </section>`;
+}
+
 function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
   const reference = finding.helpUri
     ? `<a href="${escapeHtml(finding.helpUri)}">${escapeHtml(finding.helpUri)}</a>`
     : '<span class="muted">Aucune référence fournie</span>';
   const content = ['Trivy', 'OSV-Scanner'].includes(finding.tool) ? renderTrivyContent(finding)
     : finding.tool === 'Gitleaks' ? renderGitleaksContent(finding)
-      : finding.tool === 'SonarQube' ? renderSonarQubeContent(finding) : `
+      : finding.tool === 'SonarQube' ? renderSonarQubeContent(finding)
+        : finding.tool === 'Snyk' ? renderSnykContent(finding) : `
   <div class="explanation">
     <span class="eyebrow">Synthèse Security Center pour le développeur</span>
     <p>${escapeHtml(developerExplanation(finding))}</p>
@@ -210,6 +340,10 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
     .http-evidence > div { display: grid; grid-template-columns: minmax(0,1fr) minmax(180px,auto) auto; gap: 10px; align-items: center; padding: 9px 11px; border-bottom: 1px solid var(--vscode-widget-border); }
     .http-evidence > div:last-child { border-bottom: 0; }
     .http-evidence span { color: var(--vscode-descriptionForeground); }
+    .intelligence { margin-bottom: 6px; }
+    ul.plain { list-style: none; margin: 0; padding: 0; }
+    ul.plain li { padding: 3px 0; }
+    .muted { color: var(--vscode-descriptionForeground); }
     @media (max-width: 700px) { .two-columns { grid-template-columns: 1fr; } body { padding: 16px; } }
   </style>
 </head>
@@ -218,6 +352,7 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
   <h1>${escapeHtml(finding.title)}</h1>
   <p><span class="badge">${escapeHtml(finding.tool)}</span><span class="badge">${escapeHtml(finding.rawSeverity)}</span><span class="badge">Confiance ${escapeHtml(finding.confidence || 'inconnue')}</span></p>
   ${aiAction}
+  ${renderIntelligenceSection(finding)}
   ${content}
   ${correlation}
   ${relatedEvidence}
@@ -243,4 +378,7 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
 </html>`;
 }
 
-module.exports = { escapeHtml, renderFindingDetailsHtml, renderSonarQubeContent, SONARQUBE_ISSUE_TYPES };
+module.exports = {
+  escapeHtml, renderFindingDetailsHtml, renderSonarQubeContent, renderSnykContent,
+  renderIntelligenceSection, SONARQUBE_ISSUE_TYPES, REACHABILITY_LABELS
+};

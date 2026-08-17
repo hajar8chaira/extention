@@ -1,3 +1,5 @@
+const { renderCompanionWidget, companionWidgetCss } = require('./live/companionWidget');
+
 function countBy(items, selector) {
   const counts = {};
   for (const item of items) {
@@ -45,6 +47,8 @@ function buildDashboardModel(findings = [], scanners = [], options = {}) {
     burpEndpoint: options.burpEndpoint || '',
     dynamicTargetUrl: options.dynamicTargetUrl || '',
     dynamicTargetState: options.dynamicTargetState || 'unknown',
+    // How the target state was established, and when. Never fabricated.
+    dynamicTargetEvidence: options.dynamicTargetEvidence || null,
     scanDurationMs: Number(options.scanDurationMs || 0),
     scanStartedAt: options.scanStartedAt || '',
     scanners,
@@ -127,6 +131,7 @@ const SCANNER_PRESENTATION = {
   Trivy: ['Dépendances, conteneurs et IaC', 'cube'],
   'OSV-Scanner': ['Vulnérabilités des dépendances', 'shield'],
   SonarQube: ['Qualité et sécurité du code (SAST)', 'code'],
+  Snyk: ['Dépendances, code et IaC (SCA/SAST/IaC)', 'shield'],
   ZAP: ['Analyse dynamique (DAST)', 'pulse']
 };
 
@@ -498,12 +503,116 @@ function isUsefulHttpScenario(scenario) {
     pathname === prefix.replace(/\/$/, '') || pathname.startsWith(prefix));
 }
 
+/**
+ * Association confidence between a captured HTTP transaction and a finding.
+ *
+ * Deliberately evidence-based. A shared hostname, a shared target or a shared CWE
+ * proves nothing and never links anything here — only the normalized path, the
+ * HTTP method and the exercised parameter do.
+ *
+ *   EXACT    same path, same method, and the finding's parameter really appears
+ *            in this transaction's query or body
+ *   STRONG   same path and same method
+ *   PROBABLE same path, but the scanner reported no method for the finding, so
+ *            the match cannot be proven — presented as possible, not confirmed
+ *   null     no evidence; not linked
+ *
+ * `ZAP_UNKNOWN_METHOD` matters: the normalizer stores the literal `'HTTP'` when
+ * ZAP reports no method for an alert instance. Compared for equality against a
+ * real `GET`, that sentinel silently dropped legitimate links, so it is treated
+ * as « unknown » rather than as a method name.
+ */
+const ZAP_UNKNOWN_METHOD = 'HTTP';
+
+const ASSOCIATION_CONFIDENCE = Object.freeze({
+  EXACT: 'EXACT', STRONG: 'STRONG', PROBABLE: 'PROBABLE', WEAK: 'WEAK'
+});
+
+/** Wording per tier. Only EXACT and STRONG are stated as established links. */
+const ASSOCIATION_LABELS = Object.freeze({
+  EXACT: 'Association exacte — paramètre confirmé',
+  STRONG: 'Association établie — même endpoint et même méthode',
+  PROBABLE: 'Association possible — non prouvée : le scanner n’a pas fourni la méthode',
+  WEAK: 'Association possible — non prouvée'
+});
+
+/** Parameter names this transaction actually exercises, from query and body. */
+function transactionParameters(scenario) {
+  const names = new Set();
+  const request = scenario?.request || {};
+  try {
+    for (const key of new URL(String(request.url)).searchParams.keys()) names.add(key.toLowerCase());
+  } catch { /* a relative or malformed URL simply contributes no query parameter */ }
+  for (const parameter of request.parameters || []) {
+    if (parameter?.name) names.add(String(parameter.name).toLowerCase());
+  }
+  const body = String(request.body || '');
+  if (body) {
+    // Only the shapes we can read without guessing: form encoding and flat JSON.
+    if (/^[\w.[\]%+-]+=/.test(body)) {
+      for (const pair of body.split('&')) {
+        const name = pair.split('=')[0];
+        if (name) names.add(decodeURIComponent(name).toLowerCase());
+      }
+    } else {
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const key of Object.keys(parsed)) names.add(key.toLowerCase());
+        }
+      } catch { /* an unreadable body contributes no parameter */ }
+    }
+  }
+  return names;
+}
+
+/**
+ * How strongly a finding belongs to a transaction, with the reasons.
+ * Returns `{ confidence: null }` when there is no evidence at all.
+ */
+function associationFor(scenario, finding) {
+  if (!finding?.endpoint) return { confidence: null, reasons: [] };
+  const path = endpointPath(scenario?.request?.url);
+  const findingPath = endpointPath(finding.endpoint);
+  if (findingPath !== path) return { confidence: null, reasons: [] };
+
+  const method = String(scenario?.request?.method || '').toUpperCase();
+  const findingMethod = String(finding.method || '').toUpperCase();
+  const methodKnown = findingMethod && findingMethod !== ZAP_UNKNOWN_METHOD;
+  const reasons = [`Chemin identique : ${path}`];
+
+  // A method the scanner did report and that disagrees is a hard rejection: this
+  // is what stops `GET /foo` from inheriting a finding about `POST /api/login`.
+  if (methodKnown && method && findingMethod !== method) return { confidence: null, reasons: [] };
+
+  if (!methodKnown) {
+    reasons.push('Méthode non fournie par le scanner pour ce finding');
+    return { confidence: ASSOCIATION_CONFIDENCE.PROBABLE, reasons };
+  }
+  reasons.push(`Méthode identique : ${findingMethod}`);
+
+  const parameter = String(finding.parameter || '').toLowerCase();
+  if (parameter && transactionParameters(scenario).has(parameter)) {
+    reasons.push(`Paramètre « ${finding.parameter} » réellement présent dans cette requête`);
+    return { confidence: ASSOCIATION_CONFIDENCE.EXACT, reasons };
+  }
+  if (parameter) reasons.push(`Paramètre « ${finding.parameter} » absent de cette requête`);
+  return { confidence: ASSOCIATION_CONFIDENCE.STRONG, reasons };
+}
+
+/** Findings associated with a transaction, each carrying its confidence tier. */
+function linkedFindingsWithConfidence(scenario, findings) {
+  return (findings || [])
+    .map((finding) => ({ finding, ...associationFor(scenario, finding) }))
+    .filter((entry) => entry.confidence);
+}
+
+/**
+ * The historical helper: the findings themselves. Kept so existing callers are
+ * unchanged, now including the ones a sentinel method used to hide.
+ */
 function linkedFindingsForScenario(scenario, findings) {
-  const path = endpointPath(scenario.request?.url);
-  const method = String(scenario.request?.method || '').toUpperCase();
-  return (findings || []).filter((finding) => finding.endpoint
-    && endpointPath(finding.endpoint) === path
-    && (!finding.method || !method || String(finding.method).toUpperCase() === method));
+  return linkedFindingsWithConfidence(scenario, findings).map((entry) => entry.finding);
 }
 
 function sourceCorrelationForFinding(finding, findings = [], correlations = []) {
@@ -558,8 +667,15 @@ function buildSafeHttpPreview(scenario, findings = []) {
   const request = scenario?.request || {};
   const response = scenario?.response || {};
   const headers = Object.entries(request.headers || {}).map(([name, value]) => ({ name, value: sanitizeHttpValue(name, value) }));
-  const linked = linkedFindingsForScenario(scenario, findings).map((finding) => ({
-    index: findings.indexOf(finding), severity: String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase(), title: finding.title || finding.ruleId || 'Finding', source: finding.tool || 'Security Center'
+  // Each association carries its confidence and the evidence behind it, so a
+  // match that could not be proven is never presented as a confirmed link.
+  const linked = linkedFindingsWithConfidence(scenario, findings).map(({ finding, confidence, reasons }) => ({
+    index: findings.indexOf(finding), severity: String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase(),
+    title: finding.title || finding.ruleId || 'Finding', source: finding.tool || 'Security Center',
+    confidence,
+    confidenceLabel: ASSOCIATION_LABELS[confidence] || '',
+    proven: confidence === ASSOCIATION_CONFIDENCE.EXACT || confidence === ASSOCIATION_CONFIDENCE.STRONG,
+    reasons
   }));
   const body = String(response.body || response.content?.text || '');
   const safeBody = body && !SENSITIVE_HTTP_NAME.test(body) ? body.slice(0, 2000) : body ? '[REDACTED: potentially sensitive response]' : '';
@@ -1063,6 +1179,19 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     ? `Scan partiel — ${failedTools.join(', ')} en échec`
     : scanResultsTrusted && model.policyResult?.passed === false ? 'Livraison bloquée par la politique de sécurité' : model.scanStatus === 'completed' ? 'Analyse terminée' : 'État de l’analyse';
   const operationalDetails = [criticalCount ? `${criticalCount} alerte(s) critique(s)` : '', `${currentProductionPriority} priorité(s) production`, scanResultsTrusted && model.policyResult?.passed === false ? 'Politique non respectée' : scanResultsTrusted && model.policyResult?.passed === true ? 'Politique respectée' : ''].filter(Boolean).join(' • ');
+  // A presence, not a widget: a small floating mascot in the corner, on every
+  // page surface that has room for one. It consumes the very same shared model
+  // the Live Security page renders — the dashboard computes no companion state,
+  // no message and no count.
+  //
+  // It floats rather than sitting inside `.operational-banner`: that banner is
+  // hidden by `body.surface-full > .operational-banner`, so a companion placed
+  // inside it would have been invisible on the full dashboard. The sidebar keeps
+  // none — it is a narrow strip and the tree below it needs the space.
+  const COMPANION_SURFACES = ['full', 'findings', 'scans', 'dynamic', 'analytics'];
+  const companionPresence = COMPANION_SURFACES.includes(surface)
+    ? renderCompanionWidget(model.companion, { variant: 'compact', enabled: model.companionEnabled !== false, interactive: false })
+    : '';
   const failureDiagnostics = surface === 'full' && failedScanners.length
     ? `<section class="failure-diagnostics"><div><span class="failure-kicker">⚠ Scan incomplet</span><strong>${completedCount}/${model.scanners.length} scanners terminés</strong><p>${failedScanners.map((scanner) => `${escapeHtml(scanner.tool)} : ${escapeHtml(summarizeScannerError(scanner.error))}`).join(' • ')}</p></div><div class="failure-actions"><button class="secondary" data-command="securityCenter.scanSelected">Réessayer</button><button class="quiet-action" data-command="securityCenter.showLogs">Journal →</button></div></section>`
     : '';
@@ -1090,6 +1219,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   try { targetOrigin = new URL(targetUrl).origin; } catch { targetOrigin = targetUrl; }
   const targetState = model.dynamicTargetState || 'unknown';
   const targetStatus = targetState === 'online' ? '● En ligne' : targetState === 'unreachable' ? '⚠ Cible inaccessible' : 'Inconnue / non vérifiée';
+  // The badge says how it knows. « En ligne » with no evidence would be a claim
+  // without a source, and « non vérifiée » beside a finished scan was a
+  // contradiction.
+  const targetEvidence = model.dynamicTargetEvidence;
+  const targetEvidenceLabel = targetEvidence
+    ? `${targetEvidence.source === 'zap-scan' ? 'Confirmée par l’analyse ZAP' : 'Vérifiée directement'} le ${new Date(targetEvidence.at).toLocaleString('fr-FR')}`
+    : '';
   const zapCard = `<section class="zap-card ${escapeHtml(zapScanner?.status || 'idle')}"><div><span class="zap-kicker">Analyse dynamique</span><h4>ZAP — ${escapeHtml(zapMode)}</h4><p>${escapeHtml(zapScanner?.error ? summarizeScannerError(zapScanner.error) : `${zapFindingCount} alerte(s) runtime • ${zapAuth}`)}</p></div><div class="zap-meta"><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP uniquement</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Installer / configurer ZAP</button></div></section>`;
   return `<!doctype html>
 <html lang="fr">
@@ -1840,6 +1976,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       .overview-summary .hero { border-right: 1px solid var(--vscode-widget-border); }
       .overview-split { grid-template-columns: minmax(0,1.2fr) minmax(280px,.8fr); }
     }
+    ${companionPresence ? companionWidgetCss() : ''}
   </style>
 </head>
 <body class="surface-${escapeHtml(surface)} theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
@@ -1847,7 +1984,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   ${surface === 'history' ? '<div class="history-readonly"><strong>Scan historique — lecture seule</strong><br>Cette vue indépendante ne remplace pas le scan actuellement affiché.</div>' : ''}
   <div class="operational-banner ${operationalState}"><span class="operational-icon">${operationalState === 'danger' ? '!' : operationalState === 'success' ? '✓' : 'i'}</span><div class="operational-copy"><strong>${escapeHtml(operationalTitle)}</strong><span>${escapeHtml(operationalDetails)}</span></div></div>
   ${surface === 'sidebar' ? '<button class="primary sidebar-open" data-command="securityCenter.openDashboard">Ouvrir le dashboard complet</button>' : ''}
-  ${surface === 'sidebar' ? `<div class="page-navigation"><button class="secondary" data-command="securityCenter.openFindingsPage">Findings</button><button class="secondary" data-command="securityCenter.openScansPage">Scans</button><button class="secondary" data-command="securityCenter.openAnalyticsPage">Analytics</button></div>` : ''}
+  ${surface === 'sidebar' ? `<div class="page-navigation"><button class="secondary" data-command="securityCenter.openFindingsPage">Findings</button><button class="secondary" data-command="securityCenter.openScansPage">Scans</button><button class="secondary" data-command="securityCenter.openSecurityPipeline">Pipeline</button><button class="secondary" data-command="securityCenter.openAnalyticsPage">Analytics</button></div>` : ''}
   ${failureDiagnostics}
   ${surface === 'full' ? '<div class="overview-summary">' : ''}<div class="hero ${riskClass}"><div class="risk-ring"><svg viewBox="0 0 100 100" aria-hidden="true"><circle class="risk-track" cx="50" cy="50" r="42"></circle><circle class="risk-progress" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${displayedRiskScore} 100"></circle></svg><strong>${displayedRiskScore}</strong></div><div class="risk-copy"><div class="risk-label">Risque ${escapeHtml(displayedRiskLevel)}</div><span class="risk-explanation">${scanRunning && model.snapshotAvailable ? `Score conservé depuis le snapshot consolidé pendant l’actualisation ${escapeHtml(model.executionType || 'partielle')}.` : scanRunning ? 'Calcul en attente du premier résultat exploitable.' : partialResultsAvailable ? `Score partiel calculé uniquement avec ${completedTools.size} scanner(s) terminé(s). Un outil en échec n’est jamais interprété comme zéro alerte.` : scanResultsTrusted ? 'Score calculé à partir des résultats valides les plus récents de chaque scanner.' : 'Aucun scanner n’a terminé avec des résultats exploitables. Le risque courant ne peut pas être évalué.'}</span></div></div>
   ${surface === 'full' ? `<div class="overview-kpis"><div class="overview-kpi critical"><strong>${criticalCount}</strong><span>Critical</span><small>Exigent une attention immédiate</small></div><div class="overview-kpi high"><strong>${highCount}</strong><span>High</span><small>Priorité de correction élevée</small></div><div class="overview-kpi"><strong>${currentProductionPriority}</strong><span>Production</span><small>${newCount} nouvelle(s) au total</small></div><div class="overview-kpi"><strong>${model.completedScanners}/${model.scanners.length}</strong><span>Scanners</span><small>${failedTools.length ? `${failedTools.join(', ')} en échec` : 'Tous les scanners ont réussi'}</small></div></div></div>` : ''}
@@ -1870,6 +2007,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   <div class="action-sections">
     <section class="action-group frequent"><div class="action-group-title">Analyse fréquente</div><div class="action-group-buttons">${actionButton('securityCenter.scanWorkspace', 'Relancer l’analyse', 'play', true)}${actionButton('securityCenter.scanIncremental', 'Scan rapide des fichiers modifiés', 'code')}${actionButton('securityCenter.compareScans', 'Comparer les scans', 'compare')}</div></section>
     <section class="action-group"><div class="action-group-title">Investigation</div><div class="action-group-buttons">${actionButton('securityCenter.openDynamicPage', 'Ouvrir Dynamic Security', 'pulse')}${actionButton('securityCenter.showScanHistoryPage', 'Ouvrir l’historique des scans', 'history')}${actionButton('securityCenter.showAuditLog', 'Ouvrir le journal d’audit', 'report')}${actionButton('securityCenter.showTrends', 'Tendances et MTTR', 'chart')}</div></section>
+    <section class="action-group"><div class="action-group-title">Pipeline</div><div class="action-group-buttons">${actionButton('securityCenter.openSecurityPipeline', 'Ouvrir le pipeline de sécurité', 'shield')}</div></section>
     <section class="action-group"><div class="action-group-title">Rapports</div><div class="action-group-buttons">${actionButton('securityCenter.generateSbom', 'Exporter le SBOM', 'report')}${actionButton('securityCenter.checkLicenses', 'Contrôler les licences', 'shield')}</div></section>
     <section class="action-group"><div class="action-group-title">Configuration et protection</div><div class="action-group-buttons">${actionButton('securityCenter.openScannerSetup', 'Scanners locaux', 'settings')}${actionButton('securityCenter.openProjectPolicy', 'Politique projet', 'shield')}${actionButton('securityCenter.configureOllama', 'Ollama local', 'pulse')}${actionButton('securityCenter.rollbackAiFix', 'Rollback IA', 'history')}${actionButton('securityCenter.configureBackendApiKey', 'Clé API backend', 'key')}${actionButton('securityCenter.configureTeamIntegrations', 'Slack / Jira', 'compare')}${actionButton('securityCenter.installPreCommitHook', 'Protection pre-commit', 'shield')}</div></section>
   </div>` : ''}
@@ -1891,7 +2029,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   <h3>Corrélations multi-outils</h3>${correlationRows}</section>
   <section class="page-dynamic">
     <header class="dynamic-page-header"><div><h1>Dynamic Security</h1><p>Cible, tests dynamiques, findings et trafic HTTP capturé.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header>
-    <section class="dynamic-section dynamic-target"><div class="dynamic-section-head"><h2>Cible</h2><span class="target-state ${escapeHtml(targetState)}">${escapeHtml(targetStatus)}</span></div><div class="dynamic-status-copy"><strong>${escapeHtml(targetOrigin || 'Aucune cible configurée')}</strong>${targetState === 'unreachable' ? '<span>Démarrez l’application avant de lancer une analyse dynamique.</span>' : targetState === 'unknown' && targetOrigin ? '<span>La cible n’a pas encore été vérifiée.</span>' : ''}</div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.checkDynamicTarget" ${targetOrigin ? '' : 'disabled'}>Vérifier</button><button class="secondary" data-command="securityCenter.changeDynamicTarget">Modifier la cible</button></div></section>
+    <section class="dynamic-section dynamic-target"><div class="dynamic-section-head"><h2>Cible</h2><span class="target-state ${escapeHtml(targetState)}">${escapeHtml(targetStatus)}</span></div><div class="dynamic-status-copy"><strong>${escapeHtml(targetOrigin || 'Aucune cible configurée')}</strong>${targetState === 'unreachable' ? '<span>Démarrez l’application avant de lancer une analyse dynamique.</span>' : targetState === 'unknown' && targetOrigin ? '<span>La cible n’a pas encore été vérifiée.</span>' : targetEvidenceLabel ? `<span>${escapeHtml(targetEvidenceLabel)}</span>` : ''}</div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.checkDynamicTarget" ${targetOrigin ? '' : 'disabled'}>Vérifier</button><button class="secondary" data-command="securityCenter.changeDynamicTarget">Modifier la cible</button></div></section>
     <div class="dynamic-status-grid">
       <section class="dynamic-section"><div class="dynamic-section-head"><h2>ZAP</h2><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span></div><p class="dynamic-purpose">Analyse dynamique automatisée</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Dernière analyse</span><strong>${zapScanner ? escapeHtml(zapState) : 'Jamais exécutée'}</strong></div><div class="dynamic-fact"><span>URL testées</span><strong>${zapTestedUrls || 'Non disponible'}</strong></div><div class="dynamic-fact"><span>Findings</span><strong>${zapFindingCount}</strong></div><div class="dynamic-fact"><span>Durée</span><strong>${zapScanner?.durationMs ? escapeHtml(formatDuration(zapScanner.durationMs)) : 'Non disponible'}</strong></div></div>${zapScanner?.error ? `<div class="dynamic-status-copy" role="alert"><span>${escapeHtml(summarizeScannerError(zapScanner.error))}</span></div>` : ''}<div class="dynamic-actions">${zapAuthenticationFailed ? '<button class="primary" data-command="securityCenter.configureZapCredentials">Configurer le compte ZAP</button><button class="quiet-action" data-command="securityCenter.configureZap">Paramètres ZAP</button>' : zapScanner?.status === 'failed' ? '<button class="primary" data-command="securityCenter.configureZap">Configurer ZAP</button>' : `<button class="primary" data-command="securityCenter.scanZap" ${zapScanner?.status === 'running' ? 'disabled aria-busy="true"' : ''}>${zapScanner?.status === 'running' ? 'Analyse ZAP en cours…' : 'Lancer ZAP'}</button>`}<button class="quiet-action anchor-action" data-target="dynamic-findings">Voir les findings</button></div></section>
       <section class="dynamic-section"><div class="dynamic-section-head"><h2>Burp</h2><span class="burp-connection ${model.burpConnected ? 'connected' : 'disconnected'}">${model.burpConnected ? '● Connecté' : '○ Déconnecté'}</span></div><p class="dynamic-purpose">Capture et investigation du trafic HTTP</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Requêtes capturées</span><strong>${burpScenarios.length}</strong></div><div class="dynamic-fact"><span>Endpoints uniques</span><strong>${burpUniqueEndpoints || 'Aucun'}</strong></div><div class="dynamic-fact"><span>Findings liés</span><strong>${burpLinkedFindings}</strong></div></div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.openBurpSettingsPage">Paramètres</button></div></section>
@@ -2163,8 +2301,9 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       });
     });
   </script>
+  ${companionPresence}
 </body>
 </html>`;
 }
 
-module.exports = { buildDashboardModel, calculateRiskScore, riskLevel, countBy, escapeHtml, summarizeScannerError, renderDashboardHtml, endpointPath, isUsefulHttpScenario, linkedFindingsForScenario, sourceCorrelationForFinding, buildSafeHttpPreview };
+module.exports = { SENSITIVE_HTTP_NAME, sanitizeHttpValue, buildDashboardModel, calculateRiskScore, riskLevel, countBy, escapeHtml, summarizeScannerError, renderDashboardHtml, endpointPath, isUsefulHttpScenario, linkedFindingsForScenario, linkedFindingsWithConfidence, associationFor, transactionParameters, ASSOCIATION_CONFIDENCE, ZAP_UNKNOWN_METHOD, sourceCorrelationForFinding, buildSafeHttpPreview };

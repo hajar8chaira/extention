@@ -5,7 +5,8 @@ const { runTrivy } = require('./trivy');
 const { runOsv } = require('./osv');
 const { runZap } = require('./zap');
 const { runSonarQube } = require('./sonarqube');
-const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeOsvOutput, normalizeZapOutput, normalizeSonarQubeOutput, deduplicateFindings } = require('./findings');
+const { runSnyk } = require('./snyk');
+const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeOsvOutput, normalizeZapOutput, normalizeSonarQubeOutput, normalizeSnykOutput, deduplicateFindings } = require('./findings');
 const { correlateFindings } = require('./correlation');
 const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
 const { runWithConcurrency } = require('./scheduler');
@@ -18,6 +19,10 @@ function defaultOptions(options = {}) {
     // SonarQube needs an external server and a token, so it stays opt-in.
     sonarEnabled: false, sonarMode: 'auto', sonarHostUrl: 'http://127.0.0.1:9000',
     sonarProjectKey: '', sonarToken: '', sonarIncludeCodeSmells: false,
+    // Snyk needs an account and a token, so it stays opt-in as well. Only
+    // Open Source is on by default: Code and IaC depend on the Snyk plan.
+    snykEnabled: false, snykMode: 'auto', snykToken: '',
+    snykIncludeOpenSource: true, snykIncludeCode: false, snykIncludeIaC: false,
     ...options
   };
 }
@@ -56,6 +61,24 @@ function buildScans(workspacePath, policy, options, signal) {
       signal
     }),
     normalize: normalizeSonarQubeOutput
+  });
+  // Snyk joins the same static phase and the same scheduler. Enabled but
+  // incomplete stays enabled: the runner reports the missing piece instead of
+  // the pipeline silently dropping the scanner.
+  if (options.snykEnabled) scans.push({
+    tool: 'Snyk',
+    execute: () => runSnyk({
+      workspacePath,
+      mode: policy?.snykMode || options.snykMode,
+      token: options.snykToken,
+      includeOpenSource: policy?.snykCapabilities?.includeOpenSource ?? options.snykIncludeOpenSource,
+      includeCode: policy?.snykCapabilities?.includeCode ?? options.snykIncludeCode,
+      includeIaC: policy?.snykCapabilities?.includeIaC ?? options.snykIncludeIaC,
+      exclusions: policy?.exclusions.global_files || [],
+      timeoutMs: options.timeoutMs,
+      signal
+    }),
+    normalize: normalizeSnykOutput
   });
   const zapMode = policy?.zapOpenapi ? 'openapi' : policy?.zapActive ? 'active' : 'baseline';
   if (zapMode === 'baseline' || options.zapAuthorized) scans.push({

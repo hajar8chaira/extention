@@ -525,8 +525,302 @@ function normalizeSonarQubeOutput(payload, workspacePath = '') {
   return deduplicateFindings(findings);
 }
 
+/**
+ * Whether a finding may be pinned to a position in the VS Code Problems panel.
+ *
+ * A dependency vulnerability names a manifest, not a line of code. Reporting it
+ * at line 1 of package-lock.json would be a fabricated location, so such
+ * findings stay visible in Security Center only.
+ */
+function hasReportableLocation(finding) {
+  return Boolean(finding?.absolutePath) && !finding?.unlocated;
+}
+
+// Snyk grades every capability on one scale, so a single mapping covers Open
+// Source, Code and IaC:
+//
+//   snyk severity   critical  high  medium  low
+//   Security Center CRITICAL  HIGH  MEDIUM  LOW
+//
+// Snyk Code answers in SARIF instead, where the level is a review priority
+// rather than a severity. It has no `critical` step, so `error` stops at HIGH.
+const SNYK_SEVERITY = Object.freeze({
+  CRITICAL: 'CRITICAL', HIGH: 'HIGH', MEDIUM: 'MEDIUM', LOW: 'LOW', INFO: 'INFO'
+});
+const SNYK_SARIF_LEVEL = Object.freeze({
+  ERROR: 'HIGH', WARNING: 'MEDIUM', NOTE: 'LOW', NONE: 'INFO'
+});
+
+function snykSeverity(value) {
+  return SNYK_SEVERITY[String(value || '').toUpperCase()] || 'MEDIUM';
+}
+
+/** `identifiers.CVE` / `identifiers.CWE`, always returned as a clean list. */
+function snykIdentifiers(identifiers, key) {
+  const values = identifiers?.[key];
+  return [...new Set((Array.isArray(values) ? values : [values]).map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+/**
+ * `from` starts with the scanned project itself, so the direct dependency and
+ * the vulnerable package are what remains once that root entry is dropped.
+ */
+function snykDependencyPath(from) {
+  const entries = (Array.isArray(from) ? from : []).map((value) => String(value || '').trim()).filter(Boolean);
+  return entries.length > 1 ? entries.slice(1) : entries;
+}
+
+function snykUpgradePath(upgradePath) {
+  return (Array.isArray(upgradePath) ? upgradePath : [])
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.trim());
+}
+
+/**
+ * Snyk Open Source identifies a vulnerable package, not a line of code. The
+ * identity is therefore built from what stays stable across reformatting and
+ * lockfile churn: manifest, vulnerability id, package and vulnerable version.
+ */
+function snykOpenSourceFingerprint({ manifest, vulnerabilityId, packageName, version }) {
+  return ['snyk', 'oss', manifest || 'manifest', vulnerabilityId || 'unknown', `${packageName || 'package'}@${version || '?'}`].join(':');
+}
+
+function normalizeSnykVulnerability(vulnerability, project, workspacePath) {
+  const manifest = normalizeScannerPath(project.displayTargetFile || project.targetFile || 'dependency-manifest');
+  const rawSeverity = snykSeverity(vulnerability.severity);
+  const cves = snykIdentifiers(vulnerability.identifiers, 'CVE');
+  const cwes = snykIdentifiers(vulnerability.identifiers, 'CWE');
+  const fixedVersions = (Array.isArray(vulnerability.fixedIn) ? vulnerability.fixedIn : [])
+    .map((value) => String(value || '').trim()).filter(Boolean);
+  const upgradePath = snykUpgradePath(vulnerability.upgradePath);
+  const dependencyPath = snykDependencyPath(vulnerability.from);
+  const packageName = String(vulnerability.packageName || vulnerability.name || '');
+  const version = String(vulnerability.version || '');
+  const fixedVersion = fixedVersions[0] || String(vulnerability.nearestFixedInVersion || '');
+  const canonicalId = cves[0] || String(vulnerability.id || 'SNYK-UNKNOWN');
+  const fingerprint = snykOpenSourceFingerprint({ manifest, vulnerabilityId: vulnerability.id, packageName, version });
+  return {
+    id: fingerprint,
+    fingerprint,
+    tool: 'Snyk',
+    ruleId: String(vulnerability.id || canonicalId),
+    title: `${canonicalId} — ${packageName || 'dépendance'} (${version || '?'}${fixedVersion ? ` → ${fixedVersion}` : ''})`,
+    severity: commonSeverityMap[rawSeverity] || 'warning',
+    rawSeverity,
+    category: 'dependency',
+    cwe: cwes.join(', '),
+    file: manifest,
+    absolutePath: manifest ? path.resolve(workspacePath, manifest) : '',
+    startLine: 0,
+    startColumn: 0,
+    endLine: 0,
+    endColumn: 1,
+    // The manifest exists but carries no meaningful line: the finding stays
+    // clickable without ever claiming a position it does not have.
+    unlocated: true,
+    helpUri: vulnerability.url || (cves[0] ? `https://security.snyk.io/vuln/${encodeURIComponent(String(vulnerability.id || ''))}` : ''),
+    sourceContext: classifySourceContext(manifest),
+    confidence: 'high',
+    packageName,
+    installedVersion: version,
+    fixedVersion,
+    fixedVersions,
+    upgradePath,
+    dependencyPath,
+    isUpgradable: Boolean(vulnerability.isUpgradable),
+    isPatchable: Boolean(vulnerability.isPatchable),
+    exploitMaturity: String(vulnerability.exploit || vulnerability.exploitMaturity || ''),
+    cvssScore: Number.isFinite(Number(vulnerability.cvssScore)) ? Number(vulnerability.cvssScore) : null,
+    cvssVector: String(vulnerability.CVSSv3 || ''),
+    packageManager: String(vulnerability.packageManager || project.packageManager || ''),
+    projectName: String(project.projectName || ''),
+    target: manifest,
+    description: cleanScannerText(vulnerability.description),
+    references: (Array.isArray(vulnerability.references) ? vulnerability.references : [])
+      .map((reference) => String(reference?.url || reference || '')).filter(Boolean).slice(0, 5),
+    vulnerabilityAliases: [...new Set([String(vulnerability.id || ''), ...cves].filter(Boolean))],
+    snykCapability: 'openSource'
+  };
+}
+
+/** Accepts one project result or the `--all-projects` array of them. */
+function normalizeSnykOpenSource(results, workspacePath = '') {
+  const projects = (Array.isArray(results) ? results : [results]).filter((project) => project && typeof project === 'object');
+  const findings = [];
+  for (const project of projects) {
+    for (const vulnerability of Array.isArray(project.vulnerabilities) ? project.vulnerabilities : []) {
+      if (vulnerability?.id || vulnerability?.packageName) findings.push(normalizeSnykVulnerability(vulnerability, project, workspacePath));
+    }
+  }
+  return deduplicateSnykFindings(findings);
+}
+
+/** SARIF `properties.cwe` is already `['CWE-89']`; older rules used bare ids. */
+function snykCodeCwe(rule) {
+  const values = [...(rule?.properties?.cwe || []), ...(rule?.properties?.tags || [])]
+    .map((value) => String(value || '').trim())
+    .filter((value) => /^cwe[-:]?\d+$/i.test(value))
+    .map((value) => `CWE-${value.replace(/\D+/g, '')}`);
+  return [...new Set(values)].join(', ');
+}
+
+/**
+ * Snyk publishes a stable finding identity in `fingerprints`. It is preferred
+ * over any positional key so the same issue survives edits above it.
+ */
+function snykCodeIdentity(result, ruleId, file) {
+  const fingerprints = result?.fingerprints && typeof result.fingerprints === 'object' ? result.fingerprints : {};
+  const stable = fingerprints['snyk/assets/finding/v1'] || fingerprints.identity || fingerprints['1'] || fingerprints['0'];
+  return stable ? `snyk:code:${stable}` : `snyk:code:${ruleId}:${file}`;
+}
+
+function normalizeSnykCodeResult(result, { rules, workspacePath }) {
+  const location = result?.locations?.[0]?.physicalLocation || {};
+  const region = location.region || {};
+  const relativePath = normalizeScannerPath(location.artifactLocation?.uri || '');
+  const ruleId = String(result.ruleId || 'snyk-code');
+  const rule = rules.get(ruleId) || {};
+  const rawSeverity = SNYK_SARIF_LEVEL[String(result.level || rule?.defaultConfiguration?.level || 'warning').toUpperCase()] || 'MEDIUM';
+  const startLine = Math.max(0, Number(region.startLine || 0) - 1);
+  const startColumn = Math.max(0, Number(region.startColumn || 1) - 1);
+  const hasLocation = Boolean(relativePath) && Number(region.startLine || 0) > 0;
+  // The data flow is the whole value of a Snyk Code result: source and sink are
+  // kept verbatim so the developer can follow the path without leaving VS Code.
+  const dataFlow = (result?.codeFlows?.[0]?.threadFlows?.[0]?.locations || [])
+    .map((step) => {
+      const physical = step?.location?.physicalLocation || {};
+      return {
+        file: normalizeScannerPath(physical.artifactLocation?.uri || ''),
+        line: Number(physical.region?.startLine || 0),
+        message: cleanScannerText(step?.location?.message?.text)
+      };
+    })
+    .filter((step) => step.file || step.line);
+  const fingerprint = snykCodeIdentity(result, ruleId, relativePath);
+  return {
+    id: fingerprint,
+    fingerprint,
+    tool: 'Snyk',
+    ruleId,
+    title: cleanScannerText(result?.message?.text) || rule?.shortDescription?.text || ruleId,
+    severity: commonSeverityMap[rawSeverity] || 'warning',
+    rawSeverity,
+    category: 'security',
+    cwe: snykCodeCwe(rule),
+    file: relativePath,
+    absolutePath: relativePath ? path.resolve(workspacePath, relativePath) : '',
+    startLine,
+    startColumn,
+    endLine: Math.max(startLine, Number(region.endLine || region.startLine || 0) - 1),
+    endColumn: Math.max(startColumn + 1, Number(region.endColumn || region.startColumn || 1) - 1),
+    unlocated: !hasLocation,
+    helpUri: rule?.helpUri || rule?.properties?.documentation || '',
+    sourceContext: classifySourceContext(relativePath),
+    confidence: rawSeverity === 'HIGH' ? 'high' : 'medium',
+    description: cleanScannerText(rule?.help?.text || rule?.shortDescription?.text),
+    dataFlow,
+    dataFlowSource: dataFlow[0] || null,
+    dataFlowSink: dataFlow.at(-1) || null,
+    priorityScore: Number(result?.properties?.priorityScore) || null,
+    isAutofixable: Boolean(result?.properties?.isAutofixable),
+    snykCapability: 'code'
+  };
+}
+
+/** `snyk code test --json` answers in SARIF; both shapes land here. */
+function normalizeSnykCode(sarif, workspacePath = '') {
+  const findings = [];
+  for (const run of Array.isArray(sarif?.runs) ? sarif.runs : []) {
+    const rules = new Map((run?.tool?.driver?.rules || []).filter((rule) => rule?.id).map((rule) => [rule.id, rule]));
+    for (const result of Array.isArray(run.results) ? run.results : []) {
+      if (result?.ruleId || result?.message) findings.push(normalizeSnykCodeResult(result, { rules, workspacePath }));
+    }
+  }
+  return deduplicateSnykFindings(findings);
+}
+
+function normalizeSnykIaCIssue(issue, project, workspacePath) {
+  const relativePath = normalizeScannerPath(project.targetFile || project.targetFilePath || '');
+  const rawSeverity = snykSeverity(issue.severity);
+  const startLine = Math.max(0, Number(issue.lineNumber || 0) - 1);
+  const resourcePath = (Array.isArray(issue.path) ? issue.path : []).map((value) => String(value)).join('.');
+  const publicId = String(issue.publicId || issue.id || 'snyk-iac');
+  const fingerprint = `snyk:iac:${publicId}:${relativePath}:${resourcePath || issue.subType || ''}`;
+  return {
+    id: fingerprint,
+    fingerprint,
+    tool: 'Snyk',
+    ruleId: publicId,
+    title: cleanScannerText(issue.title) || publicId,
+    severity: commonSeverityMap[rawSeverity] || 'warning',
+    rawSeverity,
+    category: 'misconfiguration',
+    cwe: '',
+    file: relativePath,
+    absolutePath: relativePath ? path.resolve(workspacePath, relativePath) : '',
+    startLine,
+    startColumn: 0,
+    endLine: startLine,
+    endColumn: 1,
+    unlocated: !relativePath || Number(issue.lineNumber || 0) <= 0,
+    helpUri: String(issue.documentation || ''),
+    sourceContext: classifySourceContext(relativePath),
+    confidence: 'high',
+    resource: resourcePath,
+    resourceType: String(issue.subType || ''),
+    policyId: publicId,
+    description: cleanScannerText(issue.iacDescription?.issue || issue.issue),
+    impact: cleanScannerText(issue.iacDescription?.impact || issue.impact),
+    solution: cleanScannerText(issue.iacDescription?.resolve || issue.resolve),
+    references: (Array.isArray(issue.references) ? issue.references : []).map((value) => String(value)).filter(Boolean).slice(0, 5),
+    projectName: String(project.projectName || ''),
+    target: relativePath,
+    snykCapability: 'iac'
+  };
+}
+
+function normalizeSnykIaC(results, workspacePath = '') {
+  const projects = (Array.isArray(results) ? results : [results]).filter((project) => project && typeof project === 'object');
+  const findings = [];
+  for (const project of projects) {
+    for (const issue of Array.isArray(project.infrastructureAsCodeIssues) ? project.infrastructureAsCodeIssues : []) {
+      if (issue && !issue.isIgnored) findings.push(normalizeSnykIaCIssue(issue, project, workspacePath));
+    }
+  }
+  return deduplicateSnykFindings(findings);
+}
+
+/**
+ * Snyk identities are stable and carry no line number, so the shared
+ * `deduplicateFindings` key — which includes the position — would keep two
+ * copies of the same package vulnerability. Deduplication happens on the
+ * fingerprint instead, and the pipeline-wide pass still runs afterwards.
+ */
+function deduplicateSnykFindings(findings) {
+  const unique = new Map();
+  for (const finding of findings) if (!unique.has(finding.fingerprint)) unique.set(finding.fingerprint, finding);
+  return [...unique.values()];
+}
+
+/**
+ * Single pipeline entry point, mirroring the other scanners: one payload in,
+ * one normalised findings array out, whatever capabilities actually ran.
+ */
+function normalizeSnykOutput(payload, workspacePath = '') {
+  return [
+    ...normalizeSnykOpenSource(payload?.openSource?.results || [], workspacePath),
+    ...normalizeSnykCode(payload?.code?.sarif || null, workspacePath),
+    ...normalizeSnykIaC(payload?.iac?.results || [], workspacePath)
+  ];
+}
+
 module.exports = {
   normalizeScannerPath, classifySourceContext, deduplicateFindings, cleanScannerText, zapConfidence,
+  hasReportableLocation,
+  SNYK_SEVERITY, SNYK_SARIF_LEVEL, snykSeverity, snykIdentifiers, snykDependencyPath, snykCodeCwe,
+  snykOpenSourceFingerprint, deduplicateSnykFindings,
+  normalizeSnykOutput, normalizeSnykOpenSource, normalizeSnykCode, normalizeSnykIaC,
+  normalizeSnykVulnerability, normalizeSnykCodeResult, normalizeSnykIaCIssue,
   SONARQUBE_LEGACY_SEVERITY, SONARQUBE_IMPACT_SEVERITY, SONARQUBE_CATEGORY,
   sonarQubeSeverity, sonarQubeCwe, sonarQubeComponentPath,
   normalizeSonarQubeOutput, normalizeSonarQubeIssue, normalizeSonarQubeHotspot,

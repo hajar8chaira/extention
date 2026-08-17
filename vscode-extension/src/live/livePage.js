@@ -2,6 +2,7 @@
 const { escapeHtml } = require('./liveCompanion');
 const { SUPPORTED_LANGUAGES } = require('./liveScheduler');
 const { themeOverridesCss } = require('../theme-controller');
+const { renderCompanionWidget, companionWidgetCss } = require('./companionWidget');
 
 class LiveSessionActivity {
   constructor({ now = () => new Date() } = {}) {
@@ -43,6 +44,17 @@ class LiveSessionActivity {
   snapshot() { return { detected: this.detected.size, resolved: this.resolved, prevented: this.resolved, recent: [...this.recent], tip: this.tip }; }
 }
 
+/**
+ * The Live Security page.
+ *
+ * The companion used to appear here as a static PNG in the header, decorative
+ * and disconnected from any state. It is now the real animated mascot, anchored
+ * bottom-right and driven by the shared companion model — which also means there
+ * is exactly one mascot on this page, not two.
+ *
+ * `companionImageUri` is kept for the callers that pass it positionally before
+ * `cspSource`; the image itself is no longer rendered.
+ */
 function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource = '', selectedTheme = 'light') {
   const active = model.state !== 'disabled' && model.state !== 'paused';
   const stateLabel = active ? 'Active' : model.state === 'paused' ? 'Paused' : 'Off';
@@ -58,17 +70,30 @@ function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource 
   const activityRows = model.activity.recent.slice(0, 8).map((item) => `<li><time>${escapeHtml(new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}</time><span>${escapeHtml(item.label)}</span><small>${item.type === 'resolved' ? 'Resolved live' : 'Detected live'}</small></li>`).join('');
   const knownContext = model.knownFindings?.length ? `<section><h2>Known findings in this file</h2><div class="info"><strong>${model.knownFindings.length} existing Security Center finding(s)</strong><small>Read-only context from completed scans. Live Security did not create these findings.</small></div></section>` : '';
   const tip = model.activity.tip ? `<section><h2>Secure coding hint</h2><div class="hint">${escapeHtml(model.activity.tip)}</div></section>` : '';
+  // The companion, from the shared visual model the provider was handed. This
+  // page decides nothing about it: not the posture, not the wording, not the
+  // count. It only chooses where it sits.
+  // FULL mode: this is the only page where the companion is the assistant of
+  // the surface itself and may comment on the file being edited.
+  const companion = renderCompanionWidget(model.companion, {
+    variant: 'full', enabled: model.companionEnabled !== false
+  });
   return `<!doctype html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource || "'none'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${themeOverridesCss()}
-    :root{color-scheme:light dark}*{box-sizing:border-box}${selectedTheme === 'light' ? themeOverridesCss().replaceAll('body.theme-light','body') : ''}body{margin:0;padding:24px;color:var(--vscode-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family);font-size:var(--vscode-font-size)}main{max-width:1050px;margin:auto}h1{margin:0}.muted,.finding span,small{color:var(--vscode-descriptionForeground)}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding-bottom:16px;border-bottom:1px solid var(--vscode-panel-border)}.identity{display:flex;align-items:center;gap:14px}.avatar-wrap{position:relative;width:116px;height:86px;display:grid;place-items:center;flex:none}.avatar-wrap::after{content:"";position:absolute;inset:10px 18px;border:1px solid var(--vscode-focusBorder);border-radius:50%;opacity:.32}.avatar{position:relative;z-index:1;width:116px;height:86px;object-fit:contain;filter:drop-shadow(0 4px 5px var(--vscode-widget-shadow))}.active .avatar{animation:float 3.2s ease-in-out infinite}.analyzing .avatar{animation-duration:1.35s}.analyzing .avatar-wrap::after{animation:pulse 1.1s ease-in-out infinite}.issues .avatar-wrap::after,.error .avatar-wrap::after{border-color:var(--vscode-errorForeground);opacity:.8}.disabled .avatar{opacity:.55;animation:none}.state{display:inline-block;margin-top:8px;padding:2px 8px;border-radius:10px;color:var(--vscode-badge-foreground);background:var(--vscode-badge-background)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);margin:20px 0;border:1px solid var(--vscode-panel-border);border-radius:5px}.metric{padding:14px}.metric+.metric{border-left:1px solid var(--vscode-panel-border)}.metric strong{display:block;font-size:1.5em}.grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(260px,.7fr);gap:20px}section{margin-bottom:20px}h2{font-size:1.05em;margin:0 0 10px}.finding{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-top:1px solid var(--vscode-panel-border)}.finding span{display:block;margin-top:3px}.actions{display:flex;gap:6px;flex-wrap:wrap}button{font:inherit;border:0;border-radius:2px;padding:5px 10px;cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background)}button:hover{background:var(--vscode-button-hoverBackground)}button.secondary{color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground)}.empty,.info,.hint{padding:12px;border:1px solid var(--vscode-panel-border);border-radius:4px}.hint{border-left:3px solid var(--vscode-focusBorder)}.info{display:grid;gap:8px}ul{list-style:none;padding:0;margin:0}li{display:grid;grid-template-columns:55px 1fr auto;gap:8px;padding:9px 0;border-top:1px solid var(--vscode-panel-border)}@keyframes float{50%{transform:translateY(-7px) rotate(.7deg)}}@keyframes pulse{50%{opacity:.9;transform:scale(1.09)}}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}@media(max-width:700px){body{padding:14px}.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}.metric+.metric{border-left:0;border-top:1px solid var(--vscode-panel-border)}.finding{align-items:flex-start;flex-direction:column}.avatar-wrap{width:90px}.avatar{width:90px}}
-  </style></head><body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'} ${active ? 'active' : 'disabled'} ${escapeHtml(model.state)}"><main><header><div class="identity"><div class="avatar-wrap">${companionImageUri ? `<img class="avatar" src="${escapeHtml(companionImageUri)}" alt="Security Companion active">` : ''}</div><div><h1>Live Security</h1><div class="state">● ${stateLabel}</div><p class="muted">${model.state === 'analyzing' ? 'Checking current file…' : model.state === 'issues' ? `${model.findings.length} potential issue(s)` : active ? 'Watching your code' : 'Live analysis is not running'}</p><p class="muted">${fileSupportMessage}</p></div></div>${active ? '<button data-command="securityCenter.disableLiveSecurity">Turn off</button>' : '<button data-command="securityCenter.enableLiveSecurity">Enable Live Security</button>'}</header>
+    :root{color-scheme:light dark}*{box-sizing:border-box}${selectedTheme === 'light' ? themeOverridesCss().replaceAll('body.theme-light','body') : ''}body{margin:0;padding:24px;color:var(--vscode-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family);font-size:var(--vscode-font-size)}main{max-width:1050px;margin:auto}h1{margin:0}.muted,.finding span,small{color:var(--vscode-descriptionForeground)}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding-bottom:16px;border-bottom:1px solid var(--vscode-panel-border)}.identity{display:flex;align-items:center;gap:14px}.state{display:inline-block;margin-top:8px;padding:2px 8px;border-radius:10px;color:var(--vscode-badge-foreground);background:var(--vscode-badge-background)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);margin:20px 0;border:1px solid var(--vscode-panel-border);border-radius:5px}.metric{padding:14px}.metric+.metric{border-left:1px solid var(--vscode-panel-border)}.metric strong{display:block;font-size:1.5em}.grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(260px,.7fr);gap:20px}section{margin-bottom:20px}h2{font-size:1.05em;margin:0 0 10px}.finding{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-top:1px solid var(--vscode-panel-border)}.finding span{display:block;margin-top:3px}.actions{display:flex;gap:6px;flex-wrap:wrap}button{font:inherit;border:0;border-radius:2px;padding:5px 10px;cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background)}button:hover{background:var(--vscode-button-hoverBackground)}button.secondary{color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground)}.empty,.info,.hint{padding:12px;border:1px solid var(--vscode-panel-border);border-radius:4px}.hint{border-left:3px solid var(--vscode-focusBorder)}.info{display:grid;gap:8px}ul{list-style:none;padding:0;margin:0}li{display:grid;grid-template-columns:55px 1fr auto;gap:8px;padding:9px 0;border-top:1px solid var(--vscode-panel-border)}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}@media(max-width:700px){body{padding:14px}.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}.metric+.metric{border-left:0;border-top:1px solid var(--vscode-panel-border)}.finding{align-items:flex-start;flex-direction:column}}
+  ${companion ? companionWidgetCss() : ''}
+  </style></head><body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'} ${active ? 'active' : 'disabled'} ${escapeHtml(model.state)}"><main><header><div class="identity"><div><h1>Live Security</h1><div class="state">● ${stateLabel}</div><p class="muted">${model.state === 'analyzing' ? 'Checking current file…' : model.state === 'issues' ? `${model.findings.length} potential issue(s)` : active ? 'Watching your code' : 'Live analysis is not running'}</p><p class="muted">${fileSupportMessage}</p></div></div>${active ? '<button data-command="securityCenter.disableLiveSecurity">Turn off</button>' : '<button data-command="securityCenter.enableLiveSecurity">Enable Live Security</button>'}</header>
   <div class="metrics"><div class="metric"><strong>${model.findings.length}</strong><span>Current file warnings</span></div><div class="metric"><strong>${model.activity.detected}</strong><span>Session warnings</span></div><div class="metric"><strong>${model.activity.resolved}</strong><span>Resolved live</span></div><div class="metric"><strong>${model.activity.prevented || 0}</strong><span>Prevented during coding</span></div></div>
   <div class="grid"><div><section><h2>Current File</h2>${findingRows || '<div class="empty">No Live warnings for the current file.</div>'}</section>${tip}<section><h2>Recent Live Activity</h2>${activityRows ? `<ul>${activityRows}</ul>` : '<div class="empty">No Live activity in this session yet.</div>'}</section></div><aside>${knownContext}<section><h2>Engine</h2><div class="info"><strong>JavaScript / TypeScript</strong><span>Security Center Live Rules</span><small>Local, lightweight and ephemeral analysis</small></div></section><section><h2>AI</h2><div class="info"><strong>Ollama</strong><span>${escapeHtml(model.ollamaModel || 'No model selected')}</span><small>Used only on request</small></div></section></aside></div>
-  </main><script nonce="${nonce}">const vscode=acquireVsCodeApi();document.addEventListener('click',e=>{const button=e.target.closest('button');if(!button)return;if(button.dataset.command)return vscode.postMessage({type:'command',command:button.dataset.command});vscode.postMessage({type:button.dataset.action,ref:JSON.parse(button.dataset.ref||'[]')});});</script></body></html>`;
+  </main>${companion}<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.addEventListener('click',e=>{const button=e.target.closest('button');if(!button)return;if(button.dataset.command)return vscode.postMessage({type:'command',command:button.dataset.command});vscode.postMessage({type:button.dataset.action,ref:JSON.parse(button.dataset.ref||'[]')});});</script></body></html>`;
 }
 
 class LiveSecurityPageProvider {
-  constructor({ api, service, diagnostics, executeCommand, workspacePath = '', extensionUri, getOllamaModel = () => '', getKnownFindings = () => [], themeController }) {
+  constructor({ api, service, diagnostics, executeCommand, workspacePath = '', extensionUri, getOllamaModel = () => '', getKnownFindings = () => [], themeController, getCompanionModel = null }) {
     this.api = api; this.service = service; this.diagnostics = diagnostics; this.executeCommand = executeCommand; this.workspacePath = workspacePath; this.extensionUri = extensionUri; this.getOllamaModel = getOllamaModel; this.getKnownFindings = getKnownFindings; this.themeController = themeController;
+    // The one companion engine, injected. This page never builds a model of its
+    // own: it asks the provider that already owns the service state, the
+    // diagnostics, the pipeline context and the anti-spam gate.
+    this.getCompanionModel = getCompanionModel;
     this.activity = new LiveSessionActivity(); this.activeDocument = api.window.activeTextEditor?.document; this.panel = undefined;
     this.subscriptions = [service.onDidChangeState(() => this.render()), diagnostics.onDidChange(({ uri, findings, reason }) => { if (reason !== 'suppressed') this.activity.update(uri, findings); this.render(); }), api.window.onDidChangeActiveTextEditor((editor) => { if (editor?.document) this.activeDocument = editor.document; this.render(); }), themeController?.onDidChange(() => this.render())].filter(Boolean);
   }
@@ -85,10 +110,50 @@ class LiveSecurityPageProvider {
     const document = this.activeDocument;
     const file = document?.uri?.fsPath ? path.relative(this.workspacePath, document.uri.fsPath).replaceAll('\\', '/') : '';
     const knownFindings = file ? this.getKnownFindings().filter((finding) => finding.file === file && ['high', 'critical'].includes(String(finding.rawSeverity || finding.severity).toLowerCase())) : [];
-    return { state: this.service.getState(), file, supportedFile: Boolean(document && SUPPORTED_LANGUAGES.has(document.languageId)), findings: this.diagnostics.findingsForDocument(document), activity: this.activity.snapshot(), ollamaModel: this.getOllamaModel(), knownFindings };
+    const companion = this.getCompanionModel?.() || null;
+    return {
+      state: this.service.getState(), file, supportedFile: Boolean(document && SUPPORTED_LANGUAGES.has(document.languageId)),
+      findings: this.diagnostics.findingsForDocument(document), activity: this.activity.snapshot(),
+      ollamaModel: this.getOllamaModel(), knownFindings,
+      companion,
+      // `securityCenter.live.companion.enabled` gates the presentation only. The
+      // engine keeps running either way, so Live Security is unaffected.
+      companionEnabled: this.api.workspace?.getConfiguration?.('securityCenter')?.get?.('live.companion.enabled', true) !== false
+    };
   }
   render() { if (this.panel) this.panel.webview.html = renderLiveSecurityPage(this.model(), 'live-security-page', this.companionImageUri, this.panel.webview.cspSource, this.themeController?.getTheme() || 'light'); }
-  handleMessage(message) { if (message.type === 'command') return this.executeCommand(message.command); const [uri, version, ruleId] = message.ref || []; const commands = { open: 'securityCenter.openLiveFinding', explain: 'securityCenter.explainLiveFinding', quickfix: 'securityCenter.applyLiveQuickFix', fix: 'securityCenter.generateLiveAiFix' }; if (commands[message.type]) return this.executeCommand(commands[message.type], uri, version, ruleId); }
+  handleMessage(message) {
+    // A webview message is untrusted input. Only the two commands this page's
+    // own buttons can emit are forwarded; the name is never passed through
+    // blindly, which it used to be.
+    if (message.type === 'command') {
+      const ALLOWED = new Set(['securityCenter.enableLiveSecurity', 'securityCenter.disableLiveSecurity']);
+      return ALLOWED.has(message.command) ? this.executeCommand(message.command) : undefined;
+    }
+    // Clicking the companion goes wherever its current message points — the
+    // finding it is talking about, the scanner that needs configuring, the
+    // pipeline that blocked. It never fixes anything and never invokes AI, and
+    // the destination is decided by the message engine, not by this page.
+    if (message.type === 'companion') {
+      const action = this.getCompanionModel?.()?.action;
+      if (action?.scope === 'finding') {
+        const [first] = this.diagnostics.findingsForDocument(this.activeDocument);
+        return first
+          ? this.executeCommand('securityCenter.openLiveFinding', first.uri, first.documentVersion, first.ruleId)
+          : undefined;
+      }
+      // Only destinations that already exist, and never a remediation command.
+      // `live` is excluded here: this *is* the Live Security page, so sending the
+      // developer to it would be a click that does nothing visible.
+      const ALLOWED = new Set([
+        'securityCenter.openScannerSetup', 'securityCenter.openSecurityPipeline', 'securityCenter.openDashboard'
+      ]);
+      return action && ALLOWED.has(action.command) ? this.executeCommand(action.command) : undefined;
+    }
+    const [uri, version, ruleId] = message.ref || [];
+    const commands = { open: 'securityCenter.openLiveFinding', explain: 'securityCenter.explainLiveFinding', quickfix: 'securityCenter.applyLiveQuickFix', fix: 'securityCenter.generateLiveAiFix' };
+    if (commands[message.type]) return this.executeCommand(commands[message.type], uri, version, ruleId);
+  }
   dispose() { this.panel?.dispose(); for (const subscription of this.subscriptions.splice(0)) subscription.dispose(); }
 }
 

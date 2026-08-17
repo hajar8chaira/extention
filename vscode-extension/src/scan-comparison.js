@@ -1687,6 +1687,13 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
       if (tool === 'ZAP' || tool === 'BURP') return 'Dynamic Security';
       if (tool === 'SEMGREP') return 'Code';
       if (tool === 'SONARQUBE') return 'Code';
+      // Snyk covers three domains at once, so the capability recorded on the
+      // finding decides its category rather than the scanner name.
+      if (tool === 'SNYK') {
+        if (f.snykCapability === 'openSource') return 'Dependencies';
+        if (f.snykCapability === 'iac') return 'IaC / Cloud';
+        return 'Code';
+      }
       if (tool === 'TRIVY') {
         if (f.imageName || f.dockerImage) return 'Containers';
         if (String(f.ruleId || '').includes('AVD-') || String(f.title || '').includes('Misconfig')) return 'IaC / Cloud';

@@ -17,6 +17,32 @@ const SONARSCANNER_LISTING = 'https://binaries.sonarsource.com/s3api?prefix=Dist
 // Verified fallback used when the official listing cannot be read.
 const SONARSCANNER_PINNED_VERSION = '8.1.0.6389';
 
+// Snyk publishes standalone executables on its own CDN, together with a single
+// GPG-signed `sha256sums.txt.asc` covering every platform binary. The same
+// download → verify → install contract as the other managed tools applies.
+const SNYK_CLI_BASE = 'https://downloads.snyk.io/cli/stable';
+
+/** Official Snyk standalone binary for the running platform, '' if unsupported. */
+function snykCliAsset(platform = process.platform, arch = process.arch) {
+  if (platform === 'win32') return arch === 'x64' ? 'snyk-win.exe' : '';
+  if (platform === 'darwin') return arch === 'arm64' ? 'snyk-macos-arm64' : 'snyk-macos';
+  if (platform === 'linux') return arch === 'arm64' ? 'snyk-linux-arm64' : 'snyk-linux';
+  return '';
+}
+
+/**
+ * `sha256sums.txt.asc` is a clear-signed list of `<sha256>  <asset>` lines.
+ * Only the line naming the downloaded asset is used, and the name is matched
+ * exactly so `snyk-linux` never picks up the `snyk-linux-arm64` digest.
+ */
+function parseSnykChecksums(text, asset) {
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const match = line.trim().match(/^([a-f0-9]{64})\s+\*?(\S+)$/i);
+    if (match && match[2].replace(/^\.\//, '') === asset) return match[1].toLowerCase();
+  }
+  return '';
+}
+
 /** Official artifact suffix for the running platform, or '' when unsupported. */
 function sonarScannerPlatform(platform = process.platform, arch = process.arch) {
   if (platform === 'win32') return arch === 'x64' ? 'windows-x64' : '';
@@ -40,7 +66,17 @@ const TOOLS = Object.freeze({
   gitleaks: { label: 'Gitleaks', kind: 'github', command: 'gitleaks', repo: 'gitleaks/gitleaks', purpose: 'Détection de secrets', asset: /gitleaks_.*_windows_x64\.zip$/i, checksum: /checksums\.txt$/i },
   trivy: { label: 'Trivy', kind: 'github', command: 'trivy', repo: 'aquasecurity/trivy', purpose: 'Dépendances, conteneurs et IaC', asset: /trivy_.*_windows-64bit\.zip$/i, checksum: /checksums\.txt$/i },
   osv: { label: 'OSV-Scanner', kind: 'github', command: 'osv-scanner', repo: 'google/osv-scanner', purpose: 'Vulnérabilités des dépendances', asset: /osv-scanner_windows_amd64\.exe$/i, checksum: /(checksums|sha256).*\.txt$/i },
-  sonarscanner: { label: 'SonarScanner', kind: 'sonarsource', command: 'sonar-scanner', purpose: 'Analyse SonarQube du code', base: SONARSCANNER_BASE, version: SONARSCANNER_PINNED_VERSION }
+  sonarscanner: { label: 'SonarScanner', kind: 'sonarsource', command: 'sonar-scanner', purpose: 'Analyse SonarQube du code', base: SONARSCANNER_BASE, version: SONARSCANNER_PINNED_VERSION },
+  snyk: { label: 'Snyk CLI', kind: 'snyk', command: 'snyk', purpose: 'Dépendances, code et IaC via Snyk', base: SNYK_CLI_BASE },
+  // Cosign is a supply-chain tool, not a scanner: it signs and verifies
+  // artefacts and never produces findings. It reuses the same official
+  // release + SHA-256 installation contract as the scanners.
+  cosign: {
+    label: 'Cosign', kind: 'github', command: 'cosign', repo: 'sigstore/cosign',
+    purpose: 'Signature et vérification des artefacts (supply chain)',
+    asset: /^cosign-windows-amd64\.exe$/i, checksum: /^cosign_checksums\.txt$/i,
+    versionArgs: ['version'], supplyChain: true
+  }
 });
 
 function request(url, headers = {}) {
@@ -93,20 +129,23 @@ async function sha256(file) {
  * Node refuses to spawn .bat/.cmd wrappers directly, so those go through the
  * interpreter with an argument array rather than `shell: true`.
  */
-function versionInvocation(executable, platform = process.platform) {
+function versionInvocation(executable, platform = process.platform, versionArgs = ['--version']) {
   if (platform === 'win32' && /\.(bat|cmd)$/i.test(executable)) {
-    return { executable: process.env.COMSPEC || 'cmd.exe', args: ['/d', '/s', '/c', executable, '--version'] };
+    return { executable: process.env.COMSPEC || 'cmd.exe', args: ['/d', '/s', '/c', executable, ...versionArgs] };
   }
-  return { executable, args: ['--version'] };
+  return { executable, args: [...versionArgs] };
 }
 
-async function commandVersion(executable, timeout = 30000) {
-  const invocation = versionInvocation(executable);
+async function commandVersion(executable, timeout = 30000, versionArgs = ['--version']) {
+  const invocation = versionInvocation(executable, process.platform, versionArgs);
   try {
     const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, { windowsHide: true, timeout, maxBuffer: 4 * 1024 * 1024 });
     const output = String(stdout || stderr);
     // SonarScanner prints a banner before the version line.
     return output.match(/SonarScanner\s+(?:CLI\s+)?v?[0-9][\w.-]*/i)?.[0]
+      // Cosign prints ASCII art first: the first line carrying a version wins
+      // over the first non-empty line, which would otherwise be the banner.
+      || output.trim().split(/\r?\n/).find((line) => /\d+\.\d+/.test(line) && line.trim())?.trim()
       || output.trim().split(/\r?\n/).find((line) => line.trim()) || 'installé';
   } catch (error) {
     const output = `${error.stdout || ''}\n${error.stderr || ''}`;
@@ -140,7 +179,8 @@ class ScannerToolManager {
     // initializing its Python environment. Do not report a false failure
     // while the managed executable is healthy but cold.
     const versionTimeout = id === 'semgrep' ? 60000 : 30000;
-    const version = executable ? await commandVersion(executable, versionTimeout) : '';
+    // Cosign v2+ exposes `cosign version`, not `--version`.
+    const version = executable ? await commandVersion(executable, versionTimeout, tool.versionArgs || ['--version']) : '';
     return { id, ...tool, installed: Boolean(executable && version), executable, version, managed: executable === managed };
   }
   async statuses() { return Promise.all(Object.keys(TOOLS).map((id) => this.status(id))); }
@@ -216,6 +256,41 @@ class ScannerToolManager {
     } finally { await fs.rm(temporary, { recursive: true, force: true }).catch(() => {}); }
   }
 
+  /**
+   * Installs the official Snyk standalone binary into the extension's private
+   * storage. No npm, no administrator rights, no system PATH change: the file
+   * is verified against Snyk's published SHA-256 list before it is kept.
+   */
+  async installSnyk(tool, onProgress, asset = snykCliAsset()) {
+    if (!asset) throw new Error(`Snyk CLI n’est pas distribué pour ${process.platform}/${process.arch}. Utilisez le mode Docker.`);
+    const binaryUrl = `${tool.base}/${asset}`;
+    onProgress({ phase: 'metadata', message: `${asset} depuis downloads.snyk.io` });
+    const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'security-center-snyk-'));
+    const downloaded = path.join(temporary, asset);
+    try {
+      await download(binaryUrl, downloaded, onProgress);
+      const expected = parseSnykChecksums(await downloadText(`${tool.base}/sha256sums.txt.asc`), asset);
+      if (!expected) throw new Error(`Snyk ne publie pas d’empreinte SHA-256 pour ${asset}. Installation refusée par sécurité.`);
+      const actual = await sha256(downloaded);
+      if (actual !== expected) throw new Error('Échec de vérification SHA-256 du binaire Snyk. Le fichier téléchargé a été supprimé.');
+      onProgress({ phase: 'verify', message: 'Empreinte SHA-256 officielle vérifiée' });
+
+      const executable = this.managedExecutable('snyk');
+      await fs.mkdir(path.dirname(executable), { recursive: true });
+      await fs.copyFile(downloaded, executable);
+      if (process.platform !== 'win32') await fs.chmod(executable, 0o755).catch(() => {});
+
+      await fs.writeFile(path.join(this.toolDirectory('snyk'), 'provenance.json'), JSON.stringify({
+        source: binaryUrl, asset, sha256: actual, checksums: `${tool.base}/sha256sums.txt.asc`, installedAt: new Date().toISOString()
+      }, null, 2));
+      await this.activateManagedPath();
+      onProgress({ phase: 'verify', message: 'Vérification de snyk --version' });
+      const result = await this.status('snyk');
+      if (!result.installed) throw new Error('Snyk CLI installé, mais « snyk --version » n’a rien renvoyé.');
+      return result;
+    } finally { await fs.rm(temporary, { recursive: true, force: true }).catch(() => {}); }
+  }
+
   async extractArchive(archive, destination) {
     if (process.platform === 'win32') {
       return execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
@@ -248,6 +323,7 @@ class ScannerToolManager {
     await fs.mkdir(this.toolDirectory(id), { recursive: true });
     if (tool.kind === 'python') return this.installSemgrep(onProgress);
     if (tool.kind === 'sonarsource') return this.installSonarScanner(tool, onProgress);
+    if (tool.kind === 'snyk') return this.installSnyk(tool, onProgress);
     const release = await this.githubRelease(tool);
     onProgress({ phase: 'metadata', message: `${release.version} trouvé sur ${tool.repo}` });
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), `security-center-${id}-`));
@@ -301,4 +377,8 @@ class ScannerToolManager {
   }
 }
 
-module.exports = { ScannerToolManager, TOOLS, sha256, commandVersion, versionInvocation, sonarScannerPlatform, compareVersions, SONARSCANNER_BASE, SONARSCANNER_PINNED_VERSION };
+module.exports = {
+  ScannerToolManager, TOOLS, sha256, commandVersion, versionInvocation,
+  sonarScannerPlatform, compareVersions, SONARSCANNER_BASE, SONARSCANNER_PINNED_VERSION,
+  snykCliAsset, parseSnykChecksums, SNYK_CLI_BASE
+};

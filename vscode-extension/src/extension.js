@@ -14,10 +14,18 @@ const { ensureDockerAvailable } = require('./docker');
 const { runSonarQube, detectLocalScanner: detectLocalSonarScanner } = require('./sonarqube');
 const { checkServerStatus: checkSonarServer, validateToken: validateSonarToken, normalizeHostUrl: normalizeSonarHostUrl } = require('./sonarqube-api');
 const { SERVER_URL: SONAR_LOCAL_SERVER_URL, inspectLocalServer, localServerState, startLocalServer, stopLocalServer, waitForLocalServer } = require('./sonarqube-server');
-const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeZapOutput, normalizeOsvOutput, normalizeSonarQubeOutput, deduplicateFindings } = require('./findings');
+const { runSnyk, detectLocalCli: detectLocalSnykCli } = require('./snyk');
+const { validateToken: validateSnykToken, looksLikeSnykToken } = require('./snyk-api');
+const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeZapOutput, normalizeOsvOutput, normalizeSonarQubeOutput, normalizeSnykOutput, deduplicateFindings, hasReportableLocation } = require('./findings');
 const { groupFindings, summarizeFindings } = require('./tree');
 const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpStatus, updateFindingStatus, listAuditEvents, createAuditEvent, listScans, getScan, requestText, scanExportUrl } = require('./backend');
 const { CACHE_KEY: LOCAL_SCAN_CACHE_KEY, createLocalScanCache, restoreLocalScanCache } = require('./local-scan-cache');
+const {
+  CAMPAIGN_STATUS: DYNAMIC_STATUS, createCampaign: createDynamicCampaign,
+  applyProgress: applyDynamicProgress, completeCampaign: completeDynamicCampaign,
+  toTransaction: dynamicTransaction, restoreCampaign: restoreDynamicCampaign,
+  legacyBucket: dynamicLegacyBucket, captureSessionFrom
+} = require('./dynamic-campaign');
 const { createExecution, snapshotFromLegacy, normalizeSnapshot, beginRefresh, updateRefresh, completeExecution, projectSnapshot } = require('./security-snapshot');
 const { HISTORY_KEY: LOCAL_SCAN_HISTORY_KEY, appendLocalHistory, renderScanHistoryHtml } = require('./scan-history-page');
 const { buildDashboardModel, renderDashboardHtml, buildSafeHttpPreview, linkedFindingsForScenario, summarizeScannerError } = require('./dashboard');
@@ -31,6 +39,8 @@ const { compareScans, renderScanComparisonHtml } = require('./scan-comparison');
 const { modifiedGitFiles, createIncrementalWorkspace, retainUnchangedFindings } = require('./incremental');
 const { renderAuditLogHtml } = require('./audit');
 const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
+const { evaluatePolicyGate, policyGateError, STATUS: GATE_STATUS } = require('./intelligence/policy-gate');
+const { readPolicyGateConfig, savePolicyGate, createStarterPolicy, policyGateHash, policyFilePath } = require('./policy-config');
 const { analyzeLicenses, renderLicenseReportHtml } = require('./license-compliance');
 const { installPreCommitHook } = require('./precommit');
 const { buildTrendReport, renderTrendReportHtml } = require('./trends');
@@ -60,10 +70,18 @@ const { SentinelEditorPresence } = require('./live/sentinelEditorPresence');
 const { LiveSecurityPageProvider } = require('./live/livePage');
 const { ThemeController } = require('./theme-controller');
 const { ScannerToolManager, TOOLS: MANAGED_SCANNER_TOOLS } = require('./scanner-tool-manager');
-const { renderScannerSetupHtml, sonarDiagnosis } = require('./scanner-setup-page');
+const { renderScannerSetupHtml, sonarDiagnosis, snykDiagnosis } = require('./scanner-setup-page');
+const { analyzeWorkspace, mergeIntelligence, buildPipelineResult, describeStages, runSupplyChainStages, restorePipelineResult, pipelineStateFor, dataAvailability } = require('./pipeline');
+const { renderPipelinePageHtml } = require('./pipeline-page');
+const { detectLocalCosign, generateKeyPair, signBlob, verifyBlob, supportedModes: cosignModes, keylessSupport } = require('./supply-chain/cosign');
 const { SCANNER_RUNTIMES, diagnoseScanner, normalizeMode } = require('./scanner-diagnostics');
 const execFileAsync = promisify(execFile);
 const SONAR_TOKEN_SECRET_KEY = 'securityCenter.sonar.token';
+const SNYK_TOKEN_SECRET_KEY = 'securityCenter.snyk.token';
+const COSIGN_PASSWORD_SECRET_KEY = 'securityCenter.cosign.keyPassword';
+const PIPELINE_STATE_KEY = 'securityCenter.pipelineState';
+// Every scanner Security Center can run, in the order the UI presents them.
+const ALL_SCANNER_TOOLS = Object.freeze(['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP']);
 // Scanners that can be switched off from the settings, so the dashboard can
 // report « Désactivé » instead of leaving them silently absent.
 const OPTIONAL_SCANNERS = Object.freeze([
@@ -71,6 +89,8 @@ const OPTIONAL_SCANNERS = Object.freeze([
   ['Trivy', 'trivy.enabled', true],
   ['OSV-Scanner', 'osv.enabled', true],
   ['SonarQube', 'sonar.enabled', false],
+  // Snyk requires an account and a token, so it is opt-in like SonarQube.
+  ['Snyk', 'snyk.enabled', false],
   ['ZAP', 'zap.enabled', true]
 ]);
 
@@ -196,6 +216,7 @@ class DashboardProvider {
         'securityCenter.configureOllama',
         'securityCenter.rollbackAiFix'
         ,'securityCenter.openScannerSetup'
+        ,'securityCenter.openSecurityPipeline'
       ]);
       if (message?.type === 'command' && message.command === 'securityCenter.scanZap') {
         this.zapConfirmationVisible = true;
@@ -208,7 +229,7 @@ class DashboardProvider {
         return;
       }
       if (message?.type === 'command' && allowed.has(message.command)) this.onCommand(message.command);
-      if (message?.type === 'retryScanner' && ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'].includes(message.tool)) {
+      if (message?.type === 'retryScanner' && ALL_SCANNER_TOOLS.includes(message.tool)) {
         this.onCommand('securityCenter.retryScanner', message.tool);
       }
       if (message?.type === 'finding' && Number.isInteger(message.index)) {
@@ -317,7 +338,16 @@ class DashboardProvider {
   }
   renderWebview(webview, surface = 'full') {
     const nonce = crypto.randomBytes(16).toString('base64');
-    webview.html = renderDashboardHtml(this.model, nonce, surface, this.selectedTheme, { zapConfirmationVisible: this.zapConfirmationVisible, zapConfirmation: this.zapConfirmation });
+    // The companion is read at render time, not stored in the dashboard model:
+    // it changes with the file being edited, which has nothing to do with a scan
+    // result. The object comes straight from the companion engine — the same one
+    // the Live Security page reads — so the two surfaces cannot disagree.
+    const model = {
+      ...this.model,
+      companion: this.getCompanionModel?.() || null,
+      companionEnabled: vscode.workspace.getConfiguration('securityCenter').get('live.companion.enabled', true) !== false
+    };
+    webview.html = renderDashboardHtml(model, nonce, surface, this.selectedTheme, { zapConfirmationVisible: this.zapConfirmationVisible, zapConfirmation: this.zapConfirmation });
   }
   dispose() { this.themeSubscription?.dispose(); }
 }
@@ -385,6 +415,9 @@ class FindingsProvider {
     node.iconPath = new vscode.ThemeIcon(findingIcon);
     if (finding.tool === 'ZAP' || finding.tool === 'OSV-Scanner'
       || (finding.tool === 'SonarQube' && !finding.absolutePath)
+      // A Snyk Open Source result names a manifest, not a line. It opens the
+      // details, and the details link back to the manifest when it exists.
+      || (finding.tool === 'Snyk' && (finding.unlocated || !finding.absolutePath || !fs.existsSync(finding.absolutePath)))
       || (finding.tool === 'Trivy' && (!finding.absolutePath || !fs.existsSync(finding.absolutePath)))) {
       node.command = { command: 'securityCenter.showFindingDetails', title: 'Afficher les détails', arguments: [finding] };
     } else if (finding.absolutePath && fs.existsSync(finding.absolutePath)) {
@@ -408,7 +441,7 @@ function publishDiagnostics(collection, findings) {
   collection.clear();
   const grouped = new Map();
   for (const finding of findings.filter(isActiveFinding)) {
-    if (!finding.absolutePath || !fs.existsSync(finding.absolutePath)) continue;
+    if (!hasReportableLocation(finding) || !fs.existsSync(finding.absolutePath)) continue;
     const uri = vscode.Uri.file(finding.absolutePath);
     const list = grouped.get(uri.fsPath) || { uri, diagnostics: [] };
     list.diagnostics.push(toDiagnostic(finding)); grouped.set(uri.fsPath, list);
@@ -434,6 +467,71 @@ async function activate(context) {
   let currentScanStatuses = [];
   let currentDashboardOptions = {};
   let currentSecuritySnapshot = snapshotFromLegacy();
+  // Security Intelligence state lives with the other scan state so it can be
+  // restored from the cache at activation, before any page is opened.
+  let currentPipelineResult = null;
+  let currentPipelineArtifacts = context.workspaceState.get(PIPELINE_STATE_KEY, {})?.artifacts || {};
+  let currentScanRunning = false;
+  /**
+   * Pipeline facts the Security Companion may mention. Every field is read from
+   * state that already exists — nothing here starts a scan, and an unknown fact
+   * is simply omitted so the companion stays silent about it.
+   */
+  function buildCompanionPipelineContext() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const scannerHealth = [];
+    // Only scanners that are enabled *and* cannot run are worth mentioning.
+    if (cfg.get('snyk.enabled', false) && !companionSnykTokenPresent) {
+      scannerHealth.push({ tool: 'Snyk', enabled: true, reason: 'jeton manquant — configurez-le dans Configuration des scanners.' });
+    }
+    if (cfg.get('sonar.enabled', false) && companionSonarUnreachable) {
+      scannerHealth.push({ tool: 'SonarQube Server', enabled: true, reason: 'serveur injoignable — vérifiez le serveur dans Configuration des scanners.' });
+    }
+    const failedScanner = currentScanStatuses.find((scanner) => scanner.status === 'failed');
+    if (failedScanner) {
+      scannerHealth.push({ tool: failedScanner.tool, enabled: true, reason: summarizeScannerError(failedScanner.error || failedScanner.details || '') });
+    }
+    return {
+      scanStatus: currentScanRunning ? 'running' : (currentPipelineResult ? 'completed' : ''),
+      scanFindingCount: currentPipelineResult ? currentFindings.length : undefined,
+      scanPriorityCount: currentPipelineResult?.prioritySummary?.distribution
+        ? (currentPipelineResult.prioritySummary.distribution.P0 || 0) + (currentPipelineResult.prioritySummary.distribution.P1 || 0)
+        : undefined,
+      // NOT_CONFIGURED stays silent — there is no verdict to report. An invalid
+      // policy is not silent: it is a state the developer must act on.
+      policyStatus: currentPipelineResult?.policy?.configured || currentPipelineResult?.policy?.status === GATE_STATUS.ERROR
+        ? currentPipelineResult.policy.status : '',
+      scannerHealth,
+      // Which scanners are actually running right now. They run in parallel, so
+      // the companion counts them rather than pretending they are sequential.
+      scanProgress: currentScanRunning ? {
+        running: currentScanStatuses.filter((scanner) => scanner.status === 'running').map((scanner) => scanner.tool),
+        completed: currentScanStatuses.filter((scanner) => scanner.status === 'completed').length,
+        total: currentScanStatuses.length
+      } : null,
+      // How the last scan ended, from the status the dashboard already holds.
+      scanOutcome: currentScanRunning ? '' : (currentDashboardOptions.scanStatus || ''),
+      // Where a remediation stands, read from the triage status the scan wrote.
+      // `fixed` means applied and awaiting a re-scan; `validated` means the
+      // re-scan no longer finds it.
+      fixState: currentFindings.some((finding) => finding.triageStatus === 'validated') ? 'validated'
+        : currentFindings.some((finding) => finding.triageStatus === 'fixed') ? 'applied' : '',
+      // Supply-chain evidence, only for the stages that really ran.
+      supplyChain: Object.keys(currentPipelineArtifacts || {}).length ? {
+        sbom: currentPipelineArtifacts.sbom?.status || '',
+        provenance: currentPipelineArtifacts.provenance?.status || '',
+        signing: currentPipelineArtifacts.signing?.status || ''
+      } : null,
+      // The Burp connector state, only once it has actually been probed.
+      burpConnected: typeof currentDashboardOptions.burpConnected === 'boolean'
+        ? currentDashboardOptions.burpConnected : null,
+      remediationAvailable: currentFindings.some((finding) => finding.autofix)
+    };
+  }
+  // Cheap cached health signals: refreshed on demand, never polled.
+  let companionSnykTokenPresent = false;
+  let companionSonarUnreachable = false;
+  context.secrets.get(SNYK_TOKEN_SECRET_KEY).then((token) => { companionSnykTokenPresent = Boolean(token); }).catch(() => {});
   let executionSequence = Number(context.workspaceState.get('securityCenter.executionSequence', 0));
   let currentScanId = null;
   let findingDetailsPanel;
@@ -446,11 +544,82 @@ async function activate(context) {
   const zapCredentialScope = crypto.createHash('sha256').update(workspacePath || 'workspace').digest('hex').slice(0, 16);
   const zapUsernameSecretKey = `securityCenter.zap.username.${zapCredentialScope}`;
   const zapPasswordSecretKey = `securityCenter.zap.password.${zapCredentialScope}`;
-  function refreshDynamicTargetModel(state = currentDashboardOptions.dynamicTargetState || 'unknown') {
+  /**
+   * The dynamic target state, with the evidence that established it.
+   *
+   * `state` alone was contradictory: a ZAP scan could complete — which *proves*
+   * the target answered — while the badge still read « Inconnue / non vérifiée »
+   * because nobody had pressed « Vérifier ». The state now records how it was
+   * established and when, and a scan is a legitimate source of that evidence.
+   *
+   * Changing the target URL invalidates the evidence: it was about the old host.
+   */
+  function refreshDynamicTargetModel(state = currentDashboardOptions.dynamicTargetState || 'unknown', evidence = null) {
     const targetUrl = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
-    currentDashboardOptions = { ...currentDashboardOptions, dynamicTargetUrl: targetUrl, dynamicTargetState: state };
+    const sameTarget = currentDashboardOptions.dynamicTargetUrl === targetUrl;
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      dynamicTargetUrl: targetUrl,
+      dynamicTargetState: state,
+      dynamicTargetEvidence: evidence
+        ? { ...evidence, at: new Date().toISOString(), target: targetUrl }
+        : (sameTarget ? currentDashboardOptions.dynamicTargetEvidence || null : null)
+    };
     dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
   }
+  /**
+   * The dynamic campaign currently being executed, or the last one restored.
+   *
+   * It lives in `currentDashboardOptions`, which the local scan cache already
+   * persists verbatim — no second store is introduced. A campaign therefore
+   * survives a reload for free, and an old cache without one restores as an
+   * explicit legacy bucket rather than crashing or claiming a run it cannot prove.
+   */
+  function currentDynamicCampaign() {
+    return currentDashboardOptions.dynamicCampaign || null;
+  }
+
+  function setDynamicCampaign(campaign) {
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicCampaign: campaign };
+    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+  }
+
+  /** Starts a ZAP campaign. Its identity exists before the scan produces anything. */
+  function beginZapCampaign() {
+    const targetUrl = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', 'http://127.0.0.1:3000');
+    const campaign = createDynamicCampaign({
+      source: 'zap',
+      target: targetUrl,
+      mode: vscode.workspace.getConfiguration('securityCenter').get('zap.mode', 'baseline'),
+      auth: { mode: lastProjectPolicy?.zapAuth?.login ? 'login' : 'anonymous' }
+    });
+    setDynamicCampaign(campaign);
+    return campaign;
+  }
+
+  /**
+   * A lifecycle observation from the execution layer.
+   *
+   * Push, never poll: the webview is re-rendered because ZAP answered, not on a
+   * schedule. An event arriving without an open campaign is dropped rather than
+   * attributed to whatever ran last.
+   */
+  function publishDynamicLifecycle(event) {
+    const campaign = currentDynamicCampaign();
+    if (!campaign || campaign.legacy) return;
+    setDynamicCampaign(applyDynamicProgress(campaign, event));
+  }
+
+  /** Closes the campaign with the outcome the scan really had. */
+  async function finishZapCampaign(status, { findingIds = [], scenarios = null } = {}) {
+    const campaign = currentDynamicCampaign();
+    if (!campaign || campaign.legacy) return;
+    const transactions = (scenarios || currentDashboardOptions.httpScenarios || [])
+      .map((scenario, index) => dynamicTransaction(scenario, { campaignId: campaign.id, index }));
+    setDynamicCampaign(completeDynamicCampaign(campaign, { status, findingIds, transactions }));
+    await saveLocalScanCache();
+  }
+
   async function saveLocalScanCache() {
     if (!workspacePath) return;
     if (currentSecuritySnapshot?.resultSets) {
@@ -520,7 +689,21 @@ async function activate(context) {
   const liveHoverProvider = new LiveHoverProvider({ api: vscode, diagnostics: liveDiagnostics });
   const liveCodeActionProvider = new LiveCodeActionProvider({ api: vscode, diagnostics: liveDiagnostics });
   liveSecurityService = new LiveSecurityService({ workspace: vscode.workspace, window: vscode.window, analyzeDocument: analyzeLiveDocument, diagnostics: liveDiagnostics });
-  const liveCompanionProvider = new LiveCompanionProvider({ api: vscode, service: liveSecurityService, diagnostics: liveDiagnostics, executeCommand: (command, ...args) => vscode.commands.executeCommand(command, ...args), workspacePath, extensionUri: context.extensionUri, themeController });
+  const liveCompanionProvider = new LiveCompanionProvider({
+    api: vscode, service: liveSecurityService, diagnostics: liveDiagnostics,
+    executeCommand: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+    workspacePath, extensionUri: context.extensionUri, themeController,
+    // The companion reads the pipeline instead of recomputing anything: scan
+    // state, policy verdict and scanner health, all from what already ran.
+    getPipelineContext: () => buildCompanionPipelineContext(),
+    // This provider is the engine: it aggregates the service state, the
+    // diagnostics of the file being edited, the pipeline context and the scanner
+    // health into one visual model, and it owns the message priority and the
+    // anti-spam gate. It has no view of its own — the large sidebar panel was
+    // removed on purpose. The surfaces that render it are wired just below,
+    // once they exist.
+    onVisualModel: undefined
+  });
   const liveStatusBar = new LiveStatusBar({ api: vscode, service: liveSecurityService, diagnostics: liveDiagnostics, workspacePath });
   const sentinelEditorPresence = new SentinelEditorPresence({ api: vscode, service: liveSecurityService, diagnostics: liveDiagnostics, extensionUri: context.extensionUri, workspace: vscode.workspace });
   const liveSecurityPageProvider = new LiveSecurityPageProvider({
@@ -532,8 +715,21 @@ async function activate(context) {
     executeCommand: (command, ...args) => vscode.commands.executeCommand(command, ...args),
     getOllamaModel: () => vscode.workspace.getConfiguration('securityCenter').get('ai.ollama.model', ''),
     getKnownFindings: () => currentFindings,
-    themeController
+    themeController,
+    // One engine, read on demand. The page never builds a companion state.
+    getCompanionModel: () => liveCompanionProvider.visualModel()
   });
+  dashboardProvider.getCompanionModel = () => liveCompanionProvider.visualModel();
+  // Wired after both surfaces exist, so a state change arriving early can never
+  // touch an uninitialised binding. Each surface re-reads the shared model; the
+  // engine pushes no copy of it, which is why the two can never drift apart.
+  liveCompanionProvider.onVisualModel = () => {
+    liveSecurityPageProvider.render();
+    dashboardProvider.render();
+    // Any open Security Pipeline panel re-reads the same model, so two open
+    // pages can never show different counts or a different posture.
+    renderPipelinePage().catch(() => {});
+  };
   context.subscriptions.push(themeController, dashboardProvider);
   context.subscriptions.push(liveSecurityService);
   context.subscriptions.push(liveDiagnostics);
@@ -541,7 +737,6 @@ async function activate(context) {
   context.subscriptions.push(liveStatusBar);
   context.subscriptions.push(sentinelEditorPresence);
   context.subscriptions.push(liveSecurityPageProvider);
-  context.subscriptions.push(vscode.window.registerWebviewViewProvider('securityCenter.liveCompanion', liveCompanionProvider));
   context.subscriptions.push(vscode.languages.registerHoverProvider(
     LIVE_SELECTOR,
     liveHoverProvider
@@ -600,9 +795,12 @@ async function activate(context) {
     liveDiagnostics.suppressForSession(finding);
     return vscode.window.showInformationMessage('Security Center Live : avertissement ignoré pour cette session.');
   }));
+  // The command stays — the status bar and the Live quick fixes use it. It now
+  // opens the Live Security page, because the sidebar view it used to focus no
+  // longer exists and focusing a removed view id would silently do nothing.
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.focusLiveSecurity', async () => {
     await vscode.commands.executeCommand('workbench.view.extension.securityCenter');
-    return vscode.commands.executeCommand('securityCenter.liveCompanion.focus');
+    return liveSecurityPageProvider.open();
   }));
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openLiveSecurityPage', () => liveSecurityPageProvider.open()));
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.enableLiveSecurity', async () => {
@@ -629,8 +827,15 @@ async function activate(context) {
     const restoredProjection = projectSnapshot(currentSecuritySnapshot);
     currentFindings = restoredProjection.findings;
     currentScanStatuses = restoredProjection.scanners;
+    // A persisted campaign is revalidated before being trusted. A cache written
+    // before campaign identity existed — or one whose campaign no longer parses —
+    // is restored as an explicit legacy bucket: the transactions stay visible,
+    // but they are never attributed to a run that cannot be proven.
+    const restoredCampaign = restoreDynamicCampaign(restoredScan.dashboardOptions?.dynamicCampaign);
+    const scenarioCount = (restoredScan.dashboardOptions?.httpScenarios || []).length;
     currentDashboardOptions = {
       ...restoredScan.dashboardOptions,
+      dynamicCampaign: restoredCampaign || (scenarioCount ? dynamicLegacyBucket(scenarioCount) : null),
       backendStatus: 'offline',
       restoredFromCache: true,
       restoredAt: restoredScan.savedAt
@@ -640,6 +845,17 @@ async function activate(context) {
     dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
     const activeCount = currentFindings.filter(isActiveFinding).length;
     scanLog.appendLine(`[${new Date().toISOString()}] Dernier scan local restauré (${currentFindings.length} résultat(s), sauvegarde ${restoredScan.savedAt || 'sans date'}).`);
+    // The intelligence summaries survive in workspaceState while the detail
+    // records lived only in memory. Reuniting them here is what keeps the
+    // Pipeline summary and its detail tabs describing the same scan.
+    currentPipelineResult = restorePipelineResult(
+      context.workspaceState.get(PIPELINE_STATE_KEY, {}),
+      currentFindings
+    );
+    if (currentPipelineResult) {
+      currentPipelineArtifacts = context.workspaceState.get(PIPELINE_STATE_KEY, {})?.artifacts || {};
+      scanLog.appendLine(`[${new Date().toISOString()}] Security Intelligence restaurée — scan ${currentPipelineResult.scanId}, ${currentPipelineResult.clusters.length} corrélation(s), ${currentPipelineResult.findings.length} résultat(s) analysé(s).`);
+    }
   }
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.clearFindings', async () => {
@@ -1093,6 +1309,198 @@ async function activate(context) {
   let scannerSetupConfirmation;
   let scannerInstallationRunning = false;
   const scannerSetupOperations = {};
+  // ------------------------------------------------------ Security Pipeline
+  let pipelinePanel;
+  let pipelineTab = 'pipeline';
+  let pipelineBusy = false;
+  // The outcome of the last policy save, shown once and then cleared: it is a
+  // message about an action, not part of the pipeline state.
+  let policySaveResult = null;
+
+  /** Cosign state for the Supply Chain section. Never exposes key material. */
+  async function collectCosignState() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const detected = await detectLocalCosign({ timeoutMs: 15000 }).catch(() => null);
+    const managed = await scannerToolManager.status('cosign').catch(() => null);
+    const privateKeyPath = cfg.get('cosign.privateKeyPath', '');
+    const publicKeyPath = cfg.get('cosign.publicKeyPath', '');
+    return {
+      installed: Boolean(detected || managed?.installed),
+      version: detected?.version || managed?.version || '',
+      path: detected?.path || managed?.executable || '',
+      keyConfigured: Boolean(privateKeyPath && publicKeyPath),
+      publicKeyPath,
+      // Only the presence of a password is ever reported, never its value.
+      passwordConfigured: Boolean(await context.secrets.get(COSIGN_PASSWORD_SECRET_KEY)),
+      dockerReason: cosignModes().dockerReason,
+      keylessReason: keylessSupport().reason
+    };
+  }
+
+  /**
+   * Single source of truth for every Security Pipeline tab.
+   *
+   * The result is resolved once — from memory if the scan just ran, otherwise
+   * rebuilt from what was persisted — and every tab of the page then reads that
+   * same object. Nothing here recomputes, re-reads « the latest scan » per tab,
+   * or mixes a persisted summary with in-memory details: that mismatch is what
+   * made the Pipeline tab announce results the detail tabs could not show.
+   */
+  async function buildPipelineModel() {
+    const persisted = context.workspaceState.get(PIPELINE_STATE_KEY, {}) || {};
+    // Resolve once, here, and nowhere else.
+    const result = currentPipelineResult || restorePipelineResult(persisted, currentFindings);
+    const model = {
+      tab: pipelineTab,
+      busy: pipelineBusy,
+      scanId: result?.scanId || persisted.scanId || '',
+      finishedAt: result?.finishedAt || persisted.finishedAt || '',
+      restored: Boolean(result?.restored),
+      findings: result?.findings || [],
+      clusters: result?.clusters || [],
+      intelligence: result?.intelligence || persisted.intelligence || { status: 'completed' },
+      correlation: result?.correlationSummary || persisted.correlation || null,
+      reachability: result?.reachabilitySummary || persisted.reachability || null,
+      priority: result?.prioritySummary || persisted.priority || null,
+      policy: result?.policy || persisted.policy || null,
+      artifacts: currentPipelineArtifacts,
+      scanners: currentScanStatuses,
+      cosign: await collectCosignState(),
+      // Same shared companion model as the Live Security page and the dashboard,
+      // rendered here in compact mode. Read, never derived.
+      companion: liveCompanionProvider.visualModel(),
+      companionEnabled: vscode.workspace.getConfiguration('securityCenter').get('live.companion.enabled', true) !== false
+    };
+    // The gate configuration is read from security-center.yml every time the
+    // page renders: the form is a view of the file, never a cached copy of it.
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    model.policyConfig = folder ? await readPolicyGateConfig(folder.uri.fsPath) : { exists: false, filePath: '', gate: {}, supplyChain: {}, error: '' };
+    // An unreadable policy is its own verdict. It replaces the stored one so the
+    // page cannot keep showing a green gate computed from a file that no longer
+    // parses.
+    if (model.policyConfig.error) model.policy = policyGateError(model.policyConfig.error, { filePath: model.policyConfig.filePath });
+    model.policyEvaluation = {
+      // The hash recorded when this scan was judged, compared with the file as
+      // it stands now: that is what distinguishes « policy at scan time » from
+      // « current policy » instead of silently recomputing history.
+      policyHashAtScan: persisted.policyHash || '',
+      currentPolicyHash: model.policyConfig.hash || '',
+      policyChangedSinceScan: Boolean(persisted.policyHash && model.policyConfig.hash
+        && persisted.policyHash !== model.policyConfig.hash),
+      reevaluatedAt: persisted.policyReevaluatedAt || ''
+    };
+    model.policySaveResult = policySaveResult;
+    // What each detail tab can honestly render, compared against what the
+    // Pipeline summary announces for the very same scan.
+    model.availability = {
+      correlations: dataAvailability({
+        summary: model.correlation, records: model.clusters,
+        expected: model.correlation?.total, intelligence: model.intelligence
+      }),
+      reachability: dataAvailability({
+        summary: model.reachability,
+        records: model.findings.filter((finding) => finding.reachability),
+        expected: model.reachability ? Object.values(model.reachability.counts || {}).reduce((total, value) => total + value, 0) : null,
+        intelligence: model.intelligence
+      }),
+      priorities: dataAvailability({
+        summary: model.priority,
+        records: model.findings.filter((finding) => finding.priority),
+        expected: model.priority ? Object.values(model.priority.distribution || {}).reduce((total, value) => total + value, 0) : null,
+        intelligence: model.intelligence
+      })
+    };
+    model.stages = describeStages({
+      findings: model.findings,
+      scanners: currentScanStatuses,
+      correlation: model.correlation,
+      reachability: model.reachability,
+      priority: model.priority,
+      policy: model.policy,
+      artifacts: model.artifacts,
+      intelligence: model.intelligence
+    });
+    return model;
+  }
+
+  async function renderPipelinePage() {
+    if (!pipelinePanel) return;
+    const model = await buildPipelineModel();
+    if (!pipelinePanel) return;
+    pipelinePanel.webview.html = renderPipelinePageHtml(model, crypto.randomBytes(16).toString('base64'), themeController.getTheme());
+  }
+
+  /** Audit trail for a policy edit. The rules travel, never the file's secrets. */
+  async function auditPolicyChange(result, comment) {
+    const actor = vscode.workspace.getConfiguration('securityCenter').get('audit.actor', '')
+      || process.env.USERNAME || process.env.USER || 'local-user';
+    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, action: 'policy.changed', actor, comment,
+      metadata: { policyHash: result.hash || '', configured: Boolean(result.configured) }
+    }).catch(() => {});
+  }
+
+  /**
+   * Re-runs the policy engine against the scan that already completed.
+   *
+   * Deliberately does *not* touch the scanners: the findings, correlations,
+   * reachability and priorities of the current scan are reused as they are, and
+   * only the gate is recomputed. That is what makes « fix the policy, not the
+   * code » a one-second operation instead of a full re-scan.
+   *
+   * If the policy cannot be read, the gate becomes ERROR — never PASS.
+   */
+  async function reevaluatePolicy() {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return;
+    const persisted = context.workspaceState.get(PIPELINE_STATE_KEY, {}) || {};
+    const result = currentPipelineResult || restorePipelineResult(persisted, currentFindings);
+    if (!result?.scanId) {
+      return vscode.window.showWarningMessage('Security Center : aucun scan terminé à ré-évaluer. Lancez d’abord une analyse.');
+    }
+    let policy;
+    try {
+      policy = await loadProjectPolicy(folder.uri.fsPath);
+    } catch (error) {
+      // An invalid policy is reported as such and persisted as such, so no
+      // surface can keep showing the previous verdict as if it still held.
+      const gate = policyGateError(error.message, { filePath: policyFilePath(folder.uri.fsPath).filePath });
+      currentPipelineResult = { ...result, policy: gate };
+      await context.workspaceState.update(PIPELINE_STATE_KEY, { ...persisted, policy: gate, policyReevaluatedAt: gate.evaluatedAt });
+      vscode.window.showErrorMessage(`Security Center : politique projet invalide — ${error.message}`);
+      return renderPipelinePage();
+    }
+    // The same engine, the same findings, the same artefacts as this scan.
+    const gate = evaluatePolicyGate(result.findings || [], policy, {
+      artifacts: Object.keys(currentPipelineArtifacts || {}).length ? currentPipelineArtifacts : null
+    });
+    const reevaluatedAt = new Date().toISOString();
+    currentPipelineResult = { ...result, policy: gate };
+    await context.workspaceState.update(PIPELINE_STATE_KEY, {
+      ...persisted, policy: gate, policyHash: policyGateHash(policy), policyReevaluatedAt: reevaluatedAt
+    });
+    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0,
+      action: gate.status === GATE_STATUS.BLOCK ? 'policy.gate.blocked' : 'policy.gate.evaluated',
+      actor: 'System',
+      comment: `Ré-évaluation manuelle de la politique, sans relancer les scanners : ${gate.summary}`,
+      metadata: {
+        status: gate.status, scanId: result.scanId, reevaluated: true,
+        violations: gate.violations.length, warnings: gate.warnings.length,
+        policyHash: policyGateHash(policy)
+      }
+    }).catch(() => {});
+    liveCompanionProvider.render();
+    vscode.window.showInformationMessage(`Security Center : Policy Gate ${gate.status} — ${gate.summary}`);
+    return renderPipelinePage();
+  }
+
+  /** Audit helper shared by every supply-chain action. */
+  async function auditSupplyChain(action, comment, metadata = {}) {
+    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, action, actor: 'System', comment, metadata
+    }).catch(() => {});
+  }
   /**
    * Real SonarQube diagnosis for the setup page. Never returns the token
    * itself, only whether one is stored.
@@ -1156,6 +1564,53 @@ async function activate(context) {
     return diagnostic;
   }
   /**
+   * Real Snyk diagnosis for the setup page. Scanner, authentication and
+   * capabilities are established separately so a Snyk Code entitlement the
+   * account does not have never marks the whole scanner as broken.
+   */
+  async function collectSnykDiagnostic() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const token = await context.secrets.get(SNYK_TOKEN_SECRET_KEY) || '';
+    const diagnostic = {
+      enabled: cfg.get('snyk.enabled', false),
+      mode: cfg.get('snyk.mode', 'auto'),
+      includeOpenSource: cfg.get('snyk.includeOpenSource', true),
+      includeCode: cfg.get('snyk.includeCode', false),
+      includeIaC: cfg.get('snyk.includeIaC', false),
+      tokenConfigured: Boolean(token),
+      cliVersion: '',
+      cliPath: '',
+      dockerAvailable: false,
+      authenticationValid: null,
+      // Open Source is available as soon as the token is accepted; Code and IaC
+      // are only decided by a real run, so they stay « non vérifié » until then.
+      capabilities: context.workspaceState.get('securityCenter.snykCapabilities', { openSource: null, code: null, iac: null })
+    };
+    const [cli, docker] = await Promise.all([
+      detectLocalSnykCli({ timeoutMs: 20000 }).catch(() => null),
+      ensureDockerAvailable(8000).then(() => true).catch(() => false)
+    ]);
+    diagnostic.cliVersion = cli?.version || '';
+    diagnostic.cliPath = cli?.path || '';
+    diagnostic.dockerAvailable = docker;
+    if (token) {
+      diagnostic.authenticationValid = await validateSnykToken(token, { timeoutMs: 8000 }).catch(() => null);
+      if (diagnostic.authenticationValid === true) diagnostic.capabilities = { ...diagnostic.capabilities, openSource: true };
+      if (diagnostic.authenticationValid === false) diagnostic.capabilities = { openSource: false, code: false, iac: false };
+    }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (folder) {
+      const policy = await loadProjectPolicy(folder.uri.fsPath).catch(() => null);
+      diagnostic.blockedByProjectPolicy = policy?.scanners?.Snyk === false;
+    }
+    diagnostic.effectiveEnabled = diagnostic.enabled && !diagnostic.blockedByProjectPolicy;
+    // Feed the companion from this existing health probe rather than adding a
+    // polling loop of its own. A disabled SonarQube never raises a warning.
+    companionSonarUnreachable = diagnostic.enabled && diagnostic.serverOnline === false;
+    liveCompanionProvider?.render();
+    return diagnostic;
+  }
+  /**
    * Enriches each managed scanner status with the mode actually resolved by its
    * own runner, so the page can never disagree with the analysis pipeline.
    */
@@ -1178,15 +1633,27 @@ async function activate(context) {
   }
   async function renderScannerSetup() {
     if (!scannerSetupPanel) return;
-    const [rawStatuses, sonar] = await Promise.all([scannerToolManager.statuses(), collectSonarDiagnostic()]);
+    const [rawStatuses, sonar, snyk] = await Promise.all([
+      scannerToolManager.statuses(), collectSonarDiagnostic(), collectSnykDiagnostic()
+    ]);
     // SonarScanner is presented inside the SonarQube card, not as a fifth
     // managed scanner, so its status and install progress are routed there.
+    // The Snyk CLI is routed into the Snyk card for the same reason.
     const sonarScannerStatus = rawStatuses.find((item) => item.id === 'sonarscanner');
     sonar.managedScannerInstalled = Boolean(sonarScannerStatus?.installed);
     sonar.installing = scannerSetupOperations.sonarscanner;
-    const statuses = await withScannerDiagnostics(rawStatuses.filter((item) => item.id !== 'sonarscanner'));
+    const snykStatus = rawStatuses.find((item) => item.id === 'snyk');
+    snyk.managedCliInstalled = Boolean(snykStatus?.managed && snykStatus?.installed);
+    // The installed CLI is authoritative over the PATH probe: a managed binary
+    // outside the PATH must still be reported as available.
+    if (!snyk.cliVersion && snykStatus?.installed) {
+      snyk.cliVersion = snykStatus.version;
+      snyk.cliPath = snykStatus.executable;
+    }
+    snyk.installing = scannerSetupOperations.snyk;
+    const statuses = await withScannerDiagnostics(rawStatuses.filter((item) => !['sonarscanner', 'snyk'].includes(item.id)));
     if (!scannerSetupPanel) return;
-    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar);
+    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar, snyk);
   }
   async function installManagedScanners(ids) {
     const tools = ids.filter((id) => MANAGED_SCANNER_TOOLS[id]);
@@ -1209,7 +1676,8 @@ async function activate(context) {
             });
           });
           scannerSetupOperations[id] = { state: 'ready', title: `${label} est prêt`, message: 'Installation vérifiée. Le prochain scan utilisera automatiquement cette version locale.' };
-          await vscode.workspace.getConfiguration('securityCenter').update(`${id}.command`, 'auto', vscode.ConfigurationTarget.Global).catch(() => {});
+          // Snyk names its execution mode `snyk.mode`, not `snyk.command`.
+          await vscode.workspace.getConfiguration('securityCenter').update(id === 'snyk' ? 'snyk.mode' : `${id}.command`, 'auto', vscode.ConfigurationTarget.Global).catch(() => {});
         } catch (error) {
           scannerSetupOperations[id] = { state: 'failed', title: `${label} n’a pas été installé`, message: error.message };
           scanLog.appendLine(`Installation ${label} — ÉCHEC : ${error.stack || error.message}`);
@@ -1240,6 +1708,11 @@ async function activate(context) {
               // fallback, and Docker never needs the local CLI.
               if (item.id === 'sonarscanner') {
                 return cfg.get('sonar.enabled', false) && cfg.get('sonar.mode', 'auto') === 'local';
+              }
+              // Same contract for Snyk: disabled installs nothing, Docker needs
+              // no local binary, and Auto keeps Docker as a valid fallback.
+              if (item.id === 'snyk') {
+                return cfg.get('snyk.enabled', false) && cfg.get('snyk.mode', 'auto') === 'local';
               }
               // A scanner pinned to Docker does not need a local binary.
               return cfg.get(SCANNER_RUNTIMES[item.id]?.settingKey || '', 'auto') !== 'docker';
@@ -1286,6 +1759,32 @@ async function activate(context) {
         if (message?.type === 'configureSonarToken') {
           await vscode.commands.executeCommand('securityCenter.configureSonarToken');
           await renderScannerSetup();
+        }
+        // Snyk exposes the same control surface as SonarQube: mode, token and
+        // activation, all written to the settings the pipeline itself reads.
+        if (message?.type === 'setSnykMode' && ['auto', 'local', 'docker'].includes(message.mode)) {
+          await vscode.workspace.getConfiguration('securityCenter').update('snyk.mode', message.mode, vscode.ConfigurationTarget.Global).catch(() => {});
+          await renderScannerSetup();
+          const diagnosis = snykDiagnosis(await collectSnykDiagnostic());
+          vscode.window.showInformationMessage(diagnosis.state === 'ready'
+            ? `Snyk utilisera le mode ${message.mode} — ${diagnosis.label}.`
+            : `Snyk : mode ${message.mode} enregistré, mais ${diagnosis.label} : ${diagnosis.hint}`);
+        }
+        if (message?.type === 'configureSnykToken') {
+          await vscode.commands.executeCommand('securityCenter.configureSnykToken');
+          await renderScannerSetup();
+        }
+        if (message?.type === 'setSnykEnabled' && typeof message.enabled === 'boolean') {
+          await vscode.workspace.getConfiguration('securityCenter').update('snyk.enabled', message.enabled, vscode.ConfigurationTarget.Global).catch(() => {});
+          // Enabled stays enabled: an incomplete configuration is reported, it
+          // never switches Snyk back off behind the user's back.
+          await renderScannerSetup();
+          dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+          if (!message.enabled) return vscode.window.showInformationMessage('Snyk ne sera plus exécuté lors des prochaines analyses.');
+          const diagnosis = snykDiagnosis(await collectSnykDiagnostic());
+          vscode.window.showInformationMessage(diagnosis.state === 'ready'
+            ? `Snyk activé — ${diagnosis.label}.`
+            : `Snyk activé, mais ${diagnosis.label} : ${diagnosis.hint}`);
         }
         // Enabling and disabling write the very settings the analysis pipeline
         // reads, so the page and the orchestrator can never disagree.
@@ -1417,7 +1916,255 @@ async function activate(context) {
     } else scannerSetupPanel.reveal(vscode.ViewColumn.Active);
     await renderScannerSetup();
   }));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openSecurityPipeline', async (tab) => {
+    if (typeof tab === 'string') pipelineTab = tab;
+    if (!pipelinePanel) {
+      pipelinePanel = vscode.window.createWebviewPanel('securityCenter.pipeline', 'Security Center — Security Pipeline', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
+      pipelinePanel.onDidDispose(() => { pipelinePanel = undefined; });
+      pipelinePanel.webview.onDidReceiveMessage(async (message) => {
+        if (message?.type === 'tab') { pipelineTab = message.tab; return renderPipelinePage(); }
+        if (message?.type === 'command') {
+          const allowed = new Set(['securityCenter.scanWorkspace', 'securityCenter.openDashboard', 'securityCenter.openProjectPolicy']);
+          if (allowed.has(message.command)) await vscode.commands.executeCommand(message.command);
+          return;
+        }
+        if (message?.type === 'stage') {
+          // A stage opens the surface that owns it rather than a fake detail view.
+          const destinations = {
+            correlation: () => vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'correlations'),
+            reachability: () => vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'reachability'),
+            priority: () => vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'priorities'),
+            policy: () => vscode.commands.executeCommand('securityCenter.openProjectPolicy'),
+            sbom: () => vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'supply-chain'),
+            provenance: () => vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'supply-chain'),
+            signing: () => vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'supply-chain')
+          };
+          if (destinations[message.stage]) return destinations[message.stage]();
+          return vscode.commands.executeCommand('securityCenter.openScansPage');
+        }
+        if (message?.type === 'finding' && Number.isInteger(message.index)) {
+          const ranked = [...(currentPipelineResult?.findings || [])]
+            .filter((finding) => finding.priority)
+            .sort((left, right) => right.priority.score - left.priority.score);
+          const finding = ranked[message.index];
+          if (finding) await vscode.commands.executeCommand('securityCenter.showFindingDetails', finding);
+          return;
+        }
+        if (message?.type === 'clusterSource' && Number.isInteger(message.cluster)) {
+          const cluster = currentPipelineResult?.clusters?.[message.cluster];
+          const source = cluster?.sources?.[message.source];
+          const finding = currentFindings.find((item) => item.id === source?.findingId);
+          if (finding) await vscode.commands.executeCommand('securityCenter.showFindingDetails', finding);
+          return;
+        }
+        if (message?.type === 'action') await handlePipelineAction(message.action, message.selection);
+      });
+    } else pipelinePanel.reveal(vscode.ViewColumn.Active);
+    await renderPipelinePage();
+  }));
+
+  /**
+   * Supply-chain actions. Each one that writes, signs or creates key material
+   * asks for an explicit confirmation first and records an audit event.
+   */
+  async function handlePipelineAction(action, selection = undefined) {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return vscode.window.showWarningMessage('Ouvrez un dossier avant d’utiliser le pipeline.');
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    if (action === 'refresh') return renderPipelinePage();
+
+    if (action === 'openPolicyYaml') return vscode.commands.executeCommand('securityCenter.openProjectPolicy');
+
+    if (action === 'savePolicy') {
+      policySaveResult = await savePolicyGate(folder.uri.fsPath, selection || {});
+      if (policySaveResult.ok) {
+        await auditPolicyChange(policySaveResult, 'Politique de gate enregistrée depuis l’interface.');
+        vscode.window.showInformationMessage(`Security Center : ${policySaveResult.message}`);
+      } else {
+        vscode.window.showErrorMessage(`Security Center : politique non enregistrée — ${policySaveResult.message}`);
+      }
+      return renderPipelinePage();
+    }
+
+    if (action === 'createStarterPolicy') {
+      policySaveResult = await createStarterPolicy(folder.uri.fsPath);
+      if (policySaveResult.ok) {
+        await auditPolicyChange(policySaveResult, 'Politique de départ créée depuis l’interface.');
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(policySaveResult.filePath)));
+      } else vscode.window.showErrorMessage(`Security Center : ${policySaveResult.message}`);
+      return renderPipelinePage();
+    }
+
+    if (action === 'reevaluatePolicy') return reevaluatePolicy();
+    if (action === 'openSbom' || action === 'openProvenance') {
+      const target = action === 'openSbom' ? currentPipelineArtifacts.sbom?.path : currentPipelineArtifacts.provenance?.path;
+      if (target) await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(target)));
+      return;
+    }
+    if (action === 'installCosign') {
+      scannerSetupConfirmation = undefined;
+      return installManagedScanners(['cosign']).then(() => renderPipelinePage());
+    }
+
+    if (action === 'generateSbom') {
+      pipelineBusy = true; await renderPipelinePage();
+      try {
+        const artifacts = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'Security Center : génération du SBOM', cancellable: false },
+          () => runSupplyChainStages({
+            workspacePath: folder.uri.fsPath,
+            sbom: { enabled: true, mode: cfg.get('trivy.command', 'auto'), imageName: cfg.get('trivy.image', '') },
+            scanners: currentScanStatuses, policy: currentPipelineResult?.policy || null
+          })
+        );
+        currentPipelineArtifacts = { ...currentPipelineArtifacts, ...artifacts };
+        const sbom = artifacts.sbom;
+        await auditSupplyChain('supplychain.sbom.generated', `SBOM ${sbom?.status === 'generated' ? 'généré' : 'non généré'}.`, {
+          status: sbom?.status, componentCount: sbom?.componentCount ?? null, format: sbom?.format || '', digest: sbom?.digest || ''
+        });
+        vscode.window.showInformationMessage(sbom?.status === 'generated'
+          ? `SBOM généré : ${sbom.componentCount} composant(s) — ${sbom.path}`
+          : `SBOM non généré : ${sbom?.reason || 'raison inconnue'}`);
+      } finally { pipelineBusy = false; await renderPipelinePage(); }
+      return;
+    }
+
+    if (action === 'generateProvenance') {
+      pipelineBusy = true; await renderPipelinePage();
+      try {
+        const artifacts = await runSupplyChainStages({
+          workspacePath: folder.uri.fsPath,
+          provenance: { enabled: true, sbom: currentPipelineArtifacts.sbom || null },
+          scanners: currentScanStatuses,
+          policy: currentPipelineResult?.policy || null,
+          startedAt: currentPipelineResult?.startedAt || ''
+        });
+        // The SBOM already on disk is the subject when no other artefact was named.
+        if (!artifacts.provenance && currentPipelineArtifacts.sbom?.path) artifacts.provenance = { status: 'failed', reason: 'Aucun artefact à attester.' };
+        currentPipelineArtifacts = { ...currentPipelineArtifacts, ...artifacts };
+        const provenance = artifacts.provenance;
+        await auditSupplyChain('supplychain.provenance.generated', `Provenance ${provenance?.status === 'generated' ? 'générée' : 'non générée'}.`, {
+          status: provenance?.status, artifactDigest: provenance?.artifactDigest || '', sbomLinked: Boolean(provenance?.sbomLinked), policyStatus: provenance?.policyStatus || ''
+        });
+        vscode.window.showInformationMessage(provenance?.status === 'generated'
+          ? `Provenance générée pour ${provenance.artifactDigest}`
+          : `Provenance non générée : ${provenance?.reason || 'générez d’abord un SBOM'}`);
+      } finally { pipelineBusy = false; await renderPipelinePage(); }
+      return;
+    }
+
+    if (action === 'configureCosignKey') {
+      const choice = await vscode.window.showQuickPick([
+        { label: 'Générer une nouvelle paire de clés', detail: 'Cosign crée cosign.key et cosign.pub dans un dossier que vous choisissez.' },
+        { label: 'Utiliser une paire de clés existante', detail: 'Sélectionner une clé privée et sa clé publique déjà présentes sur ce poste.' }
+      ], { title: 'Clé de signature Cosign', ignoreFocusOut: true });
+      if (!choice) return;
+      if (choice.label.startsWith('Utiliser')) {
+        const privateKey = await vscode.window.showOpenDialog({ title: 'Clé privée Cosign (cosign.key)', canSelectMany: false });
+        if (!privateKey?.length) return;
+        const publicKey = await vscode.window.showOpenDialog({ title: 'Clé publique Cosign (cosign.pub)', canSelectMany: false });
+        if (!publicKey?.length) return;
+        await cfg.update('cosign.privateKeyPath', privateKey[0].fsPath, vscode.ConfigurationTarget.Global);
+        await cfg.update('cosign.publicKeyPath', publicKey[0].fsPath, vscode.ConfigurationTarget.Global);
+      } else {
+        const destination = await vscode.window.showOpenDialog({ title: 'Dossier de destination de la clé Cosign', canSelectFolders: true, canSelectFiles: false, canSelectMany: false });
+        if (!destination?.length) return;
+        // Generating signing material is irreversible and must be explicit.
+        const confirmed = await vscode.window.showWarningMessage(
+          'Générer une paire de clés Cosign ?',
+          {
+            modal: true,
+            detail: `Destination : ${destination[0].fsPath}\n\nLa clé privée sera protégée par un mot de passe conservé dans VS Code SecretStorage. Security Center n’écrase jamais une clé existante et ne place jamais de clé privée dans le dépôt.`
+          },
+          'Générer'
+        );
+        if (confirmed !== 'Générer') return;
+        const password = await vscode.window.showInputBox({
+          title: 'Mot de passe de la clé privée Cosign', password: true, ignoreFocusOut: true,
+          prompt: 'Conservé dans VS Code SecretStorage. Sans lui, la clé sera inutilisable.',
+          validateInput: (value) => (value && value.length >= 8 ? undefined : 'Utilisez au moins 8 caractères.')
+        });
+        if (!password) return;
+        pipelineBusy = true; await renderPipelinePage();
+        try {
+          const keys = await generateKeyPair({ directory: destination[0].fsPath, password, confirmed: true });
+          await context.secrets.store(COSIGN_PASSWORD_SECRET_KEY, password);
+          await cfg.update('cosign.privateKeyPath', keys.privateKeyPath, vscode.ConfigurationTarget.Global);
+          await cfg.update('cosign.publicKeyPath', keys.publicKeyPath, vscode.ConfigurationTarget.Global);
+          await auditSupplyChain('supplychain.key.generated', 'Paire de clés Cosign générée.', { publicKeyPath: keys.publicKeyPath });
+          vscode.window.showInformationMessage(`Paire de clés Cosign créée dans ${destination[0].fsPath}. Sauvegardez cosign.key hors du dépôt.`);
+        } catch (error) {
+          vscode.window.showErrorMessage(`Cosign : ${error.message}`);
+        } finally { pipelineBusy = false; }
+      }
+      if (!await context.secrets.get(COSIGN_PASSWORD_SECRET_KEY)) {
+        const password = await vscode.window.showInputBox({ title: 'Mot de passe de la clé Cosign', password: true, ignoreFocusOut: true });
+        if (password) await context.secrets.store(COSIGN_PASSWORD_SECRET_KEY, password);
+      }
+      return renderPipelinePage();
+    }
+
+    if (action === 'signArtifact') {
+      const gate = currentPipelineResult?.policy;
+      if (gate?.status === 'BLOCK') {
+        return vscode.window.showWarningMessage('Signature refusée : la politique projet a bloqué ce scan. Corrigez les violations avant de signer.');
+      }
+      const keyPath = cfg.get('cosign.privateKeyPath', '');
+      if (!keyPath) return vscode.window.showWarningMessage('Configurez une clé Cosign avant de signer.');
+      const selection = await vscode.window.showOpenDialog({
+        title: 'Artefact à signer', canSelectMany: false,
+        defaultUri: currentPipelineArtifacts.sbom?.path ? vscode.Uri.file(currentPipelineArtifacts.sbom.path) : undefined
+      });
+      if (!selection?.length) return;
+      const confirmed = await vscode.window.showWarningMessage(
+        'Signer cet artefact avec Cosign ?',
+        { modal: true, detail: `Artefact : ${selection[0].fsPath}\nClé : ${keyPath}\n\nUne signature engage votre clé. Security Center ne signe jamais sans cette confirmation.` },
+        'Signer'
+      );
+      if (confirmed !== 'Signer') return;
+      const password = await context.secrets.get(COSIGN_PASSWORD_SECRET_KEY)
+        || await vscode.window.showInputBox({ title: 'Mot de passe de la clé Cosign', password: true, ignoreFocusOut: true });
+      if (!password) return;
+      pipelineBusy = true; await renderPipelinePage();
+      try {
+        const signature = await signBlob({ filePath: selection[0].fsPath, keyPath, password, confirmed: true });
+        currentPipelineArtifacts = { ...currentPipelineArtifacts, signing: signature };
+        await auditSupplyChain('supplychain.artifact.signed', 'Artefact signé avec Cosign.', {
+          artifact: signature.artifact, signaturePath: signature.signaturePath, cosignVersion: signature.cosignVersion
+        });
+        vscode.window.showInformationMessage(`Artefact signé : ${signature.signaturePath}`);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Signature impossible : ${error.message}`);
+      } finally { pipelineBusy = false; await renderPipelinePage(); }
+      return;
+    }
+
+    if (action === 'verifySignature') {
+      const publicKeyPath = cfg.get('cosign.publicKeyPath', '');
+      if (!publicKeyPath) return vscode.window.showWarningMessage('Configurez une clé publique Cosign avant de vérifier une signature.');
+      const selection = await vscode.window.showOpenDialog({
+        title: 'Artefact à vérifier', canSelectMany: false,
+        defaultUri: currentPipelineArtifacts.signing?.artifact ? vscode.Uri.file(currentPipelineArtifacts.signing.artifact) : undefined
+      });
+      if (!selection?.length) return;
+      pipelineBusy = true; await renderPipelinePage();
+      try {
+        const verification = await verifyBlob({ filePath: selection[0].fsPath, publicKeyPath });
+        currentPipelineArtifacts = { ...currentPipelineArtifacts, signing: { ...currentPipelineArtifacts.signing, ...verification } };
+        await auditSupplyChain('supplychain.signature.verified', verification.status === 'verified'
+          ? 'Signature vérifiée.' : 'Vérification de signature en échec.', {
+          artifact: verification.artifact, status: verification.status, reason: verification.reason || ''
+        });
+        if (verification.status === 'verified') vscode.window.showInformationMessage(`Signature vérifiée pour ${path.basename(verification.artifact)}.`);
+        else vscode.window.showWarningMessage(`Signature non vérifiée : ${verification.reason}`);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Vérification impossible : ${error.message}`);
+      } finally { pipelineBusy = false; await renderPipelinePage(); }
+    }
+  }
+
   context.subscriptions.push(themeController.onDidChange(() => renderScannerSetup().catch(() => {})));
+  context.subscriptions.push(themeController.onDidChange(() => renderPipelinePage().catch(() => {})));
   for (const page of ['findings', 'scans', 'dynamic', 'analytics']) {
     const command = `securityCenter.open${page[0].toUpperCase()}${page.slice(1)}Page`;
     context.subscriptions.push(vscode.commands.registerCommand(command, () => {
@@ -1431,7 +2178,7 @@ async function activate(context) {
     const targetUrl = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
     refreshDynamicTargetModel('unknown');
     const result = await checkTargetReachability(targetUrl);
-    refreshDynamicTargetModel(result.state);
+    refreshDynamicTargetModel(result.state, { source: 'probe' });
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.changeDynamicTarget', async () => {
@@ -1494,6 +2241,45 @@ async function activate(context) {
       ...(hasToken ? [] : ['Configurer le jeton'])
     );
     if (action === 'Configurer le jeton') await vscode.commands.executeCommand('securityCenter.configureSonarToken');
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureSnykToken', async () => {
+    const value = await vscode.window.showInputBox({
+      title: 'Jeton d’API Snyk',
+      prompt: 'Généré dans Snyk via Account settings > Auth Token. Conservé par VS Code SecretStorage, jamais dans le projet ni dans security-center.yml. Laissez vide pour le supprimer.',
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (input) => (!input.trim() || looksLikeSnykToken(input) ? undefined : 'Un jeton Snyk est un identifiant au format UUID.')
+    });
+    if (value === undefined) return;
+    const token = value.trim();
+    if (!token) {
+      await context.secrets.delete(SNYK_TOKEN_SECRET_KEY);
+      await context.workspaceState.update('securityCenter.snykCapabilities', { openSource: null, code: null, iac: null });
+      return vscode.window.showInformationMessage('Security Center : jeton Snyk supprimé du stockage sécurisé.');
+    }
+    await context.secrets.store(SNYK_TOKEN_SECRET_KEY, token);
+    // Only the verdict is reported: the token value never reaches a message.
+    const valid = await validateSnykToken(token, { timeoutMs: 8000 }).catch(() => null);
+    if (valid === true) vscode.window.showInformationMessage('Security Center : jeton Snyk enregistré et validé auprès de l’API Snyk.');
+    else if (valid === false) vscode.window.showWarningMessage('Security Center : jeton Snyk enregistré, mais refusé par l’API Snyk. Vérifiez qu’il n’a pas expiré.');
+    else vscode.window.showWarningMessage('Security Center : jeton Snyk enregistré, mais l’API Snyk est injoignable. La validation sera refaite au prochain scan.');
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.checkSnyk', async () => {
+    const diagnostic = await collectSnykDiagnostic();
+    const diagnosis = snykDiagnosis(diagnostic);
+    const engine = diagnostic.cliVersion
+      ? `CLI local ${diagnostic.cliVersion}`
+      : diagnostic.dockerAvailable ? 'CLI local absent — image snyk/snyk sera utilisée' : 'aucun moteur disponible';
+    const tokenState = !diagnostic.tokenConfigured ? 'aucun jeton enregistré'
+      : diagnostic.authenticationValid === true ? 'jeton validé'
+        : diagnostic.authenticationValid === false ? 'jeton refusé par Snyk' : 'jeton enregistré, validation impossible';
+    const action = await vscode.window.showInformationMessage(
+      `Security Center — Snyk : ${diagnosis.label} • ${engine} • ${tokenState}.`,
+      ...(diagnostic.tokenConfigured ? [] : ['Configurer le jeton'])
+    );
+    if (action === 'Configurer le jeton') await vscode.commands.executeCommand('securityCenter.configureSnykToken');
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureBackendApiKey', async () => {
@@ -1945,7 +2731,7 @@ async function activate(context) {
     const backendUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
     try {
       const burpStatus = await getBurpStatus(backendUrl);
-      currentDashboardOptions = { ...currentDashboardOptions, backendStatus: 'online', burpConnected: Boolean(burpStatus.connected), burpStatus, burpEndpoint: `${backendUrl.replace(/\/$/, '')}/api/v1/integrations/burp` };
+      currentDashboardOptions = { ...currentDashboardOptions, backendStatus: 'online', burpConnected: Boolean(burpStatus.connected), burpStatus, burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }), burpEndpoint: `${backendUrl.replace(/\/$/, '')}/api/v1/integrations/burp` };
       dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
       vscode.window.showInformationMessage(burpStatus.connected ? 'Security Center : connecteur Burp connecté.' : 'Security Center : backend accessible, mais aucun heartbeat Burp récent.');
     } catch (error) {
@@ -2000,6 +2786,7 @@ async function activate(context) {
       ...(cfg.get('trivy.enabled', true) ? [{ label: 'Trivy', description: 'Dépendances, images et configurations' }] : []),
       ...(cfg.get('osv.enabled', true) ? [{ label: 'OSV-Scanner', description: 'Validation complémentaire des dépendances' }] : []),
       ...(cfg.get('sonar.enabled', false) ? [{ label: 'SonarQube', description: 'Qualité et sécurité du code via le serveur SonarQube' }] : []),
+      ...(cfg.get('snyk.enabled', false) ? [{ label: 'Snyk', description: 'Dépendances, code et IaC via le service Snyk' }] : []),
       ...(cfg.get('zap.enabled', true) ? [{ label: 'ZAP', description: 'Analyse dynamique passive de la cible locale' }] : [])
     ];
     const selected = await vscode.window.showQuickPick(available, {
@@ -2012,7 +2799,7 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.retryScanner', async (tool) => {
-    const supported = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'];
+    const supported = [...ALL_SCANNER_TOOLS];
     if (!supported.includes(tool)) return;
     if (tool === 'ZAP') return vscode.commands.executeCommand('securityCenter.scanZap');
     await vscode.commands.executeCommand('securityCenter.scanWorkspace', [tool]);
@@ -2215,6 +3002,9 @@ async function activate(context) {
       return vscode.window.showErrorMessage(`Security Center : politique projet invalide — ${error.message}`);
     }
     scanInProgress = true;
+    // The companion mirrors the scan lifecycle without polling anything.
+    currentScanRunning = true;
+    liveCompanionProvider.render();
     const previousFindings = [...currentFindings];
     const previousScanId = currentScanId;
     const scanRequest = Array.isArray(requestedTools) ? { tools: requestedTools } : (requestedTools || {});
@@ -2316,6 +3106,35 @@ async function activate(context) {
             normalize: normalizeSonarQubeOutput
           });
         }
+        // Snyk resolves dependencies for the whole project against its service,
+        // so — like SonarQube — it is skipped on incremental runs where only the
+        // changed files are copied into a temporary workspace.
+        if (cfg.get('snyk.enabled', false) && !incrementalFiles.length) {
+          const snykToken = await context.secrets.get(SNYK_TOKEN_SECRET_KEY) || '';
+          scans.push({
+            tool: 'Snyk',
+            execute: () => runSnyk({
+              workspacePath: analysisPath,
+              mode: projectPolicy?.snykMode || cfg.get('snyk.mode', 'auto'),
+              token: snykToken,
+              includeOpenSource: projectPolicy?.snykCapabilities?.includeOpenSource ?? cfg.get('snyk.includeOpenSource', true),
+              includeCode: projectPolicy?.snykCapabilities?.includeCode ?? cfg.get('snyk.includeCode', false),
+              includeIaC: projectPolicy?.snykCapabilities?.includeIaC ?? cfg.get('snyk.includeIaC', false),
+              exclusions: projectPolicy?.exclusions.global_files || [],
+              timeoutMs: Math.max(timeoutMs, cfg.get('snyk.timeoutSeconds', 600) * 1000),
+              signal: abortController.signal
+            }),
+            // What the account can actually do is only known after a real run,
+            // so the setup page reads the outcome back from here.
+            onSuccess: async (result) => {
+              if (result?.payload?.capabilities) {
+                await context.workspaceState.update('securityCenter.snykCapabilities', result.payload.capabilities);
+              }
+              for (const warning of result?.payload?.warnings || []) scanLog.appendLine(`Snyk — ${warning}`);
+            },
+            normalize: normalizeSnykOutput
+          });
+        }
         const zapRequested = cfg.get('zap.enabled', true)
           && (!requested || requested.has('ZAP'))
           && projectPolicy?.scanners?.ZAP !== false;
@@ -2380,7 +3199,10 @@ async function activate(context) {
             context: projectPolicy?.zapContext || '',
             user: projectPolicy?.zapUser || '',
             auth: projectPolicy?.zapAuth,
-            authEnv: zapAuthEnv
+            authEnv: zapAuthEnv,
+            // Real lifecycle from ZAP's own API responses. Every state and every
+            // percentage that reaches the page comes through here.
+            onLifecycle: (event) => publishDynamicLifecycle(event)
           }),
           normalize: (payload, workspacePath) => normalizeZapOutput(
             payload,
@@ -2404,7 +3226,7 @@ async function activate(context) {
         activeExecution = createExecution({
           executionId: `local-execution-${executionSequence}`,
           requestedTools: scans.map((scan) => scan.tool),
-          allTools: ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'],
+          allTools: [...ALL_SCANNER_TOOLS],
           parentExecutionId: currentSecuritySnapshot.lastExecutionId
         });
         currentSecuritySnapshot = beginRefresh(currentSecuritySnapshot, activeExecution);
@@ -2443,6 +3265,9 @@ async function activate(context) {
           try {
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — démarrage`);
             liveStatuses[index] = { ...scannerIdentity(scan), status: 'running', startedAt: new Date(scannerStartedAt).toISOString() };
+            // A dynamic run gets its identity before it produces anything, so the
+            // lifecycle events that follow have a campaign to belong to.
+            if (scan.tool === 'ZAP') beginZapCampaign();
             currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'running', { startedAt: new Date(scannerStartedAt).toISOString() });
             
             const isRetry = activeExecution && activeExecution.type === 'retry';
@@ -2469,10 +3294,24 @@ async function activate(context) {
             findings.push(...scanFindings);
             const details = scan.tool === 'Trivy'
               ? `${scanFindings.filter((item) => item.category === 'dependency').length} CVE • ${scanFindings.filter((item) => item.category === 'misconfiguration').length} configuration(s)`
-              : `${scanFindings.length} résultat(s)`;
+              // Snyk reports three capabilities at once: the breakdown makes an
+              // unavailable Snyk Code visible instead of looking like zero risk.
+              : scan.tool === 'Snyk'
+                ? `${scanFindings.filter((item) => item.snykCapability === 'openSource').length} dépendance(s) • ${scanFindings.filter((item) => item.snykCapability === 'code').length} code • ${scanFindings.filter((item) => item.snykCapability === 'iac').length} IaC`
+                : `${scanFindings.length} résultat(s)`;
             const durationMs = Date.now() - scannerStartedAt;
             scanStatuses[index] = { ...scannerIdentity(scan), status: 'completed', details, durationMs };
             liveStatuses[index] = { ...scannerIdentity(scan), status: 'completed', details, durationMs };
+            // A ZAP run that completed is proof the target answered. Recording it
+            // keeps the target badge from reading « non vérifiée » right next to a
+            // finished dynamic scan.
+            if (scan.tool === 'ZAP') {
+              refreshDynamicTargetModel('online', { source: 'zap-scan' });
+              // The campaign closes with the findings this run is answerable for.
+              await finishZapCampaign(DYNAMIC_STATUS.COMPLETED, {
+                findingIds: scanFindings.map((finding) => finding.id)
+              });
+            }
             currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'completed', { details, durationMs });
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — terminé en ${Math.round(durationMs / 1000)} s (${scanFindings.length} résultat(s))`);
 
@@ -2490,6 +3329,7 @@ async function activate(context) {
               cancelled = true;
               scanStatuses[index] = { ...scannerIdentity(scan), status: 'cancelled', error: error.message, durationMs };
               liveStatuses[index] = { ...scannerIdentity(scan), status: 'cancelled', error: error.message, durationMs };
+              if (scan.tool === 'ZAP') await finishZapCampaign(DYNAMIC_STATUS.CANCELLED);
               currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'cancelled', { error: error.message, durationMs });
               scanLog.appendLine(`[${new Date().toISOString()}] Analyse annulée par l’utilisateur.`);
               return;
@@ -2507,6 +3347,7 @@ async function activate(context) {
             }
             scanStatuses[index] = { ...scannerIdentity(scan), status: 'failed', error: error.message, durationMs };
             liveStatuses[index] = { ...scannerIdentity(scan), status: 'failed', error: error.message, durationMs };
+            if (scan.tool === 'ZAP') await finishZapCampaign(DYNAMIC_STATUS.FAILED);
             currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'failed', { error: error.message, durationMs });
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — ÉCHEC : ${error.message}`);
 
@@ -2556,6 +3397,83 @@ async function activate(context) {
         const consolidatedCorrelated = correlateFindings(currentFindings);
         currentFindings = consolidatedCorrelated.findings;
         const consolidatedPolicyResult = evaluatePolicy(currentFindings, projectPolicy);
+        // Security intelligence runs on the consolidated result, through the
+        // very same services the headless CLI calls. The verdicts are merged
+        // back onto the findings so the tree, the dashboard and the details
+        // page all show them without a parallel model.
+        let intelligenceState = { status: 'completed' };
+        try {
+          progress.report({ message: 'Corrélation et priorisation' });
+          const analysis = await analyzeWorkspace({
+            workspacePath: folder.uri.fsPath, findings: currentFindings,
+            policy: projectPolicy, signal: abortController.signal
+          });
+          currentFindings = mergeIntelligence(currentFindings, analysis);
+          currentPipelineResult = buildPipelineResult({
+            scanId: String(currentScanId || activeExecution?.executionId || ''),
+            workspace: folder.uri.fsPath,
+            startedAt: new Date(scanStartedAt).toISOString(),
+            scanners: currentScanStatuses,
+            rawFindings: currentFindings,
+            analysis,
+            artifacts: currentPipelineArtifacts,
+            failures,
+            intelligence: intelligenceState
+          });
+          // One persisted record per scan: summaries and correlation groups
+          // together, so no tab can ever read a different scan than another.
+          await context.workspaceState.update(
+            PIPELINE_STATE_KEY,
+            {
+              ...pipelineStateFor(currentPipelineResult, analysis, currentPipelineArtifacts),
+              // The rules this verdict was reached with, so a later policy edit
+              // is visible as such instead of silently rewriting history.
+              policyHash: projectPolicy ? policyGateHash(projectPolicy) : ''
+            }
+          );
+          scanLog.appendLine(`Pipeline — ${analysis.clusters.length} corrélation(s), ${analysis.priority.distribution.P0} P0 / ${analysis.priority.distribution.P1} P1, Policy Gate ${analysis.policy.status}.`);
+          if (analysis.policy.configured) {
+            await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+              scan_id: currentScanId || 0,
+              action: analysis.policy.status === 'BLOCK' ? 'policy.gate.blocked' : 'policy.gate.evaluated',
+              actor: 'System',
+              comment: analysis.policy.summary,
+              metadata: {
+                status: analysis.policy.status,
+                // The verdict is tied to the scan it judged, so a historical
+                // record can never be read against a different scan.
+                scanId: currentPipelineResult.scanId,
+                policyHash: projectPolicy ? policyGateHash(projectPolicy) : '',
+                violations: analysis.policy.violations.length,
+                warnings: analysis.policy.warnings.length
+              }
+            }).catch(() => {});
+          }
+          renderPipelinePage().catch(() => {});
+        } catch (error) {
+          // Security Intelligence is additive: a failure here degrades the
+          // decision layer and is reported as such, but the scanner results
+          // stay exactly as the scanners produced them.
+          intelligenceState = { status: 'failed', error: summarizeScannerError(error.message), failedAt: new Date().toISOString() };
+          currentPipelineResult = buildPipelineResult({
+            scanId: String(currentScanId || activeExecution?.executionId || ''),
+            workspace: folder.uri.fsPath,
+            startedAt: new Date(scanStartedAt).toISOString(),
+            scanners: currentScanStatuses,
+            rawFindings: currentFindings,
+            analysis: {},
+            artifacts: currentPipelineArtifacts,
+            failures,
+            intelligence: intelligenceState
+          });
+          await context.workspaceState.update(
+            PIPELINE_STATE_KEY,
+            pipelineStateFor(currentPipelineResult, {}, currentPipelineArtifacts)
+          );
+          scanLog.appendLine(`Pipeline — Security Intelligence indisponible : ${error.message}. Les résultats des scanners sont conservés.`);
+          vscode.window.showWarningMessage(`Security Center : corrélation et priorisation indisponibles — ${intelligenceState.error}. Les résultats des scanners restent affichés.`);
+          renderPipelinePage().catch(() => {});
+        }
         publishDiagnostics(diagnostics, currentFindings); provider.setFindings(currentFindings, currentScanStatuses);
         let backendStatus = 'online';
         try {
@@ -2614,8 +3532,13 @@ async function activate(context) {
         };
         dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
         await saveLocalScanCache();
+        // History stores the enriched findings: an archived scan keeps its
+        // correlation, reachability and priority instead of losing them.
+        const enrichedById = new Map(currentFindings.map((finding) => [finding.id, finding]));
         await addCurrentScanToLocalHistory({
-          findings: triagedFindings.filter((finding) => activeExecution.scanners.includes(finding.tool) && scanStatuses.some((scanner) => scanner.tool === finding.tool && scanner.status === 'completed')),
+          findings: triagedFindings
+            .filter((finding) => activeExecution.scanners.includes(finding.tool) && scanStatuses.some((scanner) => scanner.tool === finding.tool && scanner.status === 'completed'))
+            .map((finding) => enrichedById.get(finding.id) || finding),
           scanners: scanStatuses,
           dashboardOptions: {
             ...currentDashboardOptions,
@@ -2646,6 +3569,8 @@ async function activate(context) {
       });
     } finally {
       scanInProgress = false;
+      currentScanRunning = false;
+      liveCompanionProvider.render();
     }
   }));
 
@@ -2658,6 +3583,7 @@ async function activate(context) {
       httpScenarioCount: scenarios.length,
       httpScenarios: scenarios,
       burpConnected: Boolean(burpStatus.connected),
+      burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }),
       burpStatus,
       burpEndpoint: `${configuredBackendUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
     };
@@ -2676,6 +3602,7 @@ async function activate(context) {
         httpScenarioCount: scenarios.length,
         httpScenarios: scenarios,
         burpConnected: Boolean(burpStatus.connected),
+      burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }),
         burpStatus,
         burpEndpoint: `${configuredBackendUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
       };

@@ -88,7 +88,7 @@ function projectSnapshot(snapshot) {
   const normalized = normalizeSnapshot(snapshot);
   const findings = [];
   const scanners = [];
-  const preferredOrder = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'ZAP'];
+  const preferredOrder = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP'];
   const availableTools = new Set([...Object.keys(normalized.resultSets || {}), ...Object.keys(normalized.refresh || {})]);
   const tools = [...preferredOrder.filter((tool) => availableTools.delete(tool)), ...availableTools];
   for (const tool of tools) {
