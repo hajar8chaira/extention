@@ -262,5 +262,5 @@ test('le thème sombre reste pris en charge par la page enrichie', async () => {
   const statuses = [{ ...status('semgrep'), diagnostic: await diagnose('semgrep', { configuredMode: 'auto', status: status('semgrep') }) }];
   const html = renderScannerSetupHtml(statuses, 'n', 'dark', {}, null, null);
   assert.match(html, /<html data-theme="dark">/);
-  assert.match(html, /html\[data-theme=dark\]/);
+  assert.match(html, /body class="theme-dark"/);
 });

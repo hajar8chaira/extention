@@ -1,7 +1,22 @@
 const { themeOverridesCss } = require('./theme-controller');
 
+/**
+ * Stable identity of a finding across scans.
+ *
+ * The scanner fingerprint is preferred, then the normalized id. The composite
+ * fallback matters: both used to be able to come back `undefined`, and every
+ * identity-less finding then collided with every other one — two unrelated
+ * results would have looked like the same finding persisting. Real findings
+ * always carry an id, so this only ever fires on malformed input, which is
+ * exactly when a silent collision would be hardest to notice.
+ */
 function findingIdentity(finding) {
-  return finding.fingerprint || finding.id;
+  if (finding.fingerprint) return String(finding.fingerprint);
+  if (finding.id) return String(finding.id);
+  return [
+    finding.tool || '', finding.ruleId || '', finding.file || finding.endpoint || '',
+    finding.startLine ?? '', finding.parameter || ''
+  ].join('|');
 }
 
 function completedTools(result) {
@@ -42,13 +57,36 @@ function compareScans(baseline, current) {
     return oldFinding && String(oldFinding.rawSeverity).toUpperCase() === String(finding.rawSeverity).toUpperCase();
   });
 
+  /**
+   * A regression: a finding the baseline had already dealt with, back again.
+   *
+   * « Dealt with » means the baseline carried an explicit triage verdict —
+   * `validated` (a re-scan confirmed the fix), `fixed` (awaiting that re-scan) or
+   * `false_positive` / `accepted` (judged not to require action). A finding that
+   * was merely absent from the baseline is NEW, not regressed: never having been
+   * seen is not the same as having been resolved.
+   *
+   * Detected on the stable identity, never on the title.
+   */
+  const RESOLVED_STATUSES = ['validated', 'fixed', 'false_positive', 'accepted'];
+  const regressed = currentFindings.filter((finding) => {
+    const previous = baselineById.get(findingIdentity(finding));
+    if (!previous) return false;
+    if (!RESOLVED_STATUSES.includes(String(previous.triageStatus || ''))) return false;
+    // Still closed in the current scan? Then nothing regressed — the verdict
+    // simply carried over.
+    return !RESOLVED_STATUSES.includes(String(finding.triageStatus || ''));
+  });
+  const regressedIdentities = new Set(regressed.map((finding) => findingIdentity(finding)));
+
   const perTool = comparableTools.map((tool) => ({
     tool,
     before: baselineFindings.filter((finding) => finding.tool === tool).length,
     after: currentFindings.filter((finding) => finding.tool === tool).length,
     added: added.filter((finding) => finding.tool === tool).length,
     resolved: resolved.filter((finding) => finding.tool === tool).length,
-    persistent: persistent.filter((finding) => finding.tool === tool).length
+    persistent: persistent.filter((finding) => finding.tool === tool).length,
+    regressed: regressed.filter((finding) => finding.tool === tool).length
   }));
   return {
     baselineId: baseline.scan_id,
@@ -58,6 +96,8 @@ function compareScans(baseline, current) {
     added,
     resolved,
     persistent,
+    regressed,
+    regressedIdentities: [...regressedIdentities],
     severityChanged,
     unchanged,
     perTool,
@@ -83,16 +123,14 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
   <style nonce="${nonce}">
     ${themeOverridesCss()}
 
-    html.theme-light {
-      --page-background: #f3f4f6;
-      --card-background: #ffffff;
-      --vscode-foreground: #424750;
-      --vscode-descriptionForeground: #707782;
-      --vscode-panel-border: #d9dde5;
-    }
-    html.theme-dark {
-      --page-background: var(--vscode-editor-background, #1e1e1e);
-      --card-background: var(--vscode-sideBar-background, #252526);
+
+
+    body {
+      --page-background: var(--sc-bg);
+      --card-background: var(--sc-surface);
+      --vscode-foreground: var(--sc-text);
+      --vscode-descriptionForeground: var(--sc-text-secondary);
+      --vscode-panel-border: var(--sc-border);
     }
 
     html, body {
@@ -308,14 +346,25 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
       padding-bottom: 16px;
     }
     .filter-bar input, .filter-bar select {
-      background: var(--vscode-input-background, #ffffff);
-      color: var(--vscode-input-foreground, #24292f);
-      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      background: var(--sc-input-bg);
+      color: var(--sc-input-text);
+      border: 1px solid var(--sc-input-border);
       border-radius: 6px;
       padding: 8px 12px;
       font-family: inherit;
       font-size: 13px;
       box-sizing: border-box;
+    }
+    .filter-bar select option {
+      background-color: var(--sc-input-bg);
+      color: var(--sc-input-text);
+    }
+    .filter-bar input::placeholder {
+      color: var(--sc-input-placeholder);
+    }
+    .filter-bar input:focus, .filter-bar select:focus {
+      outline: none;
+      border-color: var(--sc-primary);
     }
     .filter-bar input[type="text"] {
       flex-grow: 2;
@@ -511,13 +560,24 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
       padding-bottom: 16px;
     }
     .filter-bar input, .filter-bar select {
-      background: var(--vscode-input-background, #fff);
-      color: var(--vscode-input-foreground, #000);
-      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      background: var(--sc-input-bg);
+      color: var(--sc-input-text);
+      border: 1px solid var(--sc-input-border);
       border-radius: 4px;
       padding: 6px 10px;
       font-family: inherit;
       font-size: 13px;
+    }
+    .filter-bar select option {
+      background-color: var(--sc-input-bg);
+      color: var(--sc-input-text);
+    }
+    .filter-bar input::placeholder {
+      color: var(--sc-input-placeholder);
+    }
+    .filter-bar input:focus, .filter-bar select:focus {
+      outline: none;
+      border-color: var(--sc-primary);
     }
     .filter-bar input[type="text"] {
       flex-grow: 1;
@@ -1089,7 +1149,7 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
     <h2>Historique des scans disponibles</h2>
     
     <!-- Filter bar -->
-    <div class="filter-bar">
+    <div class="filter-bar" data-debug-theme-fix="scan-comparison-v3">
       <input type="text" id="search-scan-input" placeholder="Rechercher par ID ou nom de projet...">
       
       <select id="filter-status-select">

@@ -188,9 +188,12 @@ function mascotCss() {
 
   /* ---------- idle : breathing and an occasional blink ---------- */
   .mascot-idle .sc-eye-dot{opacity:1;animation:sc-blink 6s ease-in-out infinite}
-  .mascot-idle .sc-figure{animation:sc-breathe 4.2s ease-in-out infinite}
-  .mascot-idle .sc-arm-left{animation:sc-sway 4.2s ease-in-out infinite}
-  .mascot-idle .sc-arm-right{animation:sc-sway 4.2s ease-in-out reverse infinite}
+  .mascot-idle .sc-figure{animation:sc-breathe 4.2s ease-in-out infinite,sc-sit-down 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-idle .sc-head{animation:sc-idle-head 8s ease-in-out infinite,sc-head-sit 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-idle .sc-arm-left{animation:sc-sway 4.2s ease-in-out infinite,sc-arm-sit-left 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-idle .sc-arm-right{animation:sc-sway 4.2s ease-in-out reverse infinite,sc-arm-sit-right 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-idle .sc-leg-left{animation:sc-leg-sit-left 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-idle .sc-leg-right{animation:sc-leg-sit-right 15s cubic-bezier(0.25,1,0.5,1) forwards}
 
   /* ---------- watching : eyes scan, head tilts, magnifier out ---------- */
   .mascot-watching .sc-eye-dot{opacity:1}
@@ -230,16 +233,21 @@ function mascotCss() {
 
   /* ---------- success : jump, arms up, check ---------- */
   .mascot-success .sc-eye-happy{opacity:1;stroke:var(--sc-ok)}
-  .mascot-success .sc-figure{animation:sc-jump .75s cubic-bezier(.3,1.4,.5,1) 1}
-  .mascot-success .sc-arm-left{animation:sc-cheer-left .75s ease-out 1}
-  .mascot-success .sc-arm-right{animation:sc-cheer-right .75s ease-out 1}
+  .mascot-success .sc-figure{animation:sc-jump .75s cubic-bezier(.3,1.4,.5,1) 1,sc-breathe 4.2s ease-in-out infinite,sc-sit-down 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-success .sc-head{animation:sc-idle-head 8s ease-in-out infinite,sc-head-sit 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-success .sc-arm-left{animation:sc-cheer-left .75s ease-out 1,sc-arm-sit-left 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-success .sc-arm-right{animation:sc-cheer-right .75s ease-out 1,sc-arm-sit-right 15s cubic-bezier(0.25,1,0.5,1) forwards}
   .mascot-success .sc-check{opacity:1;animation:sc-pop .5s ease-out 1}
   .mascot-success .sc-core-mark{stroke:var(--sc-ok)}
+  .mascot-success .sc-leg-left{animation:sc-leg-sit-left 15s cubic-bezier(0.25,1,0.5,1) forwards}
+  .mascot-success .sc-leg-right{animation:sc-leg-sit-right 15s cubic-bezier(0.25,1,0.5,1) forwards}
 
   /* ---------- sleeping : lowered, eyes closed, Zz ---------- */
   .mascot-sleeping .sc-eye-closed{opacity:1}
-  .mascot-sleeping .sc-figure{transform:translateY(6px);opacity:.68}
+  .mascot-sleeping .sc-figure{transform:translateY(12px);opacity:.68}
   .mascot-sleeping .sc-head{transform:rotate(-7deg)}
+  .mascot-sleeping .sc-leg-left{transform:rotate(-75deg) translate(-5px,-12px)}
+  .mascot-sleeping .sc-leg-right{transform:rotate(75deg) translate(5px,-12px)}
   .mascot-sleeping .sc-zzz{opacity:1}
   .mascot-sleeping .sc-z1{animation:sc-float 2.8s ease-in-out infinite}
   .mascot-sleeping .sc-z2{animation:sc-float 2.8s ease-in-out .6s infinite}
@@ -270,6 +278,35 @@ function mascotCss() {
   @keyframes sc-pop{0%{transform:scale(.4);opacity:0}70%{transform:scale(1.15);opacity:1}100%{transform:scale(1)}}
   @keyframes sc-float{50%{transform:translateY(-5px)}}
   @keyframes sc-shake{25%{transform:translateX(-4px)}75%{transform:translateX(4px)}}
+
+  @keyframes sc-idle-head {
+    0%, 100% { transform: rotate(0) translateY(0); }
+    50% { transform: rotate(1.5deg) translateY(0.5px); }
+  }
+  @keyframes sc-sit-down {
+    0%, 66% { transform: translateY(0); }
+    100% { transform: translateY(12px); }
+  }
+  @keyframes sc-head-sit {
+    0%, 66% { transform: rotate(0); }
+    100% { transform: rotate(2deg) translateY(-2px); }
+  }
+  @keyframes sc-arm-sit-left {
+    0%, 66% { transform: rotate(0); }
+    100% { transform: rotate(-15deg) translateY(-4px); }
+  }
+  @keyframes sc-arm-sit-right {
+    0%, 66% { transform: rotate(0); }
+    100% { transform: rotate(15deg) translateY(-4px); }
+  }
+  @keyframes sc-leg-sit-left {
+    0%, 66% { transform: rotate(0) translateY(0); }
+    100% { transform: rotate(-75deg) translate(-5px, -12px); }
+  }
+  @keyframes sc-leg-sit-right {
+    0%, 66% { transform: rotate(0) translateY(0); }
+    100% { transform: rotate(75deg) translate(5px, -12px); }
+  }
 
   /* Motion is opt-out twice. The static pose still reads: eyes, limbs and the
      status effect stay in their state position, only movement stops. */

@@ -22,7 +22,12 @@
  *     round-trips `dashboardOptions` — this module adds no second store.
  */
 
-const { SENSITIVE_HTTP_NAME, sanitizeHttpValue } = require('./dashboard');
+// Required lazily: the dashboard renders campaign data, so a top-level require
+// would close a cycle and yield half-initialised exports at load time.
+function httpSanitizer() {
+  const { SENSITIVE_HTTP_NAME, sanitizeHttpValue } = require('./dashboard');
+  return { SENSITIVE_HTTP_NAME, sanitizeHttpValue };
+}
 
 /**
  * Lifecycle states.
@@ -172,6 +177,7 @@ function observed(campaign, state) {
  * parameter values go through the one existing sanitizer.
  */
 function toTransaction(scenario, { campaignId: id, source = '', index = 0 } = {}) {
+  const { SENSITIVE_HTTP_NAME, sanitizeHttpValue } = httpSanitizer();
   const request = scenario?.request || {};
   const response = scenario?.response || {};
   const rawUrl = String(request.url || '');
@@ -356,5 +362,5 @@ module.exports = {
   CAMPAIGN_STATUS, TERMINAL_STATUSES, CAMPAIGN_SOURCES, CAPTURE_STATE, LEGACY_CAMPAIGN_ID,
   campaignId, createCampaign, applyProgress, completeCampaign, progressFor, observed,
   toTransaction, parameterNames, withAssociation, captureSessionFrom,
-  restoreCampaign, legacyBucket, hasCampaignIdentity, SENSITIVE_HTTP_NAME
+  restoreCampaign, legacyBucket, hasCampaignIdentity
 };

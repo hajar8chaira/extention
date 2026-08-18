@@ -1,3 +1,5 @@
+const { redactOutgoingMessages } = require('./secret-redaction');
+
 const RESPONSE_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: { oldText: { type: 'string' }, newText: { type: 'string' }, summary: { type: 'string' }, securityReason: { type: 'string' }, confidence: { type: 'number' }, assumptions: { type: 'array', items: { type: 'string' } }, tests: { type: 'array', items: { type: 'string' } } },
@@ -45,9 +47,14 @@ async function listOllamaModels(baseUrl, fetchImpl = fetch) {
 async function chat({ baseUrl, model, messages, fetchImpl, timeoutMs, numPredict, signal }) {
   if (!model) throw new Error('Aucun modèle Ollama sélectionné.');
   const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
+  // The final secret boundary. Every prompt reaches the model through this one
+  // call, so sanitising here covers paths that do not exist yet as well as the
+  // two that do — and it holds even if an earlier layer is skipped or a future
+  // prompt builder forgets to sanitise its own inputs.
+  const safeMessages = redactOutgoingMessages(messages);
   const response = await fetchImpl(new URL('/api/chat', localOllamaUrl(baseUrl)), {
     method: 'POST', headers: { 'content-type': 'application/json' }, signal: requestSignal,
-    body: JSON.stringify({ model, stream: false, format: RESPONSE_SCHEMA, keep_alive: '10m', options: { temperature: 0, num_ctx: 4096, num_predict: numPredict }, messages })
+    body: JSON.stringify({ model, stream: false, format: RESPONSE_SCHEMA, keep_alive: '10m', options: { temperature: 0, num_ctx: 4096, num_predict: numPredict }, messages: safeMessages })
   });
   if (!response.ok) throw new Error(`Ollama HTTP ${response.status} — ${(await response.text()).slice(0, 300)}`);
   const payload = await response.json();

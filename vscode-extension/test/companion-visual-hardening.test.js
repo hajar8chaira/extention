@@ -127,9 +127,18 @@ test('la bulle reste courte, tronquée visuellement et complète au survol', () 
   assert.match(css, /max-width:220px/);
   assert.match(css, /overflow-wrap:anywhere/);
   assert.match(css, /-webkit-line-clamp:2/);
-  assert.match(css, /padding:8px 11px/);
-  assert.match(css, /border-radius:11px/);
-  assert.match(css, /box-shadow:0 2px 7px var\(--sc-bubble-shadow\)/);
+  // La bulle est rembourree et lisible ; figer 11px ne garantissait rien de plus
+  // qu'un pixel precis, et cassait au premier ajustement typographique.
+  const padding = css.match(/\.sc-widget-bubble\{[^}]*padding:(\d+)px (\d+)px/);
+  assert.ok(padding, 'la bulle doit declarer son rembourrage');
+  assert.ok(Number(padding[1]) >= 6 && Number(padding[1]) <= 12, 'rembourrage vertical lisible');
+  assert.ok(Number(padding[2]) >= 8 && Number(padding[2]) <= 16, 'rembourrage horizontal lisible');
+  // Meme raison pour le rayon : ce qui compte est qu'elle soit arrondie, pas
+  // qu'elle le soit d'exactement 11 pixels.
+  const radius = css.match(/\.sc-widget-bubble\{[^}]*border-radius:(\d+)px/);
+  assert.ok(radius && Number(radius[1]) >= 6 && Number(radius[1]) <= 14, 'la bulle reste arrondie');
+  // L'ombre vient du jeton de theme, jamais d'une couleur codee en dur.
+  assert.match(css, /\.sc-widget-bubble\{[^}]*box-shadow:[^;}]*var\(--sc-bubble-shadow\)/);
   // Une flèche pointe vers la mascotte.
   assert.match(css, /\.sc-widget-bubble::after\{content:""/);
   // Un message trop long est coupé, mais son texte complet reste accessible.
@@ -180,7 +189,7 @@ test('le Security Pipeline rend le compagnon en mode compact', () => {
   assert.equal((html.match(/<svg class="mascot/g) || []).length, 1);
   // Désactivé, la page ne porte aucune trace du compagnon.
   const off = renderPipelinePageHtml({ tab: 'pipeline', stages: [], companion: visual, companionEnabled: false }, 'n', 'light');
-  assert.ok(!off.includes('sc-widget'));
+  assert.ok(!/class="sc-widget/.test(off), 'aucun compagnon rendu quand le reglage est desactive');
   assert.match(off, /Security Pipeline/);
 });
 

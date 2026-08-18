@@ -14,6 +14,20 @@ test('affiche et échappe le journal d’audit', () => {
   assert.match(html, /&lt;script&gt;/);
 });
 
+test('journal d’audit theme and VS Code class support', () => {
+  const htmlLight = renderAuditLogHtml([], 'nonce', 'light');
+  const htmlDark = renderAuditLogHtml([], 'nonce', 'dark');
+
+  // Verify body theme classes are rendered correctly
+  assert.match(htmlLight, /class="[^"]*theme-light[^"]*"/);
+  assert.match(htmlDark, /class="[^"]*theme-dark[^"]*"/);
+
+  // Verify filters-bar input controls consume theme-aware variables
+  assert.match(htmlLight, /\.filters-bar input\[type="text"\]/);
+  assert.match(htmlLight, /background:\s*var\(--sc-input-bg\)/);
+  assert.match(htmlLight, /color:\s*var\(--sc-input-text\)/);
+});
+
 const { normalizeAuditEvent, sanitizeAuditEvent } = require('../src/audit-events');
 
 test('existing ZAP authorization event preserved', () => {

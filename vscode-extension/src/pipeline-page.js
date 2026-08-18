@@ -15,6 +15,7 @@
 
 const { dataAvailability } = require('./pipeline');
 const { renderCompanionWidget, companionWidgetCss } = require('./live/companionWidget');
+const { themeOverridesCss } = require('./theme-controller');
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
@@ -141,51 +142,420 @@ function renderStage(stage) {
  * Five distinct states, each with its own wording and its own next action. An
  * absent or invalid policy is never dressed up as a pass.
  */
+function getStatusBadge(state) {
+  const badgeMap = {
+    passed: { label: '✓ OK', cssClass: 'status-success' },
+    running: { label: '● RUNNING', cssClass: 'status-running' },
+    warning: { label: '! WARNING', cssClass: 'status-warning' },
+    blocked: { label: '× FAILED', cssClass: 'status-error' },
+    failed: { label: '× FAILED', cssClass: 'status-error' },
+    not_configured: { label: '— NOT CONFIGURÉ', cssClass: 'status-neutral' },
+    skipped: { label: '○ SKIPPED', cssClass: 'status-skipped' }
+  };
+  const badge = badgeMap[state] || { label: String(state).toUpperCase(), cssClass: 'status-neutral' };
+  const stateLabel = STATE_LABELS[state] || state;
+  return `<span class="status-badge ${badge.cssClass}" title="${escapeHtml(stateLabel)}">${escapeHtml(badge.label)} <small class="state-label-text" style="display: none;">${escapeHtml(stateLabel)}</small></span>`;
+}
+
+function renderScanCard(stage) {
+  const toolsLabel = stage.tools && stage.tools.length ? stage.tools.join(' · ') : '';
+  return `<div class="pipeline-card ${escapeHtml(stateClass(stage.state))}" data-stage="${escapeHtml(stage.id)}" tabindex="0" role="button" aria-label="${escapeHtml(stage.label)} — ${escapeHtml(STATE_LABELS[stage.state] || stage.state)}">
+      <div class="card-top">
+        <span class="card-icon">◇</span>
+        <span class="card-title">${escapeHtml(stage.label)}</span>
+        ${getStatusBadge(stage.state)}
+      </div>
+      ${toolsLabel ? `<div class="card-subtitle">${escapeHtml(toolsLabel)}</div>` : ''}
+      <p class="card-detail">${escapeHtml(stage.detail || 'Aucun résultat')}</p>
+    </div>`;
+}
+
+/**
+ * The Policy Gate summary shown on the Pipeline tab.
+ *
+ * Five distinct states, each with its own wording and its own next action. An
+ * absent or invalid policy is never dressed up as a pass.
+ */
 function renderPolicyBanner(model) {
   const policy = model.policy;
   const status = policy?.status || (policy ? 'NOT_CONFIGURED' : '');
+  
+  const labelMap = {
+    PASS: 'Policy Gate — PASS (Livraison autorisée)',
+    WARN: 'Policy Gate — WARN (Livraison autorisée avec avertissements)',
+    BLOCK: 'Policy Gate — BLOCK (Livraison bloquée)',
+    NOT_CONFIGURED: 'Policy Gate — NON CONFIGURÉ',
+    ERROR: 'Policy Gate — ERROR (Configuration invalide)'
+  };
+  const titleText = labelMap[status] || `Policy Gate — ${status}`;
+
   if (status === 'ERROR') {
-    return `<section class="banner bad"><strong>Policy Gate — configuration invalide</strong>
+    return `<div class="policy-callout status-error" data-stage="policy" tabindex="0" role="button" aria-label="${escapeHtml(titleText)}">
+      <div class="policy-callout-header">
+        <div class="policy-callout-title">${escapeHtml(titleText)}</div>
+      </div>
       <p>${escapeHtml(policy.error || 'La politique projet n’a pas pu être lue.')}</p>
       <p>Aucune livraison n’est autorisée sur cette base : le gate n’a pas pu être évalué.</p>
-      <div class="actions"><button data-tab="policy">Corriger la politique</button><button class="secondary" data-action="openPolicyYaml">Ouvrir security-center.yml</button></div></section>`;
+      <div class="actions">
+        <button data-tab="policy">Corriger la politique</button>
+        <button class="secondary" data-action="openPolicyYaml">Ouvrir security-center.yml</button>
+      </div>
+    </div>`;
   }
   if (!policy || !policy.configured) {
-    return `<section class="banner muted-state"><strong>Policy Gate — NON CONFIGURÉ</strong>
+    return `<div class="policy-callout status-neutral" data-stage="policy" tabindex="0" role="button" aria-label="${escapeHtml(titleText)}">
+      <div class="policy-callout-header">
+        <div class="policy-callout-title">${escapeHtml(titleText)}</div>
+      </div>
       <p>Aucune règle de gate trouvée dans <code>security-center.yml</code>. Security Center ne peut donc ni autoriser ni bloquer une livraison.</p>
-      <div class="actions"><button data-tab="policy">Configurer la politique</button></div></section>`;
+      <div class="actions">
+        <button data-tab="policy">Configurer la politique</button>
+      </div>
+    </div>`;
   }
   const violations = policy.violations || [];
   const warnings = policy.warnings || [];
-  return `<section class="banner ${escapeHtml(policyClass(status))}">
-      <strong>Policy Gate — ${escapeHtml(POLICY_STATE_LABELS[status] || status)}</strong>
+  return `<div class="policy-callout ${escapeHtml(policyClass(status))}" data-stage="policy" tabindex="0" role="button" aria-label="${escapeHtml(titleText)}">
+      <div class="policy-callout-header">
+        <div class="policy-callout-title">${escapeHtml(titleText)}</div>
+        <span class="policy-callout-stats">${violations.length} violation(s) bloquante(s) · ${warnings.length} avertissement(s)</span>
+      </div>
       <p>${escapeHtml(policy.summary || '')}</p>
-      <p class="muted">${violations.length} violation(s) bloquante(s) · ${warnings.length} avertissement(s)</p>
       ${violations.length ? `<ul class="violations">${violations.slice(0, 3).map((violation) => `<li><span class="violation-rule">${escapeHtml(violation.rule || violation.code)}</span> ${escapeHtml(violation.message)}${violation.file ? `<code>${escapeHtml(violation.file)}${violation.line ? `:${violation.line}` : ''}</code>` : ''}</li>`).join('')}</ul>` : ''}
-      <div class="actions"><button data-tab="policy">${violations.length ? 'Voir les violations' : 'Détail de la politique'}</button></div>
-    </section>`;
+      <div class="actions">
+        <button data-tab="policy">${violations.length ? 'Voir les violations' : 'Détail de la politique'}</button>
+      </div>
+    </div>`;
+}
+
+function renderVisualPipelineFlowHtml(model, stages) {
+  const scans = stages.filter((stage) => stage.kind === 'scan');
+  const intelligenceFailed = model.intelligence?.status === 'failed';
+  
+  // 1. PROJECT status
+  const isAnyScanRunning = scans.some(s => s.state === 'running');
+  const projectStatus = isAnyScanRunning ? 'running' : (model.scanId ? 'passed' : 'neutral');
+
+  // 2. DETECTION state
+  const anyScanRunning = scans.some(s => s.state === 'running');
+  const allScanFailed = scans.length > 0 && scans.every(s => s.state === 'failed');
+  const anyScanBlocked = scans.some(s => s.state === 'blocked');
+  const anyScanWarning = scans.some(s => s.state === 'warning');
+  const anyScanPassed = scans.some(s => s.state === 'passed');
+  
+  let detectionState = 'not_configured';
+  if (anyScanRunning) {
+    detectionState = 'running';
+  } else if (anyScanBlocked) {
+    detectionState = 'blocked';
+  } else if (allScanFailed) {
+    detectionState = 'failed';
+  } else if (anyScanWarning) {
+    detectionState = 'warning';
+  } else if (anyScanPassed) {
+    detectionState = 'passed';
+  } else if (scans.some(s => s.state !== 'not_configured')) {
+    detectionState = 'passed';
+  }
+
+  // Micro scanners list
+  const scannerStatuses = [];
+  const allTools = ['Gitleaks', 'Semgrep', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP'];
+  for (const tool of allTools) {
+    const scanStatus = model.scanners?.find(s => s.tool.toLowerCase() === tool.toLowerCase())?.status;
+    const isRunning = scans.some(s => s.state === 'running' && s.tools?.includes(tool));
+    const isFailed = scans.some(s => s.state === 'failed' && s.tools?.includes(tool));
+    const isPassed = scans.some(s => (s.state === 'passed' || s.state === 'warning' || s.state === 'blocked') && s.tools?.includes(tool));
+    
+    let symbol = '○';
+    let cssClass = 'status-waiting';
+    if (isRunning || scanStatus === 'running') {
+      symbol = '◉';
+      cssClass = 'status-running';
+    } else if (scanStatus === 'completed' || isPassed) {
+      symbol = '✓';
+      cssClass = 'status-completed';
+    } else if (scanStatus === 'failed' || isFailed) {
+      symbol = '×';
+      cssClass = 'status-failed';
+    }
+    scannerStatuses.push({ name: tool, symbol, cssClass });
+  }
+
+  // 3. SECURITY INTELLIGENCE state
+  const intelStages = stages.filter(s => s.kind === 'intelligence');
+  const isIntelFailed = intelligenceFailed || (intelStages.length > 0 && intelStages.every(s => s.state === 'failed'));
+  const isIntelRunning = intelStages.some(s => s.state === 'running');
+  const isIntelSkipped = intelStages.length > 0 && intelStages.every(s => s.state === 'skipped' || s.state === 'not_configured');
+  const anyIntelWarning = intelStages.some(s => s.state === 'warning');
+  const anyIntelPassed = intelStages.some(s => s.state === 'passed');
+  
+  let intelState = 'not_configured';
+  if (isIntelFailed) {
+    intelState = 'failed';
+  } else if (isIntelRunning) {
+    intelState = 'running';
+  } else if (isIntelSkipped) {
+    intelState = 'skipped';
+  } else if (anyIntelWarning) {
+    intelState = 'warning';
+  } else if (anyIntelPassed) {
+    intelState = 'passed';
+  }
+
+  function getSubitemIndicator(state) {
+    if (state === 'passed' || state === 'warning') return '✓';
+    if (state === 'running') return '◉';
+    if (state === 'failed') return '×';
+    return '○';
+  }
+
+  // 4. POLICY GATE state
+  const policyStage = stages.find(s => s.id === 'policy');
+  const policyState = policyStage ? policyStage.state : 'not_configured';
+
+  // 5. FINAL DESTINATION state
+  let destLabel = 'DELIVERY';
+  let destState = 'not_configured';
+  let destDetail = 'En attente du gate';
+  
+  if (policyState === 'blocked') {
+    destLabel = 'LIVRAISON BLOQUÉE';
+    destState = 'blocked';
+    destDetail = 'Pipeline bloqué';
+  } else if (policyState === 'passed' || policyState === 'warning') {
+    const artifactStages = stages.filter(s => s.kind === 'artifact');
+    const anyArtifactRunning = artifactStages.some(s => s.state === 'running');
+    const anyArtifactPassed = artifactStages.some(s => s.state === 'passed');
+    
+    if (anyArtifactRunning) {
+      destLabel = 'SUPPLY CHAIN';
+      destState = 'running';
+      destDetail = 'Preuves en cours...';
+    } else if (anyArtifactPassed) {
+      destLabel = 'SUPPLY CHAIN PRÊTE';
+      destState = 'passed';
+      destDetail = 'Preuves générées';
+    } else {
+      destLabel = 'READY / POLICY PASSED';
+      destState = 'passed';
+      destDetail = 'Gate validé';
+    }
+  } else if (policyState === 'running') {
+    destLabel = 'DELIVERY';
+    destState = 'running';
+    destDetail = 'Évaluation du gate...';
+  }
+
+  // 6. Connectors (lines) status
+  // Line 1: PROJECT -> DETECTION
+  let line1Status = 'connector-neutral';
+  if (projectStatus === 'passed') {
+    if (detectionState === 'running') {
+      line1Status = 'connector-active';
+    } else if (detectionState === 'passed' || detectionState === 'warning' || detectionState === 'blocked' || detectionState === 'failed') {
+      line1Status = 'connector-completed';
+    }
+  } else if (projectStatus === 'running') {
+    line1Status = 'connector-active';
+  }
+
+  // Line 2: DETECTION -> SECURITY INTELLIGENCE
+  let line2Status = 'connector-neutral';
+  if (detectionState === 'passed' || detectionState === 'warning') {
+    if (intelState === 'running') {
+      line2Status = 'connector-active';
+    } else if (intelState === 'passed' || intelState === 'warning') {
+      line2Status = 'connector-completed';
+    } else if (intelState === 'failed' || intelState === 'skipped') {
+      line2Status = 'connector-interrupted';
+    }
+  } else if (detectionState === 'blocked' || detectionState === 'failed') {
+    line2Status = 'connector-interrupted';
+  }
+
+  // Line 3: SECURITY INTELLIGENCE -> POLICY GATE
+  let line3Status = 'connector-neutral';
+  if (intelState === 'passed' || intelState === 'warning') {
+    if (policyState === 'running') {
+      line3Status = 'connector-active';
+    } else if (policyState === 'passed' || policyState === 'warning' || policyState === 'blocked' || policyState === 'failed') {
+      line3Status = 'connector-completed';
+    }
+  } else if (intelState === 'failed' || intelState === 'skipped') {
+    line3Status = 'connector-neutral';
+  }
+
+  // Line 4: POLICY GATE -> FINAL DESTINATION
+  let line4Status = 'connector-neutral';
+  if (policyState === 'passed' || policyState === 'warning') {
+    if (destState === 'running') {
+      line4Status = 'connector-active';
+    } else if (destState === 'passed') {
+      line4Status = 'connector-completed';
+    }
+  } else if (policyState === 'blocked' || policyState === 'failed') {
+    line4Status = 'connector-interrupted';
+  }
+
+  return `
+    <div class="visual-pipeline-flow">
+      <!-- PROJECT NODE -->
+      <div class="flow-node node-project ${escapeHtml(projectStatus)}" data-stage="project" tabindex="0" role="button" aria-label="Project Status — ${escapeHtml(projectStatus)}">
+        <div class="node-ring"></div>
+        <div class="node-content">
+          <div class="node-label">PROJECT</div>
+          <div class="node-sub">Source</div>
+        </div>
+      </div>
+      
+      <div class="flow-line ${escapeHtml(line1Status)}">
+        <div class="flow-pulse"></div>
+      </div>
+
+      <!-- DETECTION NODE -->
+      <div class="flow-node node-detection ${escapeHtml(detectionState)}" data-stage="secrets" tabindex="0" role="button" aria-label="Detection Status — ${escapeHtml(detectionState)}">
+        <div class="node-ring"></div>
+        <div class="node-content">
+          <div class="node-label">DETECTION</div>
+          <div class="node-sub">Security Scanners</div>
+          <div class="node-scanners-micro">
+            ${scannerStatuses.map(s => `<span class="micro-scanner ${escapeHtml(s.cssClass)}" title="${escapeHtml(s.name)}">${escapeHtml(s.name[0])}<small style="margin-left: 2px;">${escapeHtml(s.symbol)}</small></span>`).join('')}
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-line ${escapeHtml(line2Status)}">
+        <div class="flow-pulse"></div>
+      </div>
+
+      <!-- INTELLIGENCE NODE -->
+      <div class="flow-node node-intel ${escapeHtml(intelState)}" data-stage="correlation" tabindex="0" role="button" aria-label="Intelligence Status — ${escapeHtml(intelState)}">
+        <div class="node-ring"></div>
+        <div class="node-content">
+          <div class="node-label">SECURITY INTEL</div>
+          <div class="node-sub">${intelState === 'failed' || intelState === 'skipped' ? 'UNAVAILABLE ×' : 'Intelligence'}</div>
+          ${intelState !== 'failed' && intelState !== 'skipped' ? `
+          <div class="intel-micro-list">
+            <div><span>◇ Correlation</span> <span class="indicator">${escapeHtml(getSubitemIndicator(stages.find(s => s.id === 'correlation')?.state))}</span></div>
+            <div><span>◇ Reachability</span> <span class="indicator">${escapeHtml(getSubitemIndicator(stages.find(s => s.id === 'reachability')?.state))}</span></div>
+            <div><span>◇ Prioritisation</span> <span class="indicator">${escapeHtml(getSubitemIndicator(stages.find(s => s.id === 'priority')?.state))}</span></div>
+          </div>
+          ` : ''}
+        </div>
+      </div>
+
+      <div class="flow-line ${escapeHtml(line3Status)}">
+        <div class="flow-pulse"></div>
+      </div>
+
+      <!-- POLICY GATE NODE -->
+      <div class="flow-node node-policy ${escapeHtml(policyState)}" data-stage="policy" tabindex="0" role="button" aria-label="Policy Gate Status — ${escapeHtml(policyState)}">
+        <div class="node-ring"></div>
+        <div class="node-content">
+          <div class="node-label">POLICY GATE</div>
+          <div class="node-sub">${policyState === 'blocked' ? 'BLOCKED ×' : policyState === 'passed' || policyState === 'warning' ? 'PASS ✓' : policyState === 'running' ? 'EVALUATING ●' : 'NOT CONFIGURED'}</div>
+        </div>
+      </div>
+
+      <div class="flow-line ${escapeHtml(line4Status)}">
+        <div class="flow-pulse"></div>
+      </div>
+
+      <!-- FINAL DESTINATION -->
+      <div class="flow-node node-destination ${escapeHtml(destState)}" data-stage="signing" tabindex="0" role="button" aria-label="Delivery Destination — ${escapeHtml(destLabel)}">
+        <div class="node-ring"></div>
+        <div class="node-content">
+          <div class="node-label">${escapeHtml(destLabel)}</div>
+          <div class="node-sub">${escapeHtml(destDetail)}</div>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderPipelineTab(model) {
   const stages = model.stages || [];
   const intelligenceFailed = model.intelligence?.status === 'failed';
-  const groups = [
-    ['Analyse', stages.filter((stage) => stage.kind === 'scan')],
-    ['Security intelligence', stages.filter((stage) => stage.kind === 'intelligence')],
-    ['Décision', stages.filter((stage) => stage.kind === 'decision')],
-    ['Preuves supply chain', stages.filter((stage) => stage.kind === 'artifact')]
-  ];
-  const banner = renderPolicyBanner(model);
-  // A failed intelligence run is stated plainly, and the scanner results above
-  // it are explicitly described as still valid.
+  
+  const scans = stages.filter((stage) => stage.kind === 'scan');
+  const intelligenceItems = stages.filter((stage) => stage.kind === 'intelligence');
+  const artifacts = stages.filter((stage) => stage.kind === 'artifact');
+
+  const policyBanner = renderPolicyBanner(model);
+  
   const intelligenceBanner = intelligenceFailed
-    ? `<section class="banner bad"><strong>Security Intelligence indisponible</strong><p>${escapeHtml(model.intelligence.error || '')} — les résultats des scanners restent affichés et n’ont pas été modifiés. La corrélation, l’atteignabilité et la priorisation ne sont pas disponibles pour ce scan.</p></section>`
+    ? `<div class="policy-callout status-error" style="margin-bottom: 20px;">
+        <div class="policy-callout-header">
+          <div class="policy-callout-title">⚠️ Security Intelligence indisponible</div>
+        </div>
+        <p>${escapeHtml(model.intelligence.error || '')} — les résultats des scanners restent affichés et n’ont pas été modifiés. La corrélation, l’atteignabilité et la priorisation ne sont pas disponibles pour ce scan.</p>
+      </div>`
     : '';
-  return `${intelligenceBanner}${banner}
-    ${groups.map(([title, items]) => items.length
-      ? `<h3 class="section-title">${escapeHtml(title)}</h3><ol class="stages">${items.map(renderStage).join('')}</ol>`
-      : '').join('')}
-    ${model.scanId ? renderScanFooter(model) : '<p class="footnote">Aucune analyse enregistrée. Lancez une analyse du workspace pour alimenter le pipeline.</p>'}`;
+
+  if (!stages.length) {
+    return `<p class="footnote">Aucune analyse enregistrée. Lancez une analyse du workspace pour alimenter le pipeline.</p>`;
+  }
+
+  return `${intelligenceBanner}
+    ${renderVisualPipelineFlowHtml(model, stages)}
+    <div class="pipeline-flow">
+      <!-- Section 1: ANALYSE -->
+      <section class="flow-section">
+        <h3 class="flow-section-title">1. ANALYSE</h3>
+        <div class="pipeline-grid">
+          ${scans.map(renderScanCard).join('')}
+        </div>
+      </section>
+
+      <div class="flow-connector">↓</div>
+
+      <!-- Section 2: SECURITY INTELLIGENCE -->
+      <section class="flow-section">
+        <h3 class="flow-section-title">2. SECURITY INTELLIGENCE</h3>
+        <div class="intelligence-container ${intelligenceFailed ? 'failed' : ''}">
+          <div class="intelligence-row">
+            ${intelligenceItems.map(stage => `
+              <div class="intel-subcard ${escapeHtml(stateClass(stage.state))}" data-stage="${escapeHtml(stage.id)}" tabindex="0" role="button" aria-label="${escapeHtml(stage.label)} — ${escapeHtml(STATE_LABELS[stage.state] || stage.state)}">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                  <span class="intel-subcard-title">${escapeHtml(stage.label)}</span>
+                  ${getStatusBadge(stage.state)}
+                </div>
+                <p class="intel-subcard-detail">${escapeHtml(stage.detail || '')}</p>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      </section>
+
+      <div class="flow-connector">↓</div>
+
+      <!-- Section 3: DECISION -->
+      <section class="flow-section">
+        <h3 class="flow-section-title">3. DÉCISION</h3>
+        ${policyBanner}
+      </section>
+
+      <div class="flow-connector">↓</div>
+
+      <!-- Section 4: SUPPLY CHAIN -->
+      <section class="flow-section">
+        <h3 class="flow-section-title">4. PREUVES SUPPLY CHAIN</h3>
+        <div class="supply-chain-grid">
+          ${artifacts.map(stage => `
+            <div class="supply-card ${escapeHtml(stateClass(stage.state))}" data-stage="${escapeHtml(stage.id)}" tabindex="0" role="button" aria-label="${escapeHtml(stage.label)} — ${escapeHtml(STATE_LABELS[stage.state] || stage.state)}">
+              <div class="supply-card-header">
+                <span class="supply-card-title">${escapeHtml(stage.label)}</span>
+                ${getStatusBadge(stage.state)}
+              </div>
+              <p class="supply-card-detail">${escapeHtml(stage.detail || '')}</p>
+            </div>
+          `).join('')}
+        </div>
+      </section>
+    </div>
+    
+    ${model.scanId ? renderScanFooter(model) : ''}`;
 }
 
 /**
@@ -540,16 +910,726 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
           : activeTab === 'supply-chain' ? renderSupplyChainTab(model)
             : renderPipelineTab(model);
   return `<!doctype html><html data-theme="${escapeHtml(theme)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>
-    :root{color-scheme:light;--bg:#f7f8fb;--card:#fff;--text:#26344a;--muted:#687386;--border:#d8deea;--accent:#5577d8;--ok:#2f9e62;--warn:#c58a19;--bad:#d9534f}html[data-theme=dark]{color-scheme:dark;--bg:#181818;--card:#222;--text:#ddd;--muted:#aaa;--border:#444;--accent:#7aa2ff;--ok:#75ce91;--warn:#e0ad4f;--bad:#ff7b72}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px var(--vscode-font-family,Segoe UI);padding:28px}.wrap{max-width:1120px;margin:auto}.hero{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;border-bottom:1px solid var(--border);padding-bottom:18px;margin-bottom:18px}h1{font-size:28px;margin:0 0 7px}h3{font-size:15px;margin:0}p{color:var(--muted);margin:4px 0;line-height:1.5}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:20px}.tabs button{background:transparent;color:var(--muted);border:1px solid transparent;border-radius:6px;padding:7px 13px;font:inherit;cursor:pointer}.tabs button[aria-current=true]{background:var(--card);border-color:var(--border);color:var(--text);font-weight:700}.section-title{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:22px 0 10px}.stages{list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;margin:0;padding:0}.stage{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--muted);border-radius:8px;padding:13px;cursor:pointer}.stage:focus-visible{outline:2px solid var(--vscode-focusBorder,var(--accent));outline-offset:2px}.stage.ok{border-left-color:var(--ok)}.stage.warn{border-left-color:var(--warn)}.stage.bad{border-left-color:var(--bad)}.stage-head{display:flex;justify-content:space-between;gap:10px;align-items:baseline}.stage-name{font-weight:700}.stage-state{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.stage.ok .stage-state{color:var(--ok)}.stage.warn .stage-state{color:var(--warn)}.stage.bad .stage-state{color:var(--bad)}.stage-detail{font-size:12px;margin:6px 0 0}.banner{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--muted);border-radius:8px;padding:15px;margin-bottom:16px}.banner.ok{border-left-color:var(--ok)}.banner.warn{border-left-color:var(--warn)}.banner.bad{border-left-color:var(--bad)}.violations{margin:10px 0 0;padding-left:18px}.violations li{margin:5px 0;color:var(--text)}.violations.warn li{color:var(--muted)}.violation-rule{font-family:var(--vscode-editor-font-family,monospace);font-size:11px;background:color-mix(in srgb,var(--accent) 12%,var(--card));padding:1px 5px;border-radius:3px;margin-right:6px}.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}.card.ok{border-left:3px solid var(--ok)}.card.warn{border-left:3px solid var(--warn)}.card.bad{border-left:3px solid var(--bad)}.card-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.card-head small{color:var(--muted);display:block;margin-top:3px}.chip{display:inline-block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--card));padding:2px 7px;border-radius:99px;margin-bottom:5px}.tool-chip{display:inline-block;border:1px solid var(--border);border-radius:99px;padding:2px 9px;margin:0 5px 4px 0;font-weight:600}.confidence{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}.confidence.high{color:var(--ok)}.confidence.medium{color:var(--warn)}.confidence.low{color:var(--muted)}dl{margin:13px 0}dl>div{display:grid;grid-template-columns:170px 1fr;padding:6px 0;border-top:1px solid var(--border)}dt{color:var(--muted)}dd{margin:0}.path{overflow-wrap:anywhere;font-family:var(--vscode-editor-font-family,monospace);font-size:12px}.reasons,.sources{margin-top:12px}.reasons-title{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700}.reasons ul,.sources ul,.evidence{margin:6px 0 0;padding-left:18px}.reasons li,.sources li,.evidence li{margin:4px 0}.points{color:var(--muted);font-family:var(--vscode-editor-font-family,monospace)}.summary-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}.summary-tile{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 16px;min-width:110px}.summary-tile strong{display:block;font-size:22px}.summary-tile span{color:var(--muted);font-size:12px}.summary-tile.bad strong{color:var(--bad)}.summary-tile.warn strong{color:var(--warn)}.score{font-size:26px;font-weight:800;white-space:nowrap}.priority-code{display:inline-block;font-size:12px;font-weight:800;letter-spacing:.04em;border:1px solid currentColor;border-radius:4px;padding:1px 6px;vertical-align:middle;margin-right:5px}.score small{font-size:12px;font-weight:400;color:var(--muted)}.score.critical{color:var(--bad)}.score.high{color:var(--warn)}.reach{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);white-space:nowrap}.reach.dynamically_confirmed{color:var(--bad)}.reach.statically_reachable{color:var(--warn)}.reach.not_reachable{color:var(--ok)}code{font-family:var(--vscode-editor-font-family,monospace);font-size:12px;background:color-mix(in srgb,var(--text) 7%,var(--card));padding:1px 5px;border-radius:3px}button{border:0;border-radius:4px;padding:8px 12px;background:var(--accent);color:#fff;font:inherit;cursor:pointer}button.secondary{background:var(--vscode-button-secondaryBackground,#e8eaf0);color:var(--vscode-button-secondaryForeground,var(--text))}button.link{background:none;color:var(--accent);padding:0;text-align:left}button:disabled{opacity:.55;cursor:not-allowed}button:focus-visible{outline:2px solid var(--vscode-focusBorder,var(--accent));outline-offset:2px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:13px}.footnote{font-size:12px;margin-top:14px}.muted,.muted-state{color:var(--muted)}.inline-note{color:var(--muted);font-size:12px;align-self:center}.compact dl{margin:8px 0}h4.section-title{margin:18px 0 8px}.option{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--border);cursor:pointer}.option:first-of-type{border-top:0}.option input[type=checkbox]{margin:2px 0 0;width:15px;height:15px;accent-color:var(--accent);flex:none}.option small{display:block;color:var(--muted);margin-top:2px}.option.number{justify-content:space-between;align-items:center;cursor:default}.option.number input{width:88px;padding:5px 7px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);font:inherit}@media(max-width:760px){body{padding:16px}.hero{display:block}dl>div{grid-template-columns:1fr}}
-  ${companion ? companionWidgetCss() : ''}
-  </style></head><body><main class="wrap">
+    ${themeOverridesCss()}
+
+    body {
+      --bg: var(--sc-bg);
+      --card: var(--sc-surface);
+      --text: var(--sc-text);
+      --muted: var(--sc-text-secondary);
+      --border: var(--sc-border);
+      --accent: var(--sc-primary);
+      
+      --ok: #28a745;
+      --warn: #d29922;
+      --bad: #d94b40;
+      --ok-bg: rgba(40, 167, 69, 0.06);
+      --warn-bg: rgba(210, 153, 34, 0.06);
+      --bad-bg: rgba(217, 75, 64, 0.06);
+      --running-bg: rgba(70, 123, 215, 0.06);
+      --running: #467bd7;
+      
+      --ok-glow: rgba(40, 167, 69, 0.15);
+      --warn-glow: rgba(210, 153, 34, 0.15);
+      --bad-glow: rgba(217, 75, 64, 0.15);
+      --accent-glow: rgba(70, 123, 215, 0.2);
+    }
+    
+    body.theme-dark {
+      --ok: #4ca866;
+      --warn: #e3c036;
+      --bad: #d94b40;
+      --ok-bg: rgba(76, 168, 102, 0.12);
+      --warn-bg: rgba(227, 192, 54, 0.12);
+      --bad-bg: rgba(217, 75, 64, 0.12);
+      --running-bg: rgba(0, 122, 204, 0.12);
+      --running: #007acc;
+      
+      --ok-glow: rgba(76, 168, 102, 0.25);
+      --warn-glow: rgba(227, 192, 54, 0.25);
+      --bad-glow: rgba(217, 75, 64, 0.25);
+      --accent-glow: rgba(0, 122, 204, 0.3);
+    }
+
+    /* Keyframes for futuristic flow visualization */
+    @keyframes pulse-horizontal {
+      0% { left: 0%; opacity: 0; }
+      10% { opacity: 1; }
+      90% { opacity: 1; }
+      100% { left: 100%; opacity: 0; }
+    }
+    @keyframes pulse-vertical {
+      0% { top: 0%; opacity: 0; }
+      10% { opacity: 1; }
+      90% { opacity: 1; }
+      100% { top: 100%; opacity: 0; }
+    }
+    @keyframes node-glow {
+      0% { box-shadow: 0 0 4px var(--accent-glow); }
+      50% { box-shadow: 0 0 12px var(--accent-glow); }
+      100% { box-shadow: 0 0 4px var(--accent-glow); }
+    }
+    @keyframes border-pulse {
+      0% { border-color: var(--border); }
+      50% { border-color: var(--accent); }
+      100% { border-color: var(--border); }
+    }
+
+    /* Visual Pipeline Flow styles */
+    .visual-pipeline-flow {
+      display: flex;
+      flex-direction: row;
+      align-items: stretch;
+      justify-content: space-between;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 24px;
+      gap: 4px;
+    }
+    
+    .flow-node {
+      position: relative;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      flex: 1 1 0;
+      min-width: 140px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 4px;
+      transition: all 0.2s ease;
+      cursor: pointer;
+    }
+    .flow-node:hover {
+      border-color: var(--accent);
+    }
+    .flow-node:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    
+    .flow-node.not_configured {
+      opacity: 0.65;
+    }
+    
+    .node-ring {
+      position: absolute;
+      top: -3px;
+      left: -3px;
+      right: -3px;
+      bottom: -3px;
+      border-radius: 10px;
+      border: 2px solid transparent;
+      z-index: 1;
+      pointer-events: none;
+    }
+    .flow-node.passed .node-ring { border-color: var(--ok); box-shadow: 0 0 6px var(--ok-glow); }
+    .flow-node.warning .node-ring { border-color: var(--warn); box-shadow: 0 0 6px var(--warn-glow); }
+    .flow-node.blocked .node-ring, .flow-node.failed .node-ring { border-color: var(--bad); box-shadow: 0 0 6px var(--bad-glow); }
+    .flow-node.running .node-ring {
+      border-color: var(--accent);
+      animation: node-glow 2s ease-in-out infinite;
+    }
+    .flow-node.running {
+      animation: border-pulse 2s ease-in-out infinite;
+    }
+    
+    .node-content {
+      position: relative;
+      z-index: 2;
+      width: 100%;
+    }
+    
+    .node-label {
+      font-weight: 700;
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--text);
+    }
+    
+    .node-sub {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 1px;
+    }
+    
+    /* Connectors */
+    .flow-line {
+      align-self: center;
+      flex-grow: 1;
+      height: 2px;
+      background: var(--border);
+      position: relative;
+      min-width: 16px;
+    }
+    .flow-line.connector-completed {
+      background: var(--ok);
+    }
+    .flow-line.connector-interrupted {
+      background: var(--bad);
+    }
+    .flow-line.connector-active {
+      background: var(--accent);
+    }
+    
+    .flow-pulse {
+      display: none;
+      width: 6px;
+      height: 6px;
+      background: var(--accent);
+      border-radius: 50%;
+      position: absolute;
+      top: -2px;
+      box-shadow: 0 0 8px var(--accent);
+    }
+    
+    .flow-line.connector-active .flow-pulse {
+      display: block;
+      animation: pulse-horizontal 2s linear infinite;
+    }
+    
+    /* Micro Scanners List */
+    .node-scanners-micro {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px;
+      margin-top: 5px;
+      border-top: 1px solid var(--border);
+      padding-top: 5px;
+    }
+    .micro-scanner {
+      display: inline-flex;
+      align-items: center;
+      font-size: 8px;
+      font-weight: 700;
+      padding: 0px 3px;
+      border-radius: 2px;
+      border: 1px solid var(--border);
+      background: var(--card);
+    }
+    .micro-scanner.status-completed {
+      color: var(--ok);
+      border-color: var(--ok);
+    }
+    .micro-scanner.status-running {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .micro-scanner.status-failed {
+      color: var(--bad);
+      border-color: var(--bad);
+    }
+    .micro-scanner.status-waiting {
+      color: var(--muted);
+      border-color: var(--border);
+    }
+    
+    /* Micro Intel List */
+    .intel-micro-list {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      margin-top: 5px;
+      border-top: 1px solid var(--border);
+      padding-top: 5px;
+      font-size: 8px;
+      color: var(--muted);
+    }
+    .intel-micro-list > div {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .intel-micro-list .indicator {
+      font-weight: 700;
+    }
+
+    /* Responsive pipeline visual flow overrides */
+    @media (max-width: 820px) {
+      .visual-pipeline-flow {
+        flex-direction: column;
+        align-items: center;
+        width: 100%;
+        gap: 0;
+        padding: 12px;
+      }
+      .flow-node {
+        width: 100%;
+        max-width: 300px;
+        min-height: 70px;
+      }
+      .flow-line {
+        width: 2px;
+        height: 24px;
+        min-height: 24px;
+        margin: 4px 0;
+        flex-grow: 0;
+      }
+      .flow-pulse {
+        top: 0;
+        left: -2px;
+      }
+      .flow-line.connector-active .flow-pulse {
+        animation: pulse-vertical 2s linear infinite;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .flow-pulse, .flow-node.running .node-ring, .flow-node.running {
+        animation: none !important;
+      }
+      .flow-pulse {
+        display: none !important;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--vscode-font-family, Segoe UI, -apple-system, sans-serif);
+      font-size: 13px;
+      line-height: 1.4;
+      padding: 24px;
+    }
+    .wrap {
+      max-width: 1120px;
+      margin: auto;
+    }
+    
+    .hero {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 20px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+    }
+    .hero h1 {
+      font-size: 22px;
+      font-weight: 600;
+      margin: 0 0 4px 0;
+    }
+    .hero p {
+      margin: 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .hero .actions {
+      display: flex;
+      gap: 8px;
+    }
+    
+    /* Segmented tab navigation */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    .tabs button {
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      padding: 6px 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .tabs button:hover {
+      color: var(--text);
+    }
+    .tabs button[aria-current=true] {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+      font-weight: 600;
+    }
+    
+    /* Flow sections styles */
+    .pipeline-flow {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    
+    .flow-section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    
+    .flow-section-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin: 0 0 16px 0;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    
+    .flow-connector {
+      text-align: center;
+      font-size: 20px;
+      font-weight: bold;
+      color: var(--border);
+      margin: -4px 0;
+      user-select: none;
+    }
+    
+    /* Responsive grids */
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    @media (min-width: 900px) {
+      .pipeline-grid {
+        grid-template-columns: repeat(4, 1fr);
+      }
+    }
+    @media (min-width: 600px) and (max-width: 899px) {
+      .pipeline-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+    @media (max-width: 599px) {
+      .pipeline-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    
+    .pipeline-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 85px;
+      transition: all 0.15s ease;
+    }
+    .pipeline-card:hover {
+      border-color: var(--accent);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+      transform: translateY(-1px);
+    }
+    .pipeline-card:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .card-icon {
+      font-size: 14px;
+      color: var(--muted);
+      margin-right: 4px;
+    }
+    .card-title {
+      font-weight: 600;
+      font-size: 13px;
+      flex-grow: 1;
+    }
+    .card-subtitle {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .card-detail {
+      font-size: 11px;
+      color: var(--muted);
+      margin: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    
+    /* Status Badge component */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .status-success {
+      background: var(--ok-bg);
+      color: var(--ok);
+    }
+    .status-running {
+      background: var(--running-bg);
+      color: var(--running);
+    }
+    .status-warning {
+      background: var(--warn-bg);
+      color: var(--warn);
+    }
+    .status-error {
+      background: var(--bad-bg);
+      color: var(--bad);
+    }
+    .status-neutral {
+      background: rgba(120, 120, 120, 0.08);
+      color: var(--muted);
+    }
+    .status-skipped {
+      background: rgba(120, 120, 120, 0.08);
+      color: var(--muted);
+    }
+    
+    /* Security Intelligence Section */
+    .intelligence-container {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      background: rgba(120, 120, 120, 0.02);
+    }
+    .intelligence-container.failed {
+      border-color: var(--bad);
+      background: var(--bad-bg);
+    }
+    .intelligence-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    
+    .intel-subcard {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .intel-subcard:hover {
+      border-color: var(--accent);
+    }
+    .intel-subcard-title {
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .intel-subcard-detail {
+      font-size: 11px;
+      color: var(--muted);
+      margin: 0;
+    }
+    
+    /* Policy Callout Banner */
+    .policy-callout {
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--muted);
+      border-radius: 6px;
+      padding: 16px;
+      background: var(--card);
+    }
+    .policy-callout.ok {
+      border-left-color: var(--ok);
+      background: var(--ok-bg);
+    }
+    .policy-callout.warn {
+      border-left-color: var(--warn);
+      background: var(--warn-bg);
+    }
+    .policy-callout.bad, .policy-callout.status-error {
+      border-left-color: var(--bad);
+      background: var(--bad-bg);
+    }
+    .policy-callout.status-neutral {
+      border-left-color: var(--border);
+      background: rgba(120, 120, 120, 0.02);
+    }
+    
+    .policy-callout-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .policy-callout-title {
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .policy-callout-stats {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    
+    /* Supply Chain Section */
+    .supply-chain-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .supply-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .supply-card:hover {
+      border-color: var(--accent);
+    }
+    .supply-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .supply-card-title {
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .supply-card-detail {
+      font-size: 11px;
+      color: var(--muted);
+      margin: 0;
+    }
+    
+    /* Existing card, banner, detail elements preserved for detail tabs */
+    .section-title { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:22px 0 10px }
+    .stages { list-style:none; display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:12px; margin:0; padding:0 }
+    .stage { background:var(--card); border:1px solid var(--border); border-left:3px solid var(--muted); border-radius:8px; padding:13px; cursor:pointer }
+    .stage:focus-visible { outline:2px solid var(--vscode-focusBorder,var(--accent)); outline-offset:2px }
+    .stage.ok { border-left-color:var(--ok) }
+    .stage.warn { border-left-color:var(--warn) }
+    .stage.bad { border-left-color:var(--bad) }
+    .stage-head { display:flex; justify-content:space-between; gap:10px; align-items:baseline }
+    .stage-name { font-weight:700 }
+    .stage-state { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.04em }
+    .stage.ok .stage-state { color:var(--ok) }
+    .stage.warn .stage-state { color:var(--warn) }
+    .stage.bad .stage-state { color:var(--bad) }
+    .stage-detail { font-size:12px; margin:6px 0 0 }
+    
+    .banner { background:var(--card); border:1px solid var(--border); border-left:3px solid var(--muted); border-radius:8px; padding:15px; margin-bottom:16px }
+    .banner.ok { border-left-color:var(--ok) }
+    .banner.warn { border-left-color:var(--warn) }
+    .banner.bad { border-left-color:var(--bad) }
+    
+    .violations { margin:10px 0 0; padding-left:18px }
+    .violations li { margin:5px 0; color:var(--text) }
+    .violations.warn li { color:var(--muted) }
+    .violation-rule { font-family:var(--vscode-editor-font-family,monospace); font-size:11px; background:color-mix(in srgb,var(--accent) 12%,var(--card)); padding:1px 5px; border-radius:3px; margin-right:6px }
+    
+    .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:12px }
+    .card.ok { border-left:3px solid var(--ok) }
+    .card.warn { border-left:3px solid var(--warn) }
+    .card.bad { border-left:3px solid var(--bad) }
+    .card-head { display:flex; justify-content:space-between; gap:14px; align-items:flex-start }
+    .card-head small { color:var(--muted); display:block; margin-top:3px }
+    
+    .chip { display:inline-block; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--accent); background:color-mix(in srgb,var(--accent) 12%,var(--card)); padding:2px 7px; border-radius:99px; margin-bottom:5px }
+    .tool-chip { display:inline-block; border:1px solid var(--border); border-radius:99px; padding:2px 9px; margin:0 5px 4px 0; font-weight:600 }
+    
+    .confidence { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; white-space:nowrap }
+    .confidence.high { color:var(--ok) }
+    .confidence.medium { color:var(--warn) }
+    .confidence.low { color:var(--muted) }
+    
+    dl { margin:13px 0 }
+    dl>div { display:grid; grid-template-columns:170px 1fr; padding:6px 0; border-top:1px solid var(--border) }
+    dt { color:var(--muted) }
+    dd { margin:0 }
+    .path { overflow-wrap:anywhere; font-family:var(--vscode-editor-font-family,monospace); font-size:12px }
+    
+    .reasons, .sources { margin-top:12px }
+    .reasons-title { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-weight:700 }
+    .reasons ul, .sources ul, .evidence { margin:6px 0 0; padding-left:18px }
+    .reasons li, .sources li, .evidence li { margin:4px 0 }
+    .points { color:var(--muted); font-family:var(--vscode-editor-font-family,monospace) }
+    
+    .summary-row { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px }
+    .summary-tile { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:12px 16px; min-width:110px }
+    .summary-tile strong { display:block; font-size:22px }
+    .summary-tile span { color:var(--muted); font-size:12px }
+    .summary-tile.bad strong { color:var(--bad) }
+    .summary-tile.warn strong { color:var(--warn) }
+    
+    .score { font-size:26px; font-weight:800; white-space:nowrap }
+    .priority-code { display:inline-block; font-size:12px; font-weight:800; letter-spacing:.04em; border:1px solid currentColor; border-radius:4px; padding:1px 6px; vertical-align:middle; margin-right:5px }
+    .score small { font-size:12px; font-weight:400; color:var(--muted) }
+    .score.critical { color:var(--bad) }
+    .score.high { color:var(--warn) }
+    
+    .reach { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); white-space:nowrap }
+    .reach.dynamically_confirmed { color:var(--bad)}
+    .reach.statically_reachable { color:var(--warn) }
+    .reach.not_reachable { color:var(--ok) }
+    
+    code { font-family:var(--vscode-editor-font-family,monospace); font-size:12px; background:color-mix(in srgb,var(--text) 7%,var(--card)); padding:1px 5px; border-radius:3px }
+    
+    button { border:0; border-radius:4px; padding:8px 12px; background:var(--accent); color:#fff; font:inherit; cursor:pointer }
+    button.secondary { background:var(--vscode-button-secondaryBackground,#e8eaf0); color:var(--vscode-button-secondaryForeground,var(--text)) }
+    button.link { background:none; color:var(--accent); padding:0; text-align:left }
+    button:disabled { opacity:.55; cursor:not-allowed }
+    button:focus-visible { outline:2px solid var(--vscode-focusBorder,var(--accent)); outline-offset:2px }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:13px }
+    .footnote { font-size:12px; margin-top:14px }
+    .muted, .muted-state { color:var(--muted) }
+    .inline-note { color:var(--muted); font-size:12px; align-self:center }
+    .compact dl { margin:8px 0 }
+    h4.section-title { margin:18px 0 8px }
+    .option { display:flex; gap:10px; align-items:flex-start; padding:8px 0; border-top:1px solid var(--border); cursor:pointer }
+    .option:first-of-type { border-top:0 }
+    .option input[type=checkbox] { margin:2px 0 0; width:15px; height:15px; accent-color:var(--accent); flex:none }
+    .option small { display:block; color:var(--muted); margin-top:2px }
+    .option.number { justify-content:space-between; align-items:center; cursor:default }
+    .option.number input { width:88px; padding:5px 7px; border:1px solid var(--border); border-radius:4px; background:var(--bg); color:var(--text); font:inherit }
+    @media(max-width:760px){body{padding:16px}.hero{display:block}dl>div{grid-template-columns:1fr}}
+    ${companion ? companionWidgetCss() : ''}
+  </style></head><body class="theme-${theme === 'dark' ? 'dark' : 'light'}"><main class="wrap">
   <header class="hero"><div><h1>Security Pipeline</h1><p>De la détection à la décision : corrélation, atteignabilité, priorité, politique projet et preuves supply chain.</p></div><div class="actions"><button data-command="securityCenter.scanWorkspace">Relancer l’analyse</button><button class="secondary" data-command="securityCenter.openDashboard">← Dashboard</button></div></header>
   <nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${escapeHtml(id)}"${id === activeTab ? ' aria-current="true"' : ''}>${escapeHtml(label)}</button>`).join('')}</nav>
   <section>${body}</section>
   </main>${companion}
   <script nonce="${nonce}">const vscode=acquireVsCodeApi();
+  document.addEventListener('click', (e) => {
+    const companionClick = e.target.closest('.sc-widget-mascot') || e.target.closest('.sc-widget-bubble');
+    if (companionClick) {
+      vscode.postMessage({ type: 'companion' });
+    }
+  });
   document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'tab',tab:b.dataset.tab}));
   document.querySelectorAll('[data-command]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'command',command:b.dataset.command}));
+window.addEventListener('message', (event) => {
+  const msg = event.data;
+  if (msg?.command === 'setTheme' && ['light','dark'].includes(msg.theme)) {
+    document.body.classList.toggle('theme-dark', msg.theme === 'dark');
+    document.body.classList.toggle('theme-light', msg.theme === 'light');
+  }
+});
+});
   // The gate form is read at submit time, so the page keeps no state of its own:
   // the checkboxes are a view of security-center.yml, never a second copy of it.
   const policySelection=()=>{const s={};document.querySelectorAll('[data-policy-field]').forEach(i=>{s[i.dataset.policyField]=i.type==='checkbox'?i.checked:(i.value.trim()===''?null:Number(i.value));});return s;};

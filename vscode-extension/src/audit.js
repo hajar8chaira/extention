@@ -1,5 +1,7 @@
 'use strict';
 
+const { themeOverridesCss } = require('./theme-controller');
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -49,7 +51,7 @@ function getReadableAction(action) {
   return action;
 }
 
-function renderAuditLogHtml(events, nonce) {
+function renderAuditLogHtml(events, nonce, selectedTheme = 'light') {
   const eventsJson = JSON.stringify(events.map(e => ({
     ...e,
     readableAction: getReadableAction(e.action)
@@ -92,29 +94,12 @@ function renderAuditLogHtml(events, nonce) {
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <style nonce="${nonce}">
-    :root {
-      --page-background: var(--vscode-editor-background, #f3f4f6);
-      --card-background: var(--vscode-sideBar-background, var(--vscode-editor-background, #ffffff));
-      --vscode-foreground: var(--vscode-foreground, #424750);
-      --vscode-descriptionForeground: var(--vscode-descriptionForeground, #707782);
-      --vscode-panel-border: var(--vscode-panel-border, #d9dde5);
-      --vscode-button-background: var(--vscode-button-background, #4b78cf);
-      --vscode-button-foreground: var(--vscode-button-foreground, #ffffff);
-      --vscode-button-hoverBackground: var(--vscode-button-hoverBackground, #3f69ba);
-    }
-
-    body.theme-dark {
-      --page-background: var(--vscode-editor-background, #1e1e1e);
-      --card-background: var(--vscode-sideBar-background, #252526);
-      --vscode-foreground: var(--vscode-foreground, #cccccc);
-      --vscode-descriptionForeground: var(--vscode-descriptionForeground, #858585);
-      --vscode-panel-border: var(--vscode-panel-border, #454545);
-    }
+    ${themeOverridesCss()}
 
     body {
       font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);
-      color: var(--vscode-foreground);
-      background: var(--page-background);
+      color: var(--sc-text);
+      background: var(--sc-bg);
       margin: 0;
       padding: 24px;
       box-sizing: border-box;
@@ -125,7 +110,7 @@ function renderAuditLogHtml(events, nonce) {
       justify-content: space-between;
       align-items: center;
       margin-bottom: 24px;
-      border-bottom: 1px solid var(--vscode-panel-border);
+      border-bottom: 1px solid var(--sc-border);
       padding-bottom: 16px;
     }
 
@@ -138,13 +123,13 @@ function renderAuditLogHtml(events, nonce) {
     .page-header p {
       margin: 0;
       font-size: 13px;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-text-secondary);
     }
 
     .btn-secondary {
-      background: var(--vscode-button-secondaryBackground, var(--vscode-panel-border));
-      color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
-      border: 1px solid var(--vscode-panel-border);
+      background: var(--sc-button-secondary-bg);
+      color: var(--sc-button-secondary-fg);
+      border: 1px solid var(--sc-border);
       padding: 6px 12px;
       font-size: 13px;
       border-radius: 4px;
@@ -154,7 +139,7 @@ function renderAuditLogHtml(events, nonce) {
     }
 
     .btn-secondary:hover {
-      background: var(--vscode-button-secondaryHoverBackground, var(--vscode-panel-border));
+      opacity: 0.9;
     }
 
     /* KPI Summary Cards */
@@ -166,8 +151,8 @@ function renderAuditLogHtml(events, nonce) {
     }
 
     .summary-card {
-      background: var(--card-background);
-      border: 1px solid var(--vscode-panel-border);
+      background: var(--sc-surface);
+      border: 1px solid var(--sc-border);
       border-radius: 8px;
       padding: 16px;
       text-align: left;
@@ -183,13 +168,13 @@ function renderAuditLogHtml(events, nonce) {
       display: block;
       font-size: 28px;
       font-weight: 700;
-      color: var(--vscode-foreground);
+      color: var(--sc-text);
       margin-bottom: 4px;
     }
 
     .summary-card small {
       font-size: 11px;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-text-secondary);
       font-weight: 500;
       text-transform: uppercase;
       letter-spacing: 0.5px;
@@ -197,8 +182,8 @@ function renderAuditLogHtml(events, nonce) {
 
     /* Filters Bar */
     .filters-bar {
-      background: var(--card-background);
-      border: 1px solid var(--vscode-panel-border);
+      background: var(--sc-surface);
+      border: 1px solid var(--sc-border);
       border-radius: 8px;
       padding: 16px;
       margin-bottom: 20px;
@@ -224,15 +209,15 @@ function renderAuditLogHtml(events, nonce) {
     .filter-item label {
       font-size: 11px;
       font-weight: 600;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-text-secondary);
       text-transform: uppercase;
       letter-spacing: 0.5px;
     }
 
-    .filters-bar input[type="text"], .filters-bar select {
-      background: var(--vscode-input-background, var(--page-background));
-      color: var(--vscode-input-foreground, var(--vscode-foreground));
-      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    .filters-bar input[type="text"] {
+      background: var(--sc-input-bg);
+      color: var(--sc-input-text);
+      border: 1px solid var(--sc-input-border);
       padding: 6px 10px;
       font-size: 13px;
       border-radius: 4px;
@@ -240,14 +225,33 @@ function renderAuditLogHtml(events, nonce) {
       outline: none;
     }
 
+    .filters-bar select {
+      background: var(--sc-input-bg);
+      color: var(--sc-input-text);
+      border: 1px solid var(--sc-input-border);
+      padding: 6px 10px;
+      font-size: 13px;
+      border-radius: 4px;
+      font-family: inherit;
+      outline: none;
+    }
+
+    .filters-bar select option {
+      background-color: var(--sc-input-bg);
+      color: var(--sc-input-text);
+    }
+    .filters-bar input::placeholder {
+      color: var(--sc-input-placeholder);
+    }
+
     .filters-bar input[type="text"]:focus, .filters-bar select:focus {
-      border-color: var(--vscode-focusBorder, #4b78cf);
+      border-color: var(--sc-primary);
     }
 
     /* Audit Log Table */
     .table-container {
-      background: var(--card-background);
-      border: 1px solid var(--vscode-panel-border);
+      background: var(--sc-surface);
+      border: 1px solid var(--sc-border);
       border-radius: 8px;
       overflow: hidden;
       box-shadow: 0 2px 4px rgba(0,0,0,0.02);
@@ -260,21 +264,21 @@ function renderAuditLogHtml(events, nonce) {
     }
 
     th {
-      background: var(--card-background);
-      border-bottom: 2px solid var(--vscode-panel-border);
+      background: var(--sc-surface);
+      border-bottom: 2px solid var(--sc-border);
       padding: 12px 16px;
       font-size: 12px;
       font-weight: 600;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-text-secondary);
       text-transform: uppercase;
     }
 
     td {
       padding: 12px 16px;
-      border-bottom: 1px solid var(--vscode-panel-border);
+      border-bottom: 1px solid var(--sc-border);
       font-size: 13px;
       vertical-align: top;
-      color: var(--vscode-foreground);
+      color: var(--sc-text);
     }
 
     .audit-row {
@@ -283,7 +287,7 @@ function renderAuditLogHtml(events, nonce) {
     }
 
     .audit-row:hover {
-      background: rgba(120, 120, 120, 0.05);
+      background: var(--sc-surface-hover);
     }
 
     .action-badge {
@@ -295,30 +299,30 @@ function renderAuditLogHtml(events, nonce) {
       background: rgba(120, 120, 120, 0.1);
     }
 
-    .action-badge.triage { background: rgba(75, 120, 207, 0.12); color: var(--vscode-button-background); }
-    .action-badge.remediation { background: rgba(76, 168, 102, 0.12); color: var(--vscode-testing-iconPassed, #4ca866); }
-    .action-badge.scanner { background: rgba(227, 137, 54, 0.12); color: var(--vscode-charts-orange, #e38936); }
-    .action-badge.configuration { background: rgba(160, 160, 160, 0.12); color: var(--vscode-descriptionForeground); }
+    .action-badge.triage { background: var(--sc-info-bg); color: var(--sc-info); }
+    .action-badge.remediation { background: var(--sc-success-bg); color: var(--sc-success); }
+    .action-badge.scanner { background: var(--sc-warning-bg); color: var(--sc-warning); }
+    .action-badge.configuration { background: rgba(120, 120, 120, 0.12); color: var(--sc-text-secondary); }
 
     .details-row {
-      background: rgba(120, 120, 120, 0.02);
+      background: var(--sc-surface-hover);
     }
 
     .details-cell {
       padding: 16px 24px;
-      border-bottom: 1px solid var(--vscode-panel-border);
+      border-bottom: 1px solid var(--sc-border);
     }
 
     .metadata-box {
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 11px;
-      background: rgba(120, 120, 120, 0.04);
-      border: 1px solid var(--vscode-panel-border);
+      background: var(--sc-surface-secondary);
+      border: 1px solid var(--sc-border);
       border-radius: 6px;
       padding: 12px;
       margin-top: 8px;
       overflow-x: auto;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-text-secondary);
     }
 
     .metadata-box pre {
@@ -330,7 +334,7 @@ function renderAuditLogHtml(events, nonce) {
     .empty-state {
       padding: 32px;
       text-align: center;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-text-secondary);
       font-style: italic;
     }
 
@@ -345,7 +349,7 @@ function renderAuditLogHtml(events, nonce) {
     }
   </style>
 </head>
-<body class="theme-light">
+<body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
   <!-- Page Header -->
   <header class="page-header">
     <div>
@@ -443,7 +447,8 @@ function renderAuditLogHtml(events, nonce) {
     window.addEventListener('message', event => {
       const message = event.data;
       if (message.command === 'setTheme') {
-        document.body.className = 'theme-' + message.theme;
+        document.body.classList.remove('theme-light', 'theme-dark');
+        document.body.classList.add('theme-' + message.theme);
       }
     });
 

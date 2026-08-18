@@ -95,12 +95,16 @@ test('renderScanComparisonHtml handles empty scans list safely', () => {
 test('light theme contrast markup and VS Code variables', () => {
   const html = renderScanComparisonHtml([], 'nonce', 'light');
   // Check that theme overrides css is injected
-  assert.match(html, /body\.theme-light/);
-  assert.match(html, /--vscode-editor-background:\s*#f7f8fa/);
-  // Check html.theme-light defaults
-  assert.match(html, /html\.theme-light\s*\{/);
-  assert.match(html, /--page-background:\s*#f3f4f6/);
-  assert.match(html, /--card-background:\s*#ffffff/);
+  assert.match(html, /theme-light/);
+  assert.match(html, /--sc-bg:\s*#f3f4f6/);
+  assert.match(html, /--sc-surface:\s*#ffffff/);
+});
+
+test('dark theme contrast markup and VS Code variables', () => {
+  const html = renderScanComparisonHtml([], 'nonce', 'dark');
+  assert.match(html, /theme-dark/);
+  assert.match(html, /--sc-bg:\s*var\(--vscode-editor-background,\s*#1e1e1e\)/);
+  assert.match(html, /--sc-surface:\s*var\(--vscode-sideBar-background/);
 });
 
 test('A/B selection styling in CSS classes', () => {
@@ -111,6 +115,12 @@ test('A/B selection styling in CSS classes', () => {
   // Check selected cards accent colors
   assert.match(html, /\.selection-card\.selected-A[\s\S]*?border-left/);
   assert.match(html, /\.selection-card\.selected-B[\s\S]*?border-left/);
+});
+
+test('real VS Code body selectors are defined for inputs and selects', () => {
+  const html = renderScanComparisonHtml([], 'nonce', 'light');
+  assert.match(html, /\.filter-bar input/);
+  assert.match(html, /background:\s*var\(--sc-input-bg\)/);
 });
 
 test('compare button has correct initial disabled state and ID', () => {

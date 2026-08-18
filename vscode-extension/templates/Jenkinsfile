@@ -1,0 +1,129 @@
+// Security Center — exemple de pipeline Jenkins.
+//
+// Le point de ce fichier : la MÊME politique projet qui décide dans l'éditeur
+// décide aussi en CI. Security Center n'est pas rejoué avec des règles
+// différentes — `security-center.yml` du dépôt est la seule source.
+//
+// Codes de sortie du CLI, à ne pas réinterpréter :
+//   0  accepté — Policy Gate PASS ou WARN, ou aucune politique définie
+//   1  refusé  — Policy Gate BLOCK
+//   2  échec d'exécution ou politique illisible
+//
+// Aucun identifiant n'est écrit ici. Les jetons viennent des credentials Jenkins.
+
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    // Une analyse de sécurité qui ne finit pas ne doit pas bloquer l'agent.
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  environment {
+    // Ces variables sont lues par le CLI ; elles ne sont jamais journalisées.
+    // Déclarez-les comme credentials Jenkins de type « Secret text ».
+    SONAR_TOKEN = credentials('security-center-sonar-token')
+    SNYK_TOKEN  = credentials('security-center-snyk-token')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build & Test') {
+      steps {
+        sh 'npm ci'
+        sh 'npm test'
+      }
+    }
+
+    stage('Security Center') {
+      steps {
+        // `--ci-report` produit le rapport CI normalisé : schéma stable, sans
+        // finding brut et sans secret. C'est CE fichier que l'extension VS Code
+        // relit pour afficher le verdict réel de ce build.
+        // `--output` garde le rapport complet pour le reste de la chaîne.
+        //
+        // `returnStatus` est indispensable : on veut LIRE le code de sortie, pas
+        // laisser Jenkins interrompre le pipeline avant l'archivage.
+        script {
+          env.SC_EXIT = sh(
+            returnStatus: true,
+            script: '''
+              npx --yes security-center scan \
+                --workspace "$WORKSPACE" \
+                --format json \
+                --output security-center-full-report.json \
+                --ci-report security-center-report.json \
+                --sbom \
+                --provenance
+            '''
+          ).toString()
+        }
+      }
+      post {
+        // Archivé dans TOUS les cas, avant que l'étape suivante n'interrompe le
+        // pipeline. Un build bloqué doit exposer ses preuves : c'est précisément
+        // le build qu'un développeur a besoin d'inspecter depuis son éditeur.
+        always {
+          archiveArtifacts artifacts: 'security-center-report.json', allowEmptyArchive: true, fingerprint: true
+          archiveArtifacts artifacts: 'security-center-full-report.json', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Policy Gate') {
+      steps {
+        script {
+          if (env.SC_EXIT == '2') {
+            // Une politique illisible ou un scanner en échec n'est pas un PASS.
+            error("Security Center : échec d'exécution ou politique invalide (code 2).")
+          }
+          if (env.SC_EXIT == '1') {
+            // Refus de la politique projet. Le build est marqué en échec et le
+            // déploiement ne s'exécutera pas.
+            error('Security Center : Policy Gate BLOCK — livraison refusée.')
+          }
+          echo 'Security Center : Policy Gate accepté.'
+        }
+      }
+    }
+
+    stage('Supply chain evidence') {
+      steps {
+        // Le SBOM et la provenance ont été produits par l'étape précédente.
+        // La signature exige une clé : elle reste un credential Jenkins et
+        // n'est jamais écrite dans le dépôt.
+        archiveArtifacts artifacts: '**/*.cdx.json, **/*.intoto.jsonl', allowEmptyArchive: true
+      }
+    }
+
+    stage('Deploy') {
+      // Le déploiement ne peut pas s'exécuter sur un BLOCK : l'étape Policy Gate
+      // ci-dessus a déjà interrompu le pipeline. Cette condition est une seconde
+      // barrière explicite, pas une redondance décorative.
+      when {
+        allOf {
+          expression { env.SC_EXIT == '0' }
+          expression { currentBuild.currentResult == 'SUCCESS' }
+        }
+      }
+      steps {
+        echo 'Déploiement autorisé par la politique de sécurité.'
+        // Remplacez par votre étape de déploiement réelle.
+      }
+    }
+  }
+
+  post {
+    always {
+      // Le rapport reste consultable même quand le gate a refusé la livraison.
+      archiveArtifacts artifacts: 'security-center-report.json', allowEmptyArchive: true
+    }
+  }
+}

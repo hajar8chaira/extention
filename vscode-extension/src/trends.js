@@ -214,24 +214,18 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
   <style nonce="${nonce}">
     ${themeOverridesCss()}
     
-    :root {
+    body {
+      --page-background: var(--sc-bg);
+      --card-background: var(--sc-surface);
+      --vscode-foreground: var(--sc-text);
+      --vscode-descriptionForeground: var(--sc-text-secondary);
+      --vscode-panel-border: var(--sc-border);
+      
       --trend-total: var(--vscode-charts-blue, #4F7DF3);
       --trend-critical: var(--vscode-charts-red, #E5534B);
       --trend-high: var(--vscode-charts-orange, #F59E42);
       --trend-medium: var(--vscode-charts-purple, #8B5CF6);
       --trend-low: var(--vscode-charts-green, #45B36B);
-    }
-
-    html.theme-light {
-      --page-background: #f5f6f8;
-      --card-background: #ffffff;
-      --vscode-foreground: #2d3139;
-      --vscode-descriptionForeground: #69717e;
-      --vscode-panel-border: #e2e5ec;
-    }
-    html.theme-dark {
-      --page-background: var(--vscode-editor-background, #1e1e1e);
-      --card-background: var(--vscode-sideBar-background, #252526);
     }
 
     html, body, .trend-report-wrapper {

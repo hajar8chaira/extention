@@ -8,6 +8,10 @@ const { changedFilesAgainstBase, incrementalScanPlan } = require('./incremental'
 const { analyzeWorkspace, mergeIntelligence, runSupplyChainStages, buildPipelineResult, describeStages } = require('./pipeline');
 const { evaluatePolicyGate, formatGateResult, gateExitCode, policyGateError, STATUS } = require('./intelligence/policy-gate');
 const { signBlob, verifyBlob } = require('./supply-chain/cosign');
+const { buildCiReport, CI_REPORT_FILENAME } = require('./ci-report');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 
 function parseArgs(argv) {
   const result = { workspace: process.cwd(), format: 'json', output: '', tools: [], zapAuthorized: false, actor: '', justification: '' };
@@ -39,7 +43,9 @@ function parseArgs(argv) {
 }
 
 function help() {
-  return `Security Center headless\n\nUsage:\n  security-center scan --workspace . --format sarif --output results.sarif\n\nOptions:\n  --tools Semgrep,Gitleaks,Trivy,OSV-Scanner,SonarQube,Snyk,ZAP\n  --incremental --base-ref <SHA ou ref>\n  --semgrep-config p/security-audit\n  --fail-on HIGH\n  --zap-authorized --actor <nom> --justification <raison>\n  --target-url http://127.0.0.1:3000\n  --sonar-host-url http://127.0.0.1:9000 --sonar-project-key <cle>\n    Le jeton provient uniquement de la variable d'environnement SONAR_TOKEN.\n  --snyk-mode auto|local|docker --snyk-code --snyk-iac\n    Le jeton provient uniquement de la variable d'environnement SNYK_TOKEN.\n\nPipeline (corrélation, reachability, priorité, policy gate) : actif par défaut.\n  --no-intelligence            n'exécute que les scanners\n  --sbom                       génère le SBOM CycloneDX comme artefact\n  --provenance                 génère la provenance in-toto/SLSA de l'artefact\n  --sign-key <cosign.key> [--sign-artifact <fichier>]\n    Le mot de passe provient uniquement de la variable d'environnement COSIGN_PASSWORD.\n  --verify-key <cosign.pub>    vérifie la signature produite\n  --artifact-dir <dossier>     destination des artefacts générés\n\nPolicy Gate — security-center.yml est la seule source de vérité :\n  gate:\n    fail_on_severity: [CRITICAL]   # cette sévérité ou plus grave bloque\n    warn_on_severity: [HIGH]       # signalé sans bloquer\n    block_secrets: true            # un secret exposé bloque\n    priority_threshold: 80         # priorité >= 80 bloque\n    require_sbom: false            # un SBOM doit avoir été généré\n  supply_chain:\n    require_provenance: false\n    require_signature: false\n\nCodes de sortie : 0 accepté (PASS, WARN ou politique absente),\n  1 refusé par la politique projet (BLOCK),\n  2 échec d'exécution ou politique illisible.\n`;
+  return `Security Center headless\n\nUsage:\n  security-center scan --workspace . --format sarif --output results.sarif\n\nOptions:\n  --tools Semgrep,Gitleaks,Trivy,OSV-Scanner,SonarQube,Snyk,ZAP\n  --incremental --base-ref <SHA ou ref>\n  --semgrep-config p/security-audit\n  --fail-on HIGH\n  --zap-authorized --actor <nom> --justification <raison>\n  --target-url http://127.0.0.1:3000\n  --sonar-host-url http://127.0.0.1:9000 --sonar-project-key <cle>\n    Le jeton provient uniquement de la variable d'environnement SONAR_TOKEN.\n  --snyk-mode auto|local|docker --snyk-code --snyk-iac\n    Le jeton provient uniquement de la variable d'environnement SNYK_TOKEN.\n\nPipeline (corrélation, reachability, priorité, policy gate) : actif par défaut.\n  --no-intelligence            n'exécute que les scanners\n  --sbom                       génère le SBOM CycloneDX comme artefact\n  --provenance                 génère la provenance in-toto/SLSA de l'artefact\n  --sign-key <cosign.key> [--sign-artifact <fichier>]\n    Le mot de passe provient uniquement de la variable d'environnement COSIGN_PASSWORD.\n  --verify-key <cosign.pub>    vérifie la signature produite\n  --artifact-dir <dossier>     destination des artefacts générés
+  --ci-report <fichier>        rapport CI normalisé (schéma stable, sans secret),
+    destiné à être archivé par Jenkins puis relu par l'extension VS Code\n\nPolicy Gate — security-center.yml est la seule source de vérité :\n  gate:\n    fail_on_severity: [CRITICAL]   # cette sévérité ou plus grave bloque\n    warn_on_severity: [HIGH]       # signalé sans bloquer\n    block_secrets: true            # un secret exposé bloque\n    priority_threshold: 80         # priorité >= 80 bloque\n    require_sbom: false            # un SBOM doit avoir été généré\n  supply_chain:\n    require_provenance: false\n    require_signature: false\n\nCodes de sortie : 0 accepté (PASS, WARN ou politique absente),\n  1 refusé par la politique projet (BLOCK),\n  2 échec d'exécution ou politique illisible.\n`;
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -166,6 +172,17 @@ async function main(argv = process.argv.slice(2)) {
     process.stderr.write(`${formatGateResult(gate)}\n\nExit code: ${report.failures.length ? 2 : gateExitCode(gate)}\n`);
   }
 
+  // The CI report contract: a small, sanitized projection Jenkins can archive and
+  // the extension can read back. The full JSON output is unchanged.
+  if (args.ciReport) {
+    const { commit, branch } = await gitIdentity(workspacePath);
+    const ciReport = buildCiReport(report, { commit, branch });
+    await fs.writeFile(path.resolve(args.ciReport), `${JSON.stringify(ciReport, null, 2)}
+`, 'utf8');
+    process.stderr.write(`[ci-report] ${path.resolve(args.ciReport)}
+`);
+  }
+
   const output = args.format === 'sarif' ? toSarif(report) : report;
   const serialized = `${JSON.stringify(output, null, 2)}\n`;
   if (args.output) await fs.writeFile(path.resolve(args.output), serialized, 'utf8');
@@ -180,6 +197,24 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (report.policyResult && !report.policyResult.passed) return 1;
   return 0;
+}
+
+/**
+ * The commit and branch the scan ran against.
+ *
+ * Read from git, never guessed. In a detached CI checkout the branch is often
+ * absent; it stays empty rather than being inferred from an environment variable
+ * that may describe something else.
+ */
+async function gitIdentity(workspacePath) {
+  const read = async (args) => {
+    try { return (await execFileAsync('git', ['-C', workspacePath, ...args], { windowsHide: true, timeout: 8000 })).stdout.trim(); }
+    catch { return ''; }
+  };
+  const commit = await read(['rev-parse', 'HEAD']);
+  let branch = await read(['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch === 'HEAD') branch = '';
+  return { commit, branch };
 }
 
 if (require.main === module) main().then((code) => { process.exitCode = code; }).catch((error) => { process.stderr.write(`Security Center: ${error.message}\n`); process.exitCode = 2; });

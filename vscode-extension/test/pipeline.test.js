@@ -287,3 +287,61 @@ test('le détail d’un finding corrélé montre outils, atteignabilité et prio
 test('un finding sans intelligence garde exactement son rendu d’origine', () => {
   assert.equal(renderIntelligenceSection({ tool: 'Semgrep', title: 'x' }), '');
 });
+
+test('Security Pipeline redesigned flow layout and badges', () => {
+  const html = renderPipelinePageHtml(pageModel({ tab: 'pipeline' }), 'nonce', 'light');
+
+  // Verify visual flow sections exist
+  assert.match(html, /1\. ANALYSE/);
+  assert.match(html, /2\. SECURITY INTELLIGENCE/);
+  assert.match(html, /3\. DÉCISION/);
+  assert.match(html, /4\. PREUVES SUPPLY CHAIN/);
+
+  // Verify responsive grids and flow connector are present
+  assert.match(html, /class="pipeline-flow"/);
+  assert.match(html, /class="pipeline-grid"/);
+  assert.match(html, /class="flow-connector"/);
+
+  // Verify status badges exist
+  assert.match(html, /class="status-badge status-success"/);
+
+  // Verify visual pipeline flow layout wrapper and nodes
+  assert.match(html, /class="visual-pipeline-flow"/);
+  assert.match(html, /class="flow-node node-project/);
+  assert.match(html, /class="flow-node node-detection/);
+  assert.match(html, /class="flow-node node-intel/);
+  assert.match(html, /class="flow-node node-policy/);
+  assert.match(html, /class="flow-node node-destination/);
+  assert.match(html, /class="flow-line/);
+  assert.match(html, /class="flow-pulse"/);
+});
+
+test('Security Pipeline light theme classes and variable scoping', () => {
+  const html = renderPipelinePageHtml(pageModel({ tab: 'pipeline' }), 'nonce', 'light');
+
+  // Assert that body has correct light class
+  assert.match(html, /body class="theme-light"/);
+
+  // Assert themeOverridesCss stylesheet is injected
+  assert.match(html, /body\.theme-light\s*\{/);
+
+  // Assert pipeline variables scope to body and map to --sc-* values
+  assert.match(html, /body\s*\{[\s\S]*?--bg:\s*var\(--sc-bg\)/);
+  assert.match(html, /body\s*\{[\s\S]*?--card:\s*var\(--sc-surface\)/);
+
+  // Verify no hardcoded dark backgrounds on normal elements in light mode
+  assert.ok(!html.includes('background: #1e1e1e'));
+});
+
+test('Security Pipeline dark theme classes and variable scoping', () => {
+  const html = renderPipelinePageHtml(pageModel({ tab: 'pipeline' }), 'nonce', 'dark');
+
+  // Assert that body has correct dark class
+  assert.match(html, /body class="theme-dark"/);
+
+  // Assert themeOverridesCss stylesheet is injected
+  assert.match(html, /body\.theme-dark\s*\{/);
+
+  // Assert pipeline variables scope to body
+  assert.match(html, /body\s*\{[\s\S]*?--bg:\s*var\(--sc-bg\)/);
+});

@@ -16,6 +16,10 @@
  */
 
 /** Visual states of the mascot, independent from the service state. */
+// The canonical remediation lifecycle. Imported rather than re-typed so the
+// companion cannot drift from the states it reports on.
+const { VERIFICATION_STATE } = require('../fix-verification');
+
 const MASCOT_STATES = Object.freeze(['idle', 'watching', 'thinking', 'warning', 'success', 'sleeping']);
 
 /** Companion states, aligned with the Live Security service plus `degraded`. */
@@ -266,16 +270,98 @@ function scanReportMessage(outcome, context = {}) {
     Number.isFinite(context.scanPriorityCount) ? `Dont ${context.scanPriorityCount} prioritaire(s).` : '');
 }
 
+/**
+ * The whole vocabulary of remediation, in one place.
+ *
+ * Keyed by the canonical `VERIFICATION_STATE` values so the companion cannot
+ * drift from the lifecycle it reports on, plus the five short aliases the
+ * surfaces used before that lifecycle existed. One table, so there is exactly
+ * one interpretation of what a verification state means to a developer.
+ *
+ * The mascot column carries the safety property: only `validated` may be
+ * `success`. `fixed` — a patch applied, nothing verified — is `watching`, and
+ * its sentence says so out loud.
+ */
+const FIX_PRESENTATION = Object.freeze({
+  [VERIFICATION_STATE.FIX_PROPOSED]: ['watching', 'Correction disponible',
+    'Une correction est proposée. Examinez-la avant de l’appliquer.'],
+  [VERIFICATION_STATE.FIX_APPLIED]: ['watching', 'Correction appliquée',
+    'Vérifions que la vulnérabilité a réellement disparu.'],
+  [VERIFICATION_STATE.VALIDATING]: ['thinking', 'Vérification de la correction…',
+    'Le contrôle de sécurité correspondant est en cours.'],
+  [VERIFICATION_STATE.VALIDATED]: ['success', 'Correction vérifiée ✓',
+    'Le re-scan ne retrouve plus ce problème.'],
+  [VERIFICATION_STATE.STILL_PRESENT]: ['warning', 'Le problème est toujours présent',
+    'La correction appliquée n’a pas fait disparaître le finding.'],
+  [VERIFICATION_STATE.VALIDATION_FAILED]: ['warning', 'Vérification impossible',
+    'Le scanner n’a pas fourni assez de preuves pour conclure.'],
+  [VERIFICATION_STATE.INCONCLUSIVE]: ['warning', 'Vérification non concluante',
+    'Le scanner n’a pas fourni assez de preuves pour conclure.'],
+  [VERIFICATION_STATE.REGRESSED]: ['warning', 'Ce problème est réapparu',
+    'Il avait été validé auparavant : la vulnérabilité est revenue.'],
+  // Aliases kept for the surfaces that already speak this shorter vocabulary.
+  available: ['watching', 'Correction disponible',
+    'Une correction déterministe est proposée pour ce problème.'],
+  applied: ['watching', 'Correction appliquée', 'Relancez une analyse pour la valider.'],
+  failed: ['warning', 'La vérification de la correction a échoué',
+    'Le problème est encore détecté après re-scan.']
+});
+
+
+/**
+ * The severity a remediation verdict carries on its own.
+ *
+ * A regression is the one verdict that is worse than the finding it came from:
+ * something that was proven fixed is back. It escalates even when the file being
+ * edited has no live finding to supply a severity.
+ */
+function fixSeverity(fixState) {
+  return String(fixState || '') === VERIFICATION_STATE.REGRESSED ? 'critical' : 'high';
+}
+
 /** Where a remediation stands. A report, never a trigger. */
 function fixMessage(fixState, remediationAvailable) {
-  if (fixState === 'validating') return message('fix', 'thinking', 'Vérification de la correction…', '');
-  if (fixState === 'validated') return message('fix', 'success', 'Correction vérifiée ✓', 'Le re-scan ne retrouve plus ce problème.');
-  if (fixState === 'failed') return message('fix', 'warning', 'La vérification de la correction a échoué', 'Le problème est encore détecté après re-scan.');
-  if (fixState === 'applied') return message('fix', 'watching', 'Correction appliquée', 'Relancez une analyse pour la valider.');
-  if (fixState === 'available' || remediationAvailable) {
-    return message('fix', 'watching', 'Correction disponible', 'Une correction déterministe est proposée pour ce problème.');
+  const presentation = FIX_PRESENTATION[String(fixState || '')];
+  if (presentation) {
+    const [mascot, headline, detail] = presentation;
+    return message('fix', mascot, headline, detail, { fixState: String(fixState) });
+  }
+  if (remediationAvailable) {
+    const [mascot, headline, detail] = FIX_PRESENTATION.available;
+    return message('fix', mascot, headline, detail, { fixState: 'available' });
   }
   return null;
+}
+
+/**
+ * Which remediation state the companion should report, out of a finding list.
+ *
+ * Bad news first, and deliberately so: a regression outranks a validation,
+ * because a companion that leads with « vérifiée ✓ » while another finding has
+ * come back is telling the truth about one finding and lying about the state of
+ * the workspace. Within equal news, the state that still needs the developer
+ * wins over the one that does not.
+ *
+ * This is the single place a finding list becomes a companion fix state. It
+ * reads the canonical triage status and derives nothing of its own.
+ */
+const FIX_STATE_PRIORITY = Object.freeze([
+  VERIFICATION_STATE.REGRESSED,
+  VERIFICATION_STATE.STILL_PRESENT,
+  VERIFICATION_STATE.VALIDATION_FAILED,
+  VERIFICATION_STATE.INCONCLUSIVE,
+  VERIFICATION_STATE.VALIDATING,
+  VERIFICATION_STATE.FIX_APPLIED,
+  VERIFICATION_STATE.FIX_PROPOSED,
+  VERIFICATION_STATE.VALIDATED
+]);
+
+function verificationFixState(findings = []) {
+  const present = new Set(
+    (Array.isArray(findings) ? findings : [])
+      .map((finding) => String(finding?.triageStatus || ''))
+  );
+  return FIX_STATE_PRIORITY.find((state) => present.has(state)) || '';
 }
 
 /** Supply-chain evidence actually produced by the stages that ran. */
@@ -446,7 +532,23 @@ function buildCompanionVisualModel({
   const companionState = normalizeCompanionState(serviceState, pipeline);
   const message = companionMessageFor(companionState, { findings, file, ...pipeline });
   const severity = highestSeverity(findings);
-  const mascotState = mascotVisualFor(companionState, { severity, policyStatus: pipeline.policyStatus });
+  const serviceMascot = mascotVisualFor(companionState, { severity, policyStatus: pipeline.policyStatus });
+  // A remediation verdict is about a specific finding, and it is what the
+  // developer just acted on — so when the ladder settles on a `fix` message, its
+  // posture wins over the ambient service state. Without this the mascot kept
+  // celebrating `clean` while the bubble said « le problème est toujours présent ».
+  //
+  // The escalation still comes from `mascotVisualFor`: a regression on a critical
+  // finding reads `critical`, not merely `warning`. Nothing new decides posture.
+  // `watching` is included deliberately. A fix that is applied but unverified
+  // must never inherit the ambient `clean` posture: a celebrating mascot above
+  // « vérifions que la vulnérabilité a disparu » is the false success this
+  // lifecycle exists to prevent. Attentive is the honest posture.
+  const mascotState = message?.kind === 'fix'
+    ? (message.mascot === 'warning'
+      ? mascotVisualFor('findings', { severity: severity || fixSeverity(pipeline.fixState) })
+      : message.mascot)
+    : serviceMascot;
   return {
     state: companionState,
     mascotState,
@@ -514,6 +616,7 @@ function shortMessageFor(message, findings = []) {
 }
 
 module.exports = {
+  verificationFixState, FIX_PRESENTATION,
   MASCOT_STATES, COMPANION_STATES, MASCOT_TO_MOOD, PRIORITIES, SECONDARY_PRIORITIES, TRANSIENT_KINDS,
   companionMessageFor, secondaryFor, companionActionFor, shortScannerIssue,
   scanProgressHeadline, scanOutcomeMessage, scanReportMessage, fixMessage, supplyChainMessage,

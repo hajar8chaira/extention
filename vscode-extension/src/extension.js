@@ -20,6 +20,12 @@ const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, n
 const { groupFindings, summarizeFindings } = require('./tree');
 const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpStatus, updateFindingStatus, listAuditEvents, createAuditEvent, listScans, getScan, requestText, scanExportUrl } = require('./backend');
 const { CACHE_KEY: LOCAL_SCAN_CACHE_KEY, createLocalScanCache, restoreLocalScanCache } = require('./local-scan-cache');
+const { fetchDeliveryStatus, normalizeJenkinsUrl, jobUrl: jenkinsJobUrl, deliveryStatusFrom, testJenkinsConnection, artifactUrl: jenkinsArtifactUrl } = require('./jenkins');
+const { renderDeliveryPageHtml } = require('./delivery-page');
+const { buildDynamicWorkspace, dynamicWorkspaceState, restoreDynamicWorkspaceState, endpointKeyOf } = require('./dynamic-workspace');
+const { normalizeAuthProfile, publicProfile, maskSecret, secretKeyFor, interpretValidation, authHeadersFor, AUTH_KIND, AUTH_STATUS } = require('./dynamic-auth');
+const { createRetestRecord, advanceRetest, retestVerdict, RETEST_STATE } = require('./dynamic-retest');
+const { COVERAGE_LABELS } = require('./dynamic-inventory');
 const {
   CAMPAIGN_STATUS: DYNAMIC_STATUS, createCampaign: createDynamicCampaign,
   applyProgress: applyDynamicProgress, completeCampaign: completeDynamicCampaign,
@@ -33,6 +39,11 @@ const { normalizeTargetUrl, checkTargetReachability } = require('./dynamic-targe
 const { renderFindingDetailsHtml } = require('./finding-details');
 const { correlateFindings } = require('./correlation');
 const { findingKey, applyFindingStatuses, isActiveFinding, validatedAfterScan, retainValidatedFindings } = require('./triage');
+const {
+  VERIFICATION_STATE, VERIFICATION_REASON, STATE_LABELS: VERIFICATION_LABELS, REASON_LABELS: VERIFICATION_REASONS,
+  FIX_SOURCE, VERIFIER, verifyFindingFix, markFixApplied, markValidating, applyVerification,
+  detectRegressions, verificationRecord, restoreVerification, restoreVerificationOnFindings, verificationIdentity
+} = require('./fix-verification');
 const { normalizeHar, replayScenario } = require('./http-scenarios');
 const { renderHttpReplayHtml, renderSafeHttpRequestHtml } = require('./http-details');
 const { compareScans, renderScanComparisonHtml } = require('./scan-comparison');
@@ -48,7 +59,12 @@ const { runWithConcurrency } = require('./scheduler');
 const { buildAutofixPlan } = require('./autofix');
 const { sendSlack, createJiraIssue } = require('./team-integrations');
 const { buildMinimalContext, redactSecrets } = require('./ai/context-builder');
+const { verificationFixState } = require('./live/companionMessages');
 const { createAiProvider, PROVIDERS } = require('./ai/provider-registry');
+const {
+  checkOllamaHealth, probeInference, classifyOllamaError, selectModelForRole,
+  pullCommandFor, STATUS_PRESENTATION, OLLAMA_STATUS
+} = require('./ai/ollama-health');
 const { configureModelRoles } = require('./ai/model-configuration');
 const { readModelRoleConfiguration } = require('./ai/model-roles');
 const { findInstalledModel } = require('./ai/model-discovery');
@@ -79,6 +95,11 @@ const execFileAsync = promisify(execFile);
 const SONAR_TOKEN_SECRET_KEY = 'securityCenter.sonar.token';
 const SNYK_TOKEN_SECRET_KEY = 'securityCenter.snyk.token';
 const COSIGN_PASSWORD_SECRET_KEY = 'securityCenter.cosign.keyPassword';
+// The Jenkins API token lives here and nowhere else: never in settings.json,
+// never in a URL, never in a log line, never in the delivery page HTML.
+const JENKINS_TOKEN_SECRET_KEY = 'securityCenter.jenkins.apiToken';
+/** Verification metadata, stored beside the triage statuses it explains. */
+const VERIFICATION_STATE_KEY = 'securityCenter.fixVerification';
 const PIPELINE_STATE_KEY = 'securityCenter.pipelineState';
 // Every scanner Security Center can run, in the order the UI presents them.
 const ALL_SCANNER_TOOLS = Object.freeze(['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP']);
@@ -153,6 +174,21 @@ class DashboardProvider {
   }
   registerMessages(webview) {
     webview.onDidReceiveMessage((message) => {
+      if (message?.type === 'companion') {
+        const visual = this.getCompanionModel?.() || null;
+        const action = visual?.action;
+        if (action?.command) {
+          if (action.command === 'securityCenter.openLiveFinding') {
+            const first = visual.findings?.[0];
+            if (first) {
+              this.onCommand('securityCenter.openLiveFinding', first.uri, first.documentVersion, first.ruleId);
+            }
+          } else {
+            this.onCommand(action.command);
+          }
+        }
+        return;
+      }
       if (message?.type === 'themeChanged' && ['light', 'dark'].includes(message.theme)) {
         if (this.themeController) this.themeController.setTheme(message.theme);
         else this.selectedTheme = message.theme;
@@ -161,6 +197,15 @@ class DashboardProvider {
       if (message?.type === 'requestZapScan') {
         this.zapConfirmationVisible = true;
         this.render();
+        return;
+      }
+      // A click on an inventory row. The webview sends an index into the
+      // inventory it was rendered from, never a URL — so a crafted message
+      // cannot make the extension request an arbitrary target.
+      if (message?.type === 'dynamicEndpoint') {
+        const inventory = this.model?.dynamicWorkspace?.inventory || [];
+        const endpoint = Number.isInteger(message.index) ? inventory[message.index] : null;
+        if (endpoint) this.onCommand('securityCenter.showDynamicEndpoint', endpoint);
         return;
       }
       if (message?.type === 'cancelZapScan') {
@@ -217,6 +262,7 @@ class DashboardProvider {
         'securityCenter.rollbackAiFix'
         ,'securityCenter.openScannerSetup'
         ,'securityCenter.openSecurityPipeline'
+        ,'securityCenter.openSecurityDelivery'
       ]);
       if (message?.type === 'command' && message.command === 'securityCenter.scanZap') {
         this.zapConfirmationVisible = true;
@@ -226,6 +272,16 @@ class DashboardProvider {
         };
         this.openPage('dynamic');
         this.render();
+        return;
+      }
+      if (message?.type === 'openScannerDetails') {
+        this.activeScanner = message.scanner;
+        this.openPage('scanner-details');
+        return;
+      }
+      if (message?.type === 'applyFindingFix' && Number.isInteger(message.index)) {
+        const finding = this.model.findings[message.index];
+        if (finding) this.onCommand('securityCenter.applyFindingFix', finding);
         return;
       }
       if (message?.type === 'command' && allowed.has(message.command)) this.onCommand(message.command);
@@ -300,7 +356,7 @@ class DashboardProvider {
     this.renderWebview(panel.webview);
   }
   openPage(page) {
-    const titles = { findings: 'Security Center — Findings', scans: 'Security Center — Scans', dynamic: 'Security Center — Dynamic Security', analytics: 'Security Center — Analytics', 'burp-settings': 'Security Center — Burp Settings' };
+    const titles = { findings: 'Security Center — Findings', scans: 'Security Center — Scans', dynamic: 'Security Center — Dynamic Security', analytics: 'Security Center — Analytics', 'burp-settings': 'Security Center — Burp Settings', 'scanner-details': 'Security Center — Scanner Details' };
     const existing = this.pagePanels.get(page);
     if (existing) return existing.reveal(vscode.ViewColumn.Active);
     const panel = vscode.window.createWebviewPanel(`securityCenter.${page}`, titles[page] || 'Security Center', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
@@ -310,6 +366,10 @@ class DashboardProvider {
       this.pagePanels.delete(page);
     });
     this.renderWebview(panel.webview, page);
+  }
+  openScannerDetails(scannerName) {
+    this.activeScanner = scannerName;
+    this.openPage('scanner-details');
   }
   requestZapAuthorization({ mode, target }) {
     if (this.resolveZapConfirmation) this.resolveZapConfirmation(false);
@@ -345,7 +405,8 @@ class DashboardProvider {
     const model = {
       ...this.model,
       companion: this.getCompanionModel?.() || null,
-      companionEnabled: vscode.workspace.getConfiguration('securityCenter').get('live.companion.enabled', true) !== false
+      companionEnabled: vscode.workspace.getConfiguration('securityCenter').get('live.companion.enabled', true) !== false,
+      activeScanner: this.activeScanner || null
     };
     webview.html = renderDashboardHtml(model, nonce, surface, this.selectedTheme, { zapConfirmationVisible: this.zapConfirmationVisible, zapConfirmation: this.zapConfirmation });
   }
@@ -511,11 +572,10 @@ async function activate(context) {
       } : null,
       // How the last scan ended, from the status the dashboard already holds.
       scanOutcome: currentScanRunning ? '' : (currentDashboardOptions.scanStatus || ''),
-      // Where a remediation stands, read from the triage status the scan wrote.
-      // `fixed` means applied and awaiting a re-scan; `validated` means the
-      // re-scan no longer finds it.
-      fixState: currentFindings.some((finding) => finding.triageStatus === 'validated') ? 'validated'
-        : currentFindings.some((finding) => finding.triageStatus === 'fixed') ? 'applied' : '',
+      // Where a remediation stands. Derived by the companion's own module from
+      // the canonical triage statuses, so the nine states of Unified Fix
+      // Verification are read in one place rather than re-collapsed to two here.
+      fixState: verificationFixState(currentFindings),
       // Supply-chain evidence, only for the stages that really ran.
       supplyChain: Object.keys(currentPipelineArtifacts || {}).length ? {
         sbom: currentPipelineArtifacts.sbom?.status || '',
@@ -617,6 +677,50 @@ async function activate(context) {
     const transactions = (scenarios || currentDashboardOptions.httpScenarios || [])
       .map((scenario, index) => dynamicTransaction(scenario, { campaignId: campaign.id, index }));
     setDynamicCampaign(completeDynamicCampaign(campaign, { status, findingIds, transactions }));
+    // The campaign closing is the moment the coverage inputs are final: the
+    // findings are in, so endpoint-level evidence can be attributed.
+    rebuildDynamicWorkspace();
+    await persistDynamicWorkspace();
+    await saveLocalScanCache();
+  }
+
+  /**
+   * The Dynamic Security workspace: inventory, coverage, auth metadata, retests.
+   *
+   * Rebuilt from the state that already exists — the canonical transactions, the
+   * ZAP findings, the campaign, the Burp session — and stored in
+   * `currentDashboardOptions`, which the local scan cache already persists. No
+   * second store, and the secret never travels with it.
+   *
+   * Called on the events that actually change the inputs, never on a timer.
+   */
+  function rebuildDynamicWorkspace() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const scenarios = currentDashboardOptions.httpScenarios || [];
+    const campaign = currentDynamicCampaign();
+    const transactions = scenarios.map((scenario, index) => dynamicTransaction(scenario, {
+      campaignId: campaign?.id || 'legacy-unattributed', index
+    }));
+    const workspace = buildDynamicWorkspace({
+      transactions,
+      findings: currentFindings.filter((finding) => finding.category === 'dynamic' || String(finding.tool).toUpperCase() === 'ZAP'),
+      campaign,
+      burpSession: currentDashboardOptions.burpSession || null,
+      replayRecords: currentDashboardOptions.dynamicReplays || [],
+      retests: currentDashboardOptions.dynamicRetests || [],
+      authProfile: currentDashboardOptions.dynamicAuthProfile || null,
+      authValidated: currentDashboardOptions.dynamicAuthProfile?.status === AUTH_STATUS.VALID,
+      targetUrl: cfg.get('zap.targetUrl', '')
+    });
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicWorkspace: workspace };
+    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+    return workspace;
+  }
+
+  /** Persists the workspace through the existing cache. Metadata only. */
+  async function persistDynamicWorkspace() {
+    if (!workspace) return;
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicWorkspaceState: dynamicWorkspaceState(workspace) };
     await saveLocalScanCache();
   }
 
@@ -825,7 +929,13 @@ async function activate(context) {
       options: { ...restoredScan.dashboardOptions, savedAt: restoredScan.savedAt }
     });
     const restoredProjection = projectSnapshot(currentSecuritySnapshot);
-    currentFindings = restoredProjection.findings;
+    // Verification metadata rides back onto the restored findings, so a
+    // validated fix still shows *why* it is validated after a restart — not just
+    // that it is. A finding without a stored record is returned untouched.
+    currentFindings = restoreVerificationOnFindings(
+      restoredProjection.findings,
+      context.workspaceState.get(VERIFICATION_STATE_KEY, {})
+    );
     currentScanStatuses = restoredProjection.scanners;
     // A persisted campaign is revalidated before being trusted. A cache written
     // before campaign identity existed — or one whose campaign no longer parses —
@@ -840,6 +950,11 @@ async function activate(context) {
       restoredFromCache: true,
       restoredAt: restoredScan.savedAt
     };
+    // The dynamic workspace is restored from its own persisted metadata rather
+    // than recomputed, so a reload cannot invent evidence the run never produced.
+    // `restored: true` travels with it: the page says restored, not live.
+    const restoredWorkspace = restoreDynamicWorkspaceState(restoredScan.dashboardOptions?.dynamicWorkspaceState);
+    if (restoredWorkspace) currentDashboardOptions = { ...currentDashboardOptions, dynamicWorkspace: restoredWorkspace };
     publishDiagnostics(diagnostics, currentFindings);
     provider.setFindings(currentFindings, currentScanStatuses);
     dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
@@ -862,6 +977,27 @@ async function activate(context) {
     diagnostics.clear(); provider.setFindings([]); dashboardProvider.setData([], [], { scanStatus: 'idle', backendStatus: 'unknown' });
     currentSecuritySnapshot = snapshotFromLegacy(); currentFindings = []; currentScanStatuses = []; currentDashboardOptions = {};
     await context.workspaceState.update(LOCAL_SCAN_CACHE_KEY, undefined);
+  }));
+
+  /**
+   * Verifies a fix the developer made themselves.
+   *
+   * Deliberately does not require the patch to have come from Security Center: in
+   * real use most fixes are hand-written, and a verification lifecycle that only
+   * accepted its own patches would be useless exactly where it matters.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.verifyFindingFix', async (item) => {
+    const requested = item?.finding || item;
+    const finding = requested && findingKey(requested)
+      ? currentFindings.find((candidate) => findingKey(candidate) === findingKey(requested)) || requested
+      : (await vscode.window.showQuickPick(
+        currentFindings.filter(isActiveFinding).map((candidate) => ({
+          label: candidate.title, description: `${candidate.tool} • ${candidate.rawSeverity || candidate.severity}`,
+          detail: candidate.file || candidate.endpoint, candidate
+        })), { title: 'Vérifier une correction', placeHolder: 'Le scanner concerné sera relancé sur ce périmètre' }
+      ))?.candidate;
+    if (!finding) return;
+    await runFixVerification(finding, { source: finding.fixSource || FIX_SOURCE.MANUAL });
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.setFindingStatus', async (item) => {
@@ -980,6 +1116,10 @@ async function activate(context) {
       findingDetailsPanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'openHttpRequest' && Number.isInteger(message.index)) return dashboardProvider.openFullHttpRequest(message.index);
         if (message?.type === 'backToHttpRequest' && Number.isInteger(message.index)) return dashboardProvider.openFullHttpRequest(message.index);
+        if (message?.type === 'verifyFix' && findingDetailsFinding) {
+          return void await vscode.commands.executeCommand('securityCenter.verifyFindingFix', findingDetailsFinding);
+        }
+        if (message?.type === 'rollbackAiFix') return void await vscode.commands.executeCommand('securityCenter.rollbackAiFix');
         if (message?.type !== 'generateAiFix' || !findingDetailsFinding) return;
         scanLog.appendLine(`[${new Date().toISOString()}] Bouton Ollama reçu — ${findingDetailsFinding.file || findingDetailsFinding.absolutePath || findingDetailsFinding.title}`);
         await findingDetailsPanel?.webview.postMessage({ type: 'aiFixStatus', status: 'received' });
@@ -1042,8 +1182,14 @@ async function activate(context) {
       edit.replace(document.uri, range, plan.replacement);
       if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code a refusé la modification.');
       await document.save();
-      vscode.window.showInformationMessage('Security Center : correction appliquée. Relance de Semgrep…');
-      await vscode.commands.executeCommand('securityCenter.scanWorkspace', ['Semgrep']);
+      // Applying the patch is the end of the fix, not the end of the story: the
+      // finding is recorded as FIX_APPLIED and only the rescan that follows can
+      // move it to VALIDATED.
+      const applied = markFixApplied(finding, { source: FIX_SOURCE.QUICK_FIX, by: 'Quick Fix' });
+      replaceFinding(applied);
+      await persistVerification(applied);
+      vscode.window.showInformationMessage('Security Center : correction appliquée — vérification en cours…');
+      await runFixVerification(applied, { source: FIX_SOURCE.QUICK_FIX });
     } catch (error) {
       vscode.window.showErrorMessage(`Security Center : correction impossible — ${error.message}`);
     }
@@ -1053,9 +1199,31 @@ async function activate(context) {
     const cfg = vscode.workspace.getConfiguration('securityCenter');
     const baseUrl = cfg.get('ai.ollama.baseUrl', 'http://127.0.0.1:11434');
     try {
-      const provider = createAiProvider(PROVIDERS.OLLAMA, { baseUrl });
-      const models = await provider.listModels();
-      if (!models.length) return vscode.window.showWarningMessage('Ollama fonctionne, mais aucun modèle n’est installé. Installez un modèle de code avec Ollama puis relancez cette commande.');
+      // Runtime truth first: a model named in settings is a preference, and
+      // `/api/tags` is the fact. The health check never runs inference.
+      const health = await checkOllamaHealth({ baseUrl, configuredModel: cfg.get('ai.ollama.model', '') });
+      if (!health.reachable) {
+        const action = await vscode.window.showErrorMessage(
+          `Security Center : ${health.error.message}`, 'Diagnostiquer Ollama'
+        );
+        if (action) await vscode.commands.executeCommand('securityCenter.checkOllama');
+        return;
+      }
+      if (!health.models.length) {
+        // The exact command is shown, never executed: pulling several gigabytes
+        // is the developer's decision.
+        const command = pullCommandFor('qwen2.5-coder:7b');
+        const action = await vscode.window.showWarningMessage(
+          `Security Center : ${health.error.message} ${STATUS_PRESENTATION.NO_MODELS.hint}`,
+          'Copier la commande', 'Diagnostiquer Ollama'
+        );
+        if (action === 'Copier la commande') {
+          await vscode.env.clipboard.writeText(command);
+          vscode.window.showInformationMessage(`Commande copiée : ${command}`);
+        } else if (action) await vscode.commands.executeCommand('securityCenter.checkOllama');
+        return;
+      }
+      const models = health.installedModels;
       const ordered = [...models].sort((a, b) => Number(b.includes(':14b')) - Number(a.includes(':14b')));
       const selected = await configureModelRoles({
         configuration: cfg,
@@ -1076,8 +1244,78 @@ async function activate(context) {
       }).catch(() => {});
       vscode.window.showInformationMessage(`Security Center : Ollama local prêt — Fast ${selected.models.fast}, Advanced ${selected.models.advanced}, fallback ${selected.fallbackToAdvanced ? 'activé' : 'désactivé'}.`);
     } catch (error) {
-      vscode.window.showErrorMessage(`Security Center : Ollama indisponible — ${error.message}`);
+      // A normalized code and a sentence that names the next step — never a raw
+      // transport message or an HTTP body.
+      vscode.window.showErrorMessage(`Security Center : ${classifyOllamaError(error).message}`);
     }
+  }));
+
+  /**
+   * Ollama diagnosis.
+   *
+   * Answers the question the previous message could not: the service is up, so
+   * *why* is there no model. Listing is free; inference is offered as an explicit
+   * follow-up and is the only thing that may report a latency.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.checkOllama', async () => {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const baseUrl = cfg.get('ai.ollama.baseUrl', 'http://127.0.0.1:11434');
+    const configuredModel = cfg.get('ai.ollama.model', '');
+    const health = await checkOllamaHealth({ baseUrl, configuredModel });
+    const presentation = STATUS_PRESENTATION[health.status] || STATUS_PRESENTATION.ERROR;
+    const lines = [
+      `Statut : ${presentation.label}`,
+      `Serveur : ${health.baseUrl}${health.version ? ` (Ollama ${health.version})` : ''}`,
+      `Connexion : ${health.reachable ? 'OK' : 'échec'}`,
+      `Modèles : ${health.models.length} installé(s)`,
+      `Modèle sélectionné : ${configuredModel || 'aucun'}${configuredModel ? (health.configuredModelAvailable ? ' — disponible' : ' — introuvable') : ''}`
+    ];
+    if (health.models.length) {
+      lines.push('', ...health.models.map((model) => {
+        const size = model.sizeBytes ? `${(model.sizeBytes / 1e9).toFixed(1)} Go` : 'taille inconnue';
+        return `  • ${model.name} — ${size}${model.parameterSize ? `, ${model.parameterSize}` : ''}`;
+      }));
+    }
+    if (presentation.hint) lines.push('', presentation.hint);
+    scanLog.appendLine(`[${new Date().toISOString()}] Ollama — ${lines.join(' | ')}`);
+    scanLog.show(true);
+
+    const actions = [];
+    if (health.reachable && health.models.length) actions.push('Tester le modèle');
+    if (health.models.length) actions.push('Choisir un modèle');
+    if (!health.models.length) actions.push('Copier la commande d’installation');
+    const action = await vscode.window.showInformationMessage(
+      `Ollama : ${presentation.label} — ${health.models.length} modèle(s), ${configuredModel || 'aucun modèle sélectionné'}.`,
+      ...actions
+    );
+    if (action === 'Choisir un modèle') return vscode.commands.executeCommand('securityCenter.configureOllama');
+    if (action === 'Copier la commande d’installation') {
+      const command = pullCommandFor('qwen2.5-coder:7b');
+      await vscode.env.clipboard.writeText(command);
+      return vscode.window.showInformationMessage(`Commande copiée : ${command}`);
+    }
+    if (action !== 'Tester le modèle') return;
+
+    // The only inference this command performs, and only because it was asked
+    // for. A single token: enough to prove the model loads and answers.
+    const model = configuredModel && health.configuredModelAvailable
+      ? configuredModel
+      : selectModelForRole('fast', health.installedModels, configuredModel).model;
+    const probe = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Security Center : test du modèle ${model}`, cancellable: true },
+      (progress, token) => {
+        const controller = new AbortController();
+        token.onCancellationRequested(() => controller.abort(new Error('cancelled')));
+        return probeInference({ baseUrl, model, signal: controller.signal, timeoutMs: 120000 });
+      }
+    );
+    if (probe.ok) {
+      const latency = `${(probe.latencyMs / 1000).toFixed(1)} s`;
+      scanLog.appendLine(`[${new Date().toISOString()}] Ollama — inférence OK sur ${model} en ${latency}.`);
+      return vscode.window.showInformationMessage(`Ollama : inférence OK sur ${model} — latence ${latency}.`);
+    }
+    scanLog.appendLine(`[${new Date().toISOString()}] Ollama — inférence ${probe.error.code} : ${probe.error.message}`);
+    return vscode.window.showErrorMessage(`Ollama : ${probe.error.message}`);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.generateAiFix', async (item) => {
@@ -1224,18 +1462,18 @@ async function activate(context) {
         }
         return;
       }
-      const aiFixedFinding = { ...finding, triageStatus: 'fixed', fixedAt: new Date().toISOString(), fixedBy: 'Ollama', aiModel: generated.model, aiSummary: generated.summary, aiVerifiedConfidence: verifiedConfidence };
-      const savedAiStatuses = context.workspaceState.get('securityCenter.findingStatuses', {});
-      savedAiStatuses[findingKey(finding)] = 'fixed';
-      await context.workspaceState.update('securityCenter.findingStatuses', savedAiStatuses);
-      currentFindings = currentFindings.map((candidate) => findingKey(candidate) === findingKey(finding) ? aiFixedFinding : candidate);
-      publishDiagnostics(diagnostics, currentFindings);
-      provider.setFindings(currentFindings, currentScanStatuses);
-      dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+      // An AI patch is a patch, not a verification. It records FIX_APPLIED with
+      // its provenance, and the verifier below decides whether it worked.
+      const aiFixedFinding = {
+        ...markFixApplied(finding, { source: FIX_SOURCE.AI, by: 'Ollama' }),
+        aiModel: generated.model, aiSummary: generated.summary, aiVerifiedConfidence: verifiedConfidence
+      };
+      await persistVerification(aiFixedFinding);
+      replaceFinding(aiFixedFinding);
       await saveLocalScanCache();
       lastAiRollback = { uri: document.uri, originalText, findingId: finding.id, findingKey: findingKey(finding) };
-      scanLog.appendLine(`Correction Ollama appliquée — modèle ${generated.model}; finding ${finding.id}; résumé ${generated.summary}`);
-      await vscode.commands.executeCommand('securityCenter.scanWorkspace', [finding.tool]);
+      scanLog.appendLine(`Correction Ollama appliquee - modele ${generated.model}; finding ${finding.id}`);
+      await runFixVerification(aiFixedFinding, { source: FIX_SOURCE.AI });
       const findingStillPresent = dashboardProvider.model.findings.some((candidate) => isActiveFinding(candidate) && findingKey(candidate) === findingKey(finding));
       const testResult = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Security Center : validation des tests du projet', cancellable: false }, () => runDeclaredTests(folder.uri.fsPath));
       await saveLocalRemediationMetric(context.workspaceState, buildRemediationMetric(routed, { id: metricId, testResult: testResult.status, rescanResult: findingStillPresent ? 'finding_present' : 'finding_absent' }));
@@ -1923,6 +2161,21 @@ async function activate(context) {
       pipelinePanel.onDidDispose(() => { pipelinePanel = undefined; });
       pipelinePanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'tab') { pipelineTab = message.tab; return renderPipelinePage(); }
+        if (message?.type === 'companion') {
+          const visual = liveCompanionProvider.visualModel();
+          const action = visual?.action;
+          if (action?.command) {
+            if (action.command === 'securityCenter.openLiveFinding') {
+              const first = visual.findings?.[0];
+              if (first) {
+                await vscode.commands.executeCommand('securityCenter.openLiveFinding', first.uri, first.documentVersion, first.ruleId);
+              }
+            } else {
+              await vscode.commands.executeCommand(action.command);
+            }
+          }
+          return;
+        }
         if (message?.type === 'command') {
           const allowed = new Set(['securityCenter.scanWorkspace', 'securityCenter.openDashboard', 'securityCenter.openProjectPolicy']);
           if (allowed.has(message.command)) await vscode.commands.executeCommand(message.command);
@@ -2174,6 +2427,299 @@ async function activate(context) {
   }
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openBurpSettingsPage', () => dashboardProvider.openPage('burp-settings')));
 
+  // ---------------------------------------------------------------- Jenkins
+  //
+  // Security Center reads the security state of the last build; it never
+  // deploys and never triggers one. The API token comes from SecretStorage on
+  // every call and is passed as an Authorization header inside `jenkins.js` —
+  // it is not stored in settings, not put in a URL and not rendered.
+  let deliveryPanel;
+  let deliveryStatus = deliveryStatusFrom({ configured: false });
+
+  async function currentWorkspaceCommit() {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return '';
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', folder.uri.fsPath, 'rev-parse', 'HEAD'], { windowsHide: true, timeout: 8000 });
+      return stdout.trim();
+    } catch { return ''; }
+  }
+
+  /** The branch the developer has checked out, for the workspace section. */
+  async function currentWorkspaceBranch() {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return '';
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', folder.uri.fsPath, 'rev-parse', '--abbrev-ref', 'HEAD'], { windowsHide: true, timeout: 8000 });
+      const branch = stdout.trim();
+      return branch === 'HEAD' ? '' : branch;
+    } catch { return ''; }
+  }
+
+  /** Writes a finding back into every surface that holds it. */
+  function replaceFinding(updated) {
+    const key = findingKey(updated);
+    currentFindings = currentFindings.map((candidate) => findingKey(candidate) === key ? updated : candidate);
+    publishDiagnostics(diagnostics, currentFindings);
+    provider.setFindings(currentFindings, currentScanStatuses);
+    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+  }
+
+  /** Persists verification metadata alongside the triage statuses already stored. */
+  async function persistVerification(finding) {
+    const record = verificationRecord(finding);
+    if (!record) return;
+    const stored = context.workspaceState.get(VERIFICATION_STATE_KEY, {});
+    stored[record.key] = record;
+    await context.workspaceState.update(VERIFICATION_STATE_KEY, stored);
+    const statuses = context.workspaceState.get('securityCenter.findingStatuses', {});
+    statuses[record.key] = finding.triageStatus;
+    await context.workspaceState.update('securityCenter.findingStatuses', statuses);
+  }
+
+  /**
+   * The one place a fix is verified, whatever produced it.
+   *
+   * The verifier is the scan machinery that already exists: re-running the tool
+   * that reported the finding and asking whether the same fingerprint comes back.
+   * Nothing here reimplements a scanner, and nothing here decides a DAST verdict —
+   * that stays with `retestVerdict()`.
+   */
+  async function runFixVerification(finding, { source = FIX_SOURCE.MANUAL, silent = false } = {}) {
+    replaceFinding(markValidating(finding));
+    const result = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Vérification — ${finding.title}`, cancellable: true },
+      async (_progress, token) => verifyFindingFix(finding, {
+        token,
+        runVerifier: async (strategy) => {
+          if (strategy.verifier === VERIFIER.DAST_RETEST) {
+            const record = await verifyDynamicFinding(finding, token);
+            return { verdict: record?.verdict, retestId: record?.findingId || finding.id };
+          }
+          // The smallest safe rescan: only the tool that owns this finding.
+          await vscode.commands.executeCommand('securityCenter.scanWorkspace', [finding.tool]);
+          return { findings: currentFindings, scannerStatuses: currentScanStatuses, scanId: currentScanId || null };
+        }
+      })
+    );
+    const verified = applyVerification({ ...finding, fixSource: finding.fixSource || source }, result);
+    replaceFinding(verified);
+    await persistVerification(verified);
+    await saveLocalScanCache();
+    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, finding_id: finding.id,
+      action: `fix.verification.${result.state}`, actor: 'System',
+      // Only the verdict and its reason: never patch content, never scanner output.
+      comment: `${VERIFICATION_LABELS[result.state] || result.state} — ${VERIFICATION_REASONS[result.reason] || result.reason}`,
+      metadata: { validator: result.validator, reason: result.reason, scanId: result.evidence?.scanId ?? null }
+    }).catch(() => {});
+    if (!silent) {
+      const message = `${VERIFICATION_LABELS[result.state] || result.state} — ${VERIFICATION_REASONS[result.reason] || result.reason}`;
+      if (result.state === VERIFICATION_STATE.VALIDATED) vscode.window.showInformationMessage(`Security Center : ${message}`);
+      else vscode.window.showWarningMessage(`Security Center : ${message}`);
+    }
+    return verified;
+  }
+
+  /** Runs the existing targeted Dynamic Security retest for a DAST finding. */
+  async function verifyDynamicFinding(finding, token) {
+    if (token?.isCancellationRequested) throw new Error('Vérification annulée.');
+    const scenario = (currentDashboardOptions.httpScenarios || [])
+      .find((candidate) => candidate.request?.url === finding.endpoint)
+      || { name: finding.title, request: { url: finding.endpoint, method: finding.method && finding.method !== 'HTTP' ? finding.method : 'GET', headers: {} }, response: {} };
+    const method = String(scenario.request.method).toUpperCase();
+    const replay = await replayScenario(scenario, { allowWrite: ['POST', 'PUT', 'PATCH'].includes(method), timeoutMs: 30000 });
+    return {
+      findingId: finding.id,
+      verdict: retestVerdict({
+        finding, original: scenario,
+        replay: { response: { statusCode: replay.statusCode, headers: replay.headers, body: replay.body } },
+        association: finding.association
+      })
+    };
+  }
+
+  let deliveryConnection = null;
+
+  /**
+   * The single place a Jenkins configuration is written.
+   *
+   * Both entry points — the InputBox command and the inline form in Security
+   * Delivery — end here, so URL normalisation, the workspace-settings write and
+   * the SecretStorage write exist once. A second path would be a second set of
+   * rules to keep in agreement.
+   *
+   * The token is treated as write-only: an empty value keeps whatever is already
+   * stored, and the value never travels back out of this function.
+   */
+  async function applyJenkinsConfiguration({ url = '', job = '', user = '', token = '' } = {}) {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const trimmedUrl = String(url).trim();
+    let normalizedUrl = '';
+    if (trimmedUrl) {
+      try {
+        normalizedUrl = normalizeJenkinsUrl(trimmedUrl);
+      } catch (error) {
+        return { ok: false, message: error.message };
+      }
+    }
+    const trimmedJob = String(job).trim();
+    const trimmedToken = String(token).trim();
+    await cfg.update('jenkins.url', normalizedUrl, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('jenkins.job', trimmedJob, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('jenkins.user', String(user).trim(), vscode.ConfigurationTarget.Workspace);
+    // Only SecretStorage ever receives the token, and only when a new one was
+    // actually typed — an empty field means « keep the one already stored ».
+    if (trimmedToken) await context.secrets.store(JENKINS_TOKEN_SECRET_KEY, trimmedToken);
+    await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, action: 'scanner.configuration.changed', actor: 'System',
+      // The token never enters an audit event, only the fact that one is stored.
+      comment: 'Intégration Jenkins configurée.',
+      metadata: { integration: 'jenkins', job: trimmedJob, tokenStored: Boolean(trimmedToken) }
+    }).catch(() => {});
+    return { ok: true, url: normalizedUrl, job: trimmedJob };
+  }
+
+  async function refreshDeliveryStatus() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const token = await context.secrets.get(JENKINS_TOKEN_SECRET_KEY) || '';
+    deliveryStatus = await fetchDeliveryStatus({
+      baseUrl: cfg.get('jenkins.url', ''),
+      job: cfg.get('jenkins.job', ''),
+      user: cfg.get('jenkins.user', ''),
+      token,
+      workspaceCommit: await currentWorkspaceCommit()
+    });
+    // Presentation-only context. The token itself never enters the model: only
+    // the fact that one is stored.
+    deliveryStatus = {
+      ...deliveryStatus,
+      // `user` prefills the form; `tokenConfigured` is the only thing the page
+      // learns about the token — the token itself never enters the model.
+      user: cfg.get('jenkins.user', ''),
+      tokenConfigured: Boolean(token),
+      workspaceBranch: await currentWorkspaceBranch(),
+      connection: deliveryConnection
+    };
+    renderDeliveryPage();
+    return deliveryStatus;
+  }
+
+  function renderDeliveryPage() {
+    if (!deliveryPanel) return;
+    deliveryPanel.webview.html = renderDeliveryPageHtml(
+      deliveryStatus, crypto.randomBytes(16).toString('base64'), themeController.getTheme()
+    );
+  }
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openSecurityDelivery', async () => {
+    if (!deliveryPanel) {
+      deliveryPanel = vscode.window.createWebviewPanel('securityCenter.delivery', 'Security Center — Security Delivery', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
+      deliveryPanel.onDidDispose(() => { deliveryPanel = undefined; });
+      deliveryPanel.webview.onDidReceiveMessage(async (message) => {
+        if (message?.type === 'command') {
+          // A webview message is untrusted input: only this page's own targets.
+          const ALLOWED = new Set(['securityCenter.openDashboard']);
+          if (ALLOWED.has(message.command)) await vscode.commands.executeCommand(message.command);
+          return;
+        }
+        if (message?.type !== 'action') return;
+        if (message.action === 'refresh') return void await refreshDeliveryStatus();
+        if (message.action === 'testConnection') {
+          const cfg = vscode.workspace.getConfiguration('securityCenter');
+          deliveryConnection = await testJenkinsConnection({
+            baseUrl: cfg.get('jenkins.url', ''), job: cfg.get('jenkins.job', ''), user: cfg.get('jenkins.user', ''),
+            token: await context.secrets.get(JENKINS_TOKEN_SECRET_KEY) || ''
+          });
+          vscode.window.showInformationMessage(`Security Center : ${deliveryConnection.message}`);
+          return void await refreshDeliveryStatus();
+        }
+        if (message.action === 'openReport') {
+          const cfg = vscode.workspace.getConfiguration('securityCenter');
+          const build = deliveryStatus.build?.number;
+          const artifact = deliveryStatus.ci?.artifactPath;
+          if (!build || !artifact) return;
+          try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsArtifactUrl(cfg.get('jenkins.url', ''), cfg.get('jenkins.job', ''), build, artifact))); }
+          catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
+          return;
+        }
+        // Tests the values currently in the form, before they are saved, so a
+        // wrong URL or job is caught without writing anything. The token field
+        // is empty when the user is not changing it — the stored one is used
+        // instead, which is why a saved token never has to reach the webview.
+        if (message.action === 'testConfig') {
+          const typed = message.config || {};
+          deliveryConnection = await testJenkinsConnection({
+            baseUrl: String(typed.url || ''), job: String(typed.job || ''), user: String(typed.user || ''),
+            token: String(typed.token || '') || await context.secrets.get(JENKINS_TOKEN_SECRET_KEY) || ''
+          });
+          vscode.window.showInformationMessage(`Security Center : ${deliveryConnection.message}`);
+          return void await refreshDeliveryStatus();
+        }
+        if (message.action === 'saveConfig') {
+          const typed = message.config || {};
+          const saved = await applyJenkinsConfiguration({
+            url: typed.url, job: typed.job, user: typed.user, token: typed.token
+          });
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          vscode.window.showInformationMessage('Security Center : Jenkins configuré.');
+          return void await refreshDeliveryStatus();
+        }
+        if (message.action === 'configure') return void await vscode.commands.executeCommand('securityCenter.configureJenkins');
+        if (message.action === 'openJenkinsfile') return void await vscode.commands.executeCommand('securityCenter.openJenkinsfileTemplate');
+        if (message.action === 'openBlocking') return void await vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'policy');
+        if (message.action === 'openJenkins') {
+          const cfg = vscode.workspace.getConfiguration('securityCenter');
+          try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsJobUrl(cfg.get('jenkins.url', ''), cfg.get('jenkins.job', '')))); }
+          catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
+        }
+      });
+    } else deliveryPanel.reveal(vscode.ViewColumn.Active);
+    renderDeliveryPage();
+    await refreshDeliveryStatus();
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureJenkins', async () => {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const url = await vscode.window.showInputBox({
+      title: 'Jenkins — URL de base', value: cfg.get('jenkins.url', ''), ignoreFocusOut: true,
+      prompt: 'Par exemple http://127.0.0.1:8080. N’y mettez pas d’identifiants.',
+      validateInput: (input) => { if (!String(input).trim()) return undefined; try { normalizeJenkinsUrl(input); return undefined; } catch (error) { return error.message; } }
+    });
+    if (url === undefined) return;
+    const job = await vscode.window.showInputBox({
+      title: 'Jenkins — job', value: cfg.get('jenkins.job', ''), ignoreFocusOut: true,
+      prompt: 'Nom du job, ou chemin pour un dossier / pipeline multibranche (equipe/projet/main).'
+    });
+    if (job === undefined) return;
+    const user = await vscode.window.showInputBox({
+      title: 'Jenkins — utilisateur', value: cfg.get('jenkins.user', ''), ignoreFocusOut: true,
+      prompt: 'Utilisateur associé au jeton d’API.'
+    });
+    if (user === undefined) return;
+    const token = await vscode.window.showInputBox({
+      title: 'Jenkins — jeton d’API', password: true, ignoreFocusOut: true,
+      prompt: 'Conservé dans le SecretStorage de VS Code. Laissez vide pour conserver le jeton existant.'
+    });
+    if (token === undefined) return;
+    const saved = await applyJenkinsConfiguration({ url, job, user, token });
+    if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+    vscode.window.showInformationMessage('Security Center : Jenkins configuré.');
+    await refreshDeliveryStatus();
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openJenkinsfileTemplate', async () => {
+    const template = vscode.Uri.file(path.join(context.extensionPath, 'templates', 'Jenkinsfile'));
+    try {
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(template));
+    } catch {
+      vscode.window.showWarningMessage('Security Center : modèle Jenkinsfile introuvable dans l’extension.');
+    }
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openScannerDetails', (scannerName) => {
+    dashboardProvider.openScannerDetails(scannerName);
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.checkDynamicTarget', async () => {
     const targetUrl = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
     refreshDynamicTargetModel('unknown');
@@ -2342,8 +2888,17 @@ async function activate(context) {
     try {
       const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
       const events = await listAuditEvents(baseUrl, 500);
-      const panel = vscode.window.createWebviewPanel('securityCenter.auditLog', 'Security Center — Journal d’audit', vscode.ViewColumn.Active, { enableScripts: false });
-      panel.webview.html = renderAuditLogHtml(events, crypto.randomBytes(16).toString('base64'));
+      const panel = vscode.window.createWebviewPanel('securityCenter.auditLog', 'Security Center — Journal d’audit', vscode.ViewColumn.Active, { enableScripts: true });
+      const theme = themeController.getTheme ? themeController.getTheme() : 'light';
+      panel.webview.html = renderAuditLogHtml(events, crypto.randomBytes(16).toString('base64'), theme);
+      
+      // Keep theme synchronized dynamically
+      const themeSubscription = themeController?.onDidChange((updatedTheme) => {
+        panel.webview.postMessage({ command: 'setTheme', theme: updatedTheme });
+      });
+      panel.onDidDispose(() => {
+        themeSubscription?.dispose();
+      });
     } catch (error) {
       vscode.window.showErrorMessage(`Security Center : journal d’audit indisponible — ${error.message}`);
     }
@@ -2732,7 +3287,10 @@ async function activate(context) {
     try {
       const burpStatus = await getBurpStatus(backendUrl);
       currentDashboardOptions = { ...currentDashboardOptions, backendStatus: 'online', burpConnected: Boolean(burpStatus.connected), burpStatus, burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }), burpEndpoint: `${backendUrl.replace(/\/$/, '')}/api/v1/integrations/burp` };
-      dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+      // Burp traffic is what makes endpoints OBSERVED, so a refreshed session is
+      // a real input change — rebuild rather than wait for the next scan.
+      rebuildDynamicWorkspace();
+      await persistDynamicWorkspace();
       vscode.window.showInformationMessage(burpStatus.connected ? 'Security Center : connecteur Burp connecté.' : 'Security Center : backend accessible, mais aucun heartbeat Burp récent.');
     } catch (error) {
       vscode.window.showErrorMessage(`Security Center : test Burp impossible — ${error.message}`);
@@ -2965,6 +3523,220 @@ async function activate(context) {
     }
   }));
 
+  /**
+   * Shows what is known about one inventory endpoint, and offers the actions
+   * that apply to it. The coverage state is restated with its reason, so a row
+   * reading OBSERVED explains that proxy traffic is not a test.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showDynamicEndpoint', async (endpoint) => {
+    if (!endpoint?.key) return;
+    const workspace = currentDashboardOptions.dynamicWorkspace;
+    const label = COVERAGE_LABELS[endpoint.coverage] || endpoint.coverage;
+    const findings = currentFindings.filter((finding) => finding.endpoint
+      && endpointKeyOf(finding.method, finding.endpoint) === endpoint.key);
+    const lines = [
+      `${endpoint.method} ${endpoint.template}`,
+      '',
+      `Couverture : ${label}`,
+      `Requêtes observées : ${endpoint.requestCount}`,
+      `Sources : ${(endpoint.sources || []).join(', ') || 'inconnue'}`,
+      `Authentifiée : ${endpoint.authenticated ? 'oui' : 'non observée'}`,
+      endpoint.normalization === 'HIGH' ? 'Route normalisée à partir des observations' : 'Route littérale',
+      '',
+      findings.length ? `${findings.length} vulnérabilité(s) associée(s).` : 'Aucune vulnérabilité associée.'
+    ];
+    const actions = ['Rejouer la requête'];
+    if (findings.length) actions.push('Re-tester une vulnérabilité');
+    const choice = await vscode.window.showInformationMessage(lines.join('\n'), { modal: true }, ...actions);
+    if (choice === 'Rejouer la requête') {
+      const scenario = (currentDashboardOptions.httpScenarios || []).find((candidate) => {
+        try { return endpointKeyOf(candidate.request.method, candidate.request.url) === endpoint.key; } catch { return false; }
+      });
+      await vscode.commands.executeCommand('securityCenter.replayHttpScenario', scenario);
+    } else if (choice === 'Re-tester une vulnérabilité') {
+      await vscode.commands.executeCommand('securityCenter.retestDynamicFinding', { findingId: findings[0].id });
+    }
+  }));
+
+  /**
+   * Configures an authentication profile for dynamic testing.
+   *
+   * The split is the whole point: the *shape* of the credential (kind, header
+   * name, label) is metadata and lives in the workspace state the dashboard
+   * already persists; the credential *value* goes to SecretStorage and is never
+   * read back into the model, the HTML, or the cache. The masked form is
+   * computed once, at entry, so the profile stays identifiable afterwards
+   * without the secret being recoverable.
+   *
+   * A new profile is created selected=false: nothing uses it until the user
+   * says so, because silently authenticating a scan changes what it touches.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureDynamicAuth', async () => {
+    const kind = await vscode.window.showQuickPick([
+      { label: 'Bearer', description: 'En-tête Authorization: Bearer <jeton>', kind: AUTH_KIND.BEARER },
+      { label: 'Cookie', description: 'En-tête Cookie: <session>', kind: AUTH_KIND.COOKIE },
+      { label: 'En-tête personnalisé', description: 'Par exemple X-API-Key', kind: AUTH_KIND.HEADER }
+    ], { title: 'Type d’authentification dynamique', placeHolder: 'Le secret ira dans SecretStorage, jamais dans les paramètres' });
+    if (!kind) return;
+    const headerName = kind.kind === AUTH_KIND.HEADER
+      ? await vscode.window.showInputBox({ title: 'Nom de l’en-tête', placeHolder: 'X-API-Key', ignoreFocusOut: true })
+      : undefined;
+    if (kind.kind === AUTH_KIND.HEADER && !headerName) return;
+    const secret = await vscode.window.showInputBox({
+      title: 'Valeur du secret',
+      prompt: 'Stockée dans VS Code SecretStorage. Elle ne sera plus jamais réaffichée.',
+      password: true, ignoreFocusOut: true
+    });
+    if (!secret) return;
+    const label = await vscode.window.showInputBox({ title: 'Nom du profil', value: `${kind.label} — cible locale`, ignoreFocusOut: true });
+    if (!label) return;
+    let profile;
+    try {
+      profile = normalizeAuthProfile({
+        id: `auth-${Date.now().toString(36)}`,
+        label, kind: kind.kind, headerName,
+        secretConfigured: true, maskedValue: maskSecret(secret),
+        status: AUTH_STATUS.CONFIGURED, selected: false
+      });
+    } catch (error) {
+      return vscode.window.showErrorMessage(`Security Center : profil refusé — ${error.message}`);
+    }
+    await context.secrets.store(secretKeyFor(profile.id), secret);
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicAuthProfile: publicProfile(profile) };
+    rebuildDynamicWorkspace();
+    await persistDynamicWorkspace();
+    const activate = await vscode.window.showInformationMessage(
+      `Profil « ${label} » enregistré (secret dans SecretStorage). Il n’est pas encore utilisé.`,
+      'Sélectionner pour les tests', 'Laisser inactif'
+    );
+    if (activate === 'Sélectionner pour les tests') {
+      currentDashboardOptions = {
+        ...currentDashboardOptions,
+        dynamicAuthProfile: { ...currentDashboardOptions.dynamicAuthProfile, selected: true }
+      };
+      rebuildDynamicWorkspace();
+      await persistDynamicWorkspace();
+    }
+  }));
+
+  /**
+   * Validates a profile against the configured target.
+   *
+   * Validation is what upgrades the profile from CONFIGURED to VALID, and only a
+   * validated profile may support an "authenticated scan" claim. The secret is
+   * read from SecretStorage into the request headers and dropped; nothing about
+   * the response body is stored, only the interpretation of its status.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.validateDynamicAuth', async () => {
+    const profile = currentDashboardOptions.dynamicAuthProfile;
+    if (!profile) return vscode.window.showInformationMessage('Security Center : aucun profil d’authentification configuré.');
+    const target = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
+    if (!target) return vscode.window.showWarningMessage('Security Center : configurez d’abord une cible dynamique (securityCenter.zap.targetUrl).');
+    const secret = await context.secrets.get(secretKeyFor(profile.id));
+    if (!secret) {
+      currentDashboardOptions = { ...currentDashboardOptions, dynamicAuthProfile: { ...profile, secretConfigured: false, status: AUTH_STATUS.NOT_CONFIGURED } };
+      rebuildDynamicWorkspace();
+      return vscode.window.showErrorMessage('Security Center : secret introuvable dans SecretStorage. Reconfigurez le profil.');
+    }
+    const probeUrl = await vscode.window.showInputBox({
+      title: 'Endpoint de validation', value: `${target.replace(/\/$/, '')}/`,
+      prompt: 'Un endpoint protégé donne le signal le plus fiable.', ignoreFocusOut: true
+    });
+    if (!probeUrl) return;
+    let interpreted;
+    try {
+      const response = await replayScenario(
+        { request: { url: probeUrl, method: 'GET', headers: authHeadersFor(profile, secret) }, response: {} },
+        { allowWrite: false, timeoutMs: 15000 }
+      );
+      // `interpretValidation` reads `status`, and it needs the previous status to
+      // tell an expired session apart from a credential that was never valid.
+      interpreted = interpretValidation({ status: response.statusCode, previousStatus: profile.status });
+    } catch (error) {
+      interpreted = interpretValidation({ error: error.message });
+    }
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      dynamicAuthProfile: { ...profile, status: interpreted.status, lastValidatedAt: new Date().toISOString(), lastValidationReason: interpreted.reason }
+    };
+    rebuildDynamicWorkspace();
+    await persistDynamicWorkspace();
+    const notify = interpreted.status === AUTH_STATUS.VALID ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
+    notify(`Security Center : ${interpreted.reason}`);
+  }));
+
+  /** Removes the profile and its secret together — no orphaned SecretStorage entry. */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.removeDynamicAuth', async () => {
+    const profile = currentDashboardOptions.dynamicAuthProfile;
+    if (!profile) return vscode.window.showInformationMessage('Security Center : aucun profil à supprimer.');
+    const confirmation = await vscode.window.showWarningMessage(
+      `Supprimer le profil « ${profile.label || profile.id} » et son secret ?`, { modal: true }, 'Supprimer'
+    );
+    if (confirmation !== 'Supprimer') return;
+    await context.secrets.delete(secretKeyFor(profile.id));
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicAuthProfile: null };
+    rebuildDynamicWorkspace();
+    await persistDynamicWorkspace();
+    vscode.window.showInformationMessage('Security Center : profil et secret supprimés.');
+  }));
+
+  /**
+   * Re-tests a single dynamic finding by replaying the request that found it.
+   *
+   * Deliberately narrow: one request, no ZAP run. And the verdict comes from
+   * `retestVerdict()`, which requires the vulnerability *evidence* to be gone —
+   * an HTTP 200 on its own proves nothing, so a 200 with the payload still
+   * reflected stays STILL_PRESENT, and a replay we cannot interpret is
+   * INCONCLUSIVE rather than optimistically green.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.retestDynamicFinding', async (requested) => {
+    const dynamicFindings = currentFindings.filter((finding) => String(finding.tool).toUpperCase() === 'ZAP' || finding.category === 'dynamic');
+    if (!dynamicFindings.length) return vscode.window.showInformationMessage('Security Center : aucune vulnérabilité dynamique à re-tester.');
+    const selected = requested && dynamicFindings.find((finding) => finding.id === requested.findingId || finding.id === requested)
+      || (await vscode.window.showQuickPick(dynamicFindings.map((finding) => ({
+        label: finding.title, description: `${finding.method || 'HTTP'} • ${finding.rawSeverity || finding.severity}`,
+        detail: finding.endpoint, finding
+      })), { title: 'Re-tester une vulnérabilité dynamique', placeHolder: 'Une seule requête sera rejouée — pas de scan ZAP complet' }))?.finding;
+    if (!selected) return;
+    const scenario = (currentDashboardOptions.httpScenarios || []).find((candidate) => candidate.request?.url === selected.endpoint)
+      || { name: selected.title, request: { url: selected.endpoint, method: selected.method && selected.method !== 'HTTP' ? selected.method : 'GET', headers: {} }, response: {} };
+    const method = String(scenario.request.method).toUpperCase();
+    const confirmation = await vscode.window.showWarningMessage(
+      `Re-tester « ${selected.title} » ?\n\n${method} ${selected.endpoint}\n\nUne seule requête sera envoyée. Aucun scan ZAP ne sera lancé.`,
+      { modal: true }, 'Re-tester'
+    );
+    if (confirmation !== 'Re-tester') return;
+    let record = createRetestRecord(selected, { originalResponse: scenario.response });
+    record = advanceRetest(record, RETEST_STATE.FIX_APPLIED);
+    record = advanceRetest(record, RETEST_STATE.RETESTING);
+    try {
+      const profile = currentDashboardOptions.dynamicAuthProfile;
+      const secret = profile?.selected && profile?.secretConfigured ? await context.secrets.get(secretKeyFor(profile.id)) : null;
+      const headers = secret ? { ...scenario.request.headers, ...authHeadersFor(profile, secret) } : scenario.request.headers;
+      const replay = await replayScenario(
+        { ...scenario, request: { ...scenario.request, headers } },
+        { allowWrite: ['POST', 'PUT', 'PATCH'].includes(method), timeoutMs: 30000 }
+      );
+      // Both sides are scenario-shaped wrappers: `retestVerdict` reads
+      // `.response` from each, so a flat replay object would read as no response
+      // at all and every verdict would come back INCONCLUSIVE.
+      const verdict = retestVerdict({
+        finding: selected, original: scenario,
+        replay: { response: { statusCode: replay.statusCode, headers: replay.headers, body: replay.body } },
+        association: selected.association
+      });
+      record = advanceRetest({ ...record, verdict }, verdict.state);
+    } catch (error) {
+      record = advanceRetest({ ...record, verdict: { state: RETEST_STATE.INCONCLUSIVE, reason: 'replay_failed', detail: error.message } }, RETEST_STATE.INCONCLUSIVE);
+    }
+    const retests = [record, ...(currentDashboardOptions.dynamicRetests || []).filter((existing) => existing.findingId !== record.findingId)];
+    const replays = [{ method, endpoint: selected.endpoint, at: new Date().toISOString() }, ...(currentDashboardOptions.dynamicReplays || [])];
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicRetests: retests, dynamicReplays: replays };
+    rebuildDynamicWorkspace();
+    await persistDynamicWorkspace();
+    dashboardProvider.openPage('dynamic');
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.scanWorkspace', async (requestedTools) => {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) return vscode.window.showWarningMessage('Ouvrez un dossier avant de lancer un scan.');
@@ -3182,10 +3954,24 @@ async function activate(context) {
           await context.secrets.store(zapPasswordSecretKey, password);
           zapAuthEnv = { ...process.env, [projectPolicy.zapAuth.usernameEnv]: username.trim(), [projectPolicy.zapAuth.passwordEnv]: password };
         }
+        // A Dynamic Security auth profile applies to ZAP only if the user selected
+        // it and it validated. Configured-but-unvalidated is not usable evidence,
+        // and an unselected profile must not silently change what the scan reaches.
+        let resolvedDynamicAuth = null;
+        const dynamicAuthProfile = currentDashboardOptions.dynamicAuthProfile;
+        if (zapRequested && dynamicAuthProfile?.selected && dynamicAuthProfile.status === AUTH_STATUS.VALID) {
+          const secret = await context.secrets.get(secretKeyFor(dynamicAuthProfile.id));
+          if (secret) {
+            const [header, value] = Object.entries(authHeadersFor(dynamicAuthProfile, secret))[0] || [];
+            if (header) resolvedDynamicAuth = { header, value };
+          } else {
+            scanLog.appendLine('ZAP — profil d’authentification sélectionné mais secret absent de SecretStorage : scan non authentifié.');
+          }
+        }
         if (zapRequested) scans.push({
           tool: 'ZAP',
           mode: zapMode,
-          authenticated: Boolean(projectPolicy?.zapAuth?.login || projectPolicy?.zapContext),
+          authenticated: Boolean(projectPolicy?.zapAuth?.login || projectPolicy?.zapContext || resolvedDynamicAuth),
           execute: () => runZap({
             targetUrl: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'),
             timeoutMs,
@@ -3200,6 +3986,7 @@ async function activate(context) {
             user: projectPolicy?.zapUser || '',
             auth: projectPolicy?.zapAuth,
             authEnv: zapAuthEnv,
+            resolvedAuth: resolvedDynamicAuth,
             // Real lifecycle from ZAP's own API responses. Every state and every
             // percentage that reaches the page comes through here.
             onLifecycle: (event) => publishDynamicLifecycle(event)
@@ -3387,8 +4174,29 @@ async function activate(context) {
         const savedStatuses = context.workspaceState.get('securityCenter.findingStatuses', {});
         const validatedFindings = validatedAfterScan(previousFindings, correlated.findings, scanStatuses);
         for (const finding of validatedFindings) savedStatuses[findingKey(finding)] = 'validated';
+        // A finding that was validated and is reported again by a scanner that
+        // actually completed has regressed. Its earlier validation is kept as
+        // history rather than overwritten — the fix did work once, and that is
+        // part of the story.
+        const regressedFindings = detectRegressions(previousFindings, correlated.findings, scanStatuses);
+        if (regressedFindings.length) {
+          const verificationState = context.workspaceState.get(VERIFICATION_STATE_KEY, {});
+          for (const finding of regressedFindings) {
+            savedStatuses[findingKey(finding)] = VERIFICATION_STATE.REGRESSED;
+            const previous = verificationState[findingKey(finding)];
+            verificationState[findingKey(finding)] = {
+              ...(previous || {}), key: findingKey(finding), status: VERIFICATION_STATE.REGRESSED,
+              previousValidatedAt: previous?.validatedAt || finding.previousValidation?.at || null
+            };
+          }
+          await context.workspaceState.update(VERIFICATION_STATE_KEY, verificationState);
+          scanLog.appendLine(`[${new Date().toISOString()}] ${regressedFindings.length} vulnérabilité(s) validée(s) réapparue(s) — statut RÉAPPARUE.`);
+        }
         if (validatedFindings.length) await context.workspaceState.update('securityCenter.findingStatuses', savedStatuses);
-        const triagedFindings = retainValidatedFindings(applyFindingStatuses(correlated.findings, savedStatuses), validatedFindings);
+        const triagedFindings = restoreVerificationOnFindings(
+          retainValidatedFindings(applyFindingStatuses(correlated.findings, savedStatuses), validatedFindings),
+          context.workspaceState.get(VERIFICATION_STATE_KEY, {})
+        );
         const policyResult = evaluatePolicy(triagedFindings, projectPolicy);
         currentSecuritySnapshot = completeExecution(currentSecuritySnapshot, activeExecution, triagedFindings, scanStatuses);
         const completedProjection = projectSnapshot(currentSecuritySnapshot);

@@ -29,11 +29,21 @@ function escapeHtml(value) {
 }
 
 /**
- * Mascot sizes per mode. Both are far below the 140px of the removed panel.
- * `full` stays in the 70–100px band, `compact` in the 42–56px band.
+ * Mascot sizes per mode, both far below the 140px of the removed panel.
+ *
+ * `compact` is the primary surface and sits at 44px wide: that is the WCAG 2.5.5
+ * target-size minimum, so the companion stays clickable without growing.
+ *
+ * `full` is 1.6x its area — enough that the two modes read as different at a
+ * glance, which is the whole point of having two. A previous value of 52x65 made
+ * `full` all but indistinguishable from `compact`, and a mode the user cannot
+ * see is not a mode. It stays under 100px so it never competes with the code.
+ *
+ * Every pair keeps the 4:5 ratio of the 120x150 viewBox, so the figure is never
+ * distorted at any breakpoint.
  */
 const WIDGET_SIZES = Object.freeze({
-  full: { width: 72, height: 90, narrow: { width: 56, height: 70 } },
+  full: { width: 72, height: 90, narrow: { width: 60, height: 75 } },
   compact: { width: 44, height: 56, narrow: { width: 38, height: 48 } }
 });
 
@@ -152,13 +162,13 @@ function companionWidgetCss() {
     /* Only the real controls take pointer events back. */
     .sc-widget-mascot,.sc-widget-bubble,.sc-widget-action{pointer-events:auto}
 
-    .sc-widget-bubble{position:relative;margin-bottom:8px;padding:8px 11px;border-radius:11px;
-      display:grid;gap:2px;text-align:left;font-size:.92em;line-height:1.35;
+    .sc-widget-bubble{position:relative;margin-bottom:8px;padding:8px 12px;border-radius:8px;
+      display:grid;gap:3px;text-align:left;font-size:12px;line-height:1.4;
       color:var(--sc-bubble-fg);background:var(--sc-bubble-bg);
       border:1px solid var(--sc-bubble-border);
-      box-shadow:0 2px 7px var(--sc-bubble-shadow);
+      box-shadow:0 4px 12px var(--sc-bubble-shadow);
       max-width:220px;overflow-wrap:anywhere;
-      animation:sc-widget-in .2s ease-out}
+      animation:sc-widget-in .22s cubic-bezier(0.16,1,0.3,1)}
     .sc-widget-headline{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
     .sc-widget-secondary{color:var(--sc-bubble-muted);font-size:.9em;
       display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}

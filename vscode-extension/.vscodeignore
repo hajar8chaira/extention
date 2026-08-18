@@ -7,3 +7,26 @@ coverage/**
 security-reports/**
 outputs/**
 work/**
+
+# Anciennes copies complètes des sources, conservées hors du paquet : elles
+# doublent le code livré et exposeraient des versions non maintenues.
+.codex-backups/**
+
+# Base d'indexation CodeGraph : artefact de développement, jamais du produit.
+.codegraph/**
+
+# Jamais empaqueté : secrets, clés de signature, paquets déjà construits.
+.env
+.env.*
+*.vsix
+*.key
+*.pem
+*.p12
+*.pfx
+cosign.key
+cosign.password
+
+# Fixtures et sorties temporaires de développement.
+**/*.tmp
+**/*.sc-tmp
+.codex/**

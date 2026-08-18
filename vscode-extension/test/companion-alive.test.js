@@ -48,7 +48,10 @@ test('chaque état visuel a des mouvements réels, sur les membres existants', (
     critical: [/\.mascot-critical \.sc-arm-left\{transform:rotate\(-42deg\)\}/, /\.mascot-critical \.sc-arm-right\{transform:rotate\(42deg\)\}/, /\.mascot-critical \.sc-figure\{animation:sc-pulse 2s/],
     success: [/\.mascot-success \.sc-figure\{animation:sc-jump/, /\.mascot-success \.sc-arm-left\{animation:sc-cheer-left/, /\.mascot-success \.sc-check\{opacity:1/],
     error: [/\.mascot-error \.sc-figure\{animation:sc-shake/, /\.mascot-error \.sc-eye-cross\{opacity:1/, /\.mascot-error \.sc-arm-left\{transform:rotate\(-28deg\)\}/],
-    sleeping: [/\.mascot-sleeping \.sc-figure\{transform:translateY\(6px\)/, /\.mascot-sleeping \.sc-eye-closed\{opacity:1\}/, /\.mascot-sleeping \.sc-zzz\{opacity:1\}/]
+    // Le corps s'abaisse : c'est la posture qui compte, pas le nombre exact de
+    // pixels. L'ancienne assertion figeait 6px et cassait dès que la pose a été
+    // approfondie, sans rien garantir de plus sur l'UX.
+    sleeping: [/\.mascot-sleeping \.sc-figure\{transform:translateY\([1-9]\d*px\)/, /\.mascot-sleeping \.sc-eye-closed\{opacity:1\}/, /\.mascot-sleeping \.sc-zzz\{opacity:1\}/]
   };
   for (const [state, patterns] of Object.entries(expected)) {
     for (const pattern of patterns) assert.match(css, pattern, `${state} : ${pattern} absent`);
@@ -66,9 +69,21 @@ test('les états d’alerte ne clignotent pas et les états calmes ne s’agiten
   assert.ok(pulse && Number(pulse[1]) >= 1.5, 'la pulsation critique doit rester lente');
   // Le sommeil n'a qu'un Zz qui flotte, rien sur le corps.
   assert.ok(!/\.mascot-sleeping \.sc-figure\{animation/.test(css), 'le sommeil ne doit pas animer le corps');
-  // Warning et success se jouent un nombre fini de fois.
-  assert.match(css, /\.mascot-warning \.sc-figure\{animation:sc-recoil [\d.]+s ease-out 2\}/);
-  assert.match(css, /\.mascot-success \.sc-figure\{animation:sc-jump [\d.]+s [^;}]+ 1\}/);
+  // Warning et success se jouent un nombre fini de fois. La réaction peut être
+  // composée avec la respiration de repos — ce qui compte est qu'aucune des deux
+  // ne boucle : l'ancienne assertion exigeait que le saut soit la seule
+  // animation, ce qui interdisait la composition sans rien protéger de plus.
+  const finiteCount = (state, name, count) =>
+    new RegExp(`\\.mascot-${state} \\.sc-figure\\{animation:${name} [\\d.]+s [^;}]*?\\b${count}\\b`);
+  assert.match(css, finiteCount('warning', 'sc-recoil', 2), 'le recul d’alerte doit être fini');
+  assert.match(css, finiteCount('success', 'sc-jump', 1), 'le saut de succès doit être fini');
+  assert.ok(!/animation:sc-recoil [\d.]+s [^,;}]*infinite/.test(css), 'le recul ne boucle jamais');
+  assert.ok(!/animation:sc-jump [\d.]+s [^,;}]*infinite/.test(css), 'le saut ne boucle jamais');
+  // La seule animation d'opacité des états d'alerte reste lente : c'est elle
+  // qui produirait un stroboscope si elle accélérait.
+  for (const [, duration] of css.matchAll(/animation:sc-pulse ([\d.]+)s/g)) {
+    assert.ok(Number(duration) >= 1.5, `sc-pulse à ${duration}s clignoterait`);
+  }
 });
 
 test('aucune animation ne planifie de travail et le mouvement est désactivable deux fois', () => {

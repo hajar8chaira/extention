@@ -163,10 +163,16 @@ function checkTargetAvailable(targetUrl, timeoutMs = 5000) {
   });
 }
 
-async function runZap({ targetUrl, timeoutMs = 600000, signal, excludedRoutes = [], mode = 'baseline', workspacePath = '', openapi = '', context = '', user = '', auth, authEnv = process.env, engine = 'auto', localPath = '', onLifecycle }) {
+async function runZap({ targetUrl, timeoutMs = 600000, signal, excludedRoutes = [], mode = 'baseline', workspacePath = '', openapi = '', context = '', user = '', auth, authEnv = process.env, resolvedAuth = null, engine = 'auto', localPath = '', onLifecycle }) {
   validateLocalTarget(targetUrl);
   await checkTargetAvailable(targetUrl);
-  const authResult = await authenticateForZap(targetUrl, auth, authEnv);
+  // A caller that already holds a credential — a Dynamic Security auth profile,
+  // whose secret lives in SecretStorage — passes it here as a resolved
+  // `{header, value}` pair, which is exactly what a login would have produced.
+  // The rest of the path is unchanged: `zapAuthEnv` still rejects CRLF, the file
+  // is still written 0600 into the temp directory, and the `finally` below still
+  // deletes it. No parallel authentication engine, no new secret lifetime.
+  const authResult = resolvedAuth || await authenticateForZap(targetUrl, auth, authEnv);
   const detectedLocalPath = detectLocalZap(localPath);
   if (engine !== 'docker') {
     if (!detectedLocalPath) throw new Error('ZAP local n’est pas détecté. Installez ZAP ou choisissez zap.mode: docker explicitement.');

@@ -1,3 +1,12 @@
+const {
+  STATE_LABELS: VERIFICATION_LABELS, REASON_LABELS: VERIFICATION_REASONS
+} = require('./fix-verification');
+
+/** How a fix reached the code, in words the page can show. */
+const FIX_SOURCE_LABELS = Object.freeze({
+  quick_fix: 'Quick Fix déterministe', ai: 'Patch Ollama', manual: 'Correction manuelle'
+});
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -237,6 +246,42 @@ function renderIntelligenceSection(finding) {
   </section>`;
 }
 
+/**
+ * The verification block.
+ *
+ * Says which of the two very different things is true — a fix was applied, or the
+ * issue was shown to be gone — and names the evidence behind the second. A
+ * finding that was merely patched shows « vérification en attente » and offers
+ * the action that would settle it.
+ */
+function renderVerification(finding) {
+  const status = String(finding?.triageStatus || 'new');
+  const verification = finding?.verification;
+  const relevant = verification || ['fixed', 'validating', 'validated', 'still_present', 'validation_failed', 'inconclusive', 'regressed'].includes(status);
+  if (!relevant) {
+    return `<div class="actions"><button data-verify="1">Vérifier la correction</button></div>
+      <p class="muted">Une correction n’est validée qu’après relance du scanner concerné : appliquer un patch ne suffit pas.</p>`;
+  }
+  const rows = [
+    ['Résultat', escapeHtml(VERIFICATION_LABELS[status] || status)],
+    verification?.reason ? ['Raison', escapeHtml(VERIFICATION_REASONS[verification.reason] || verification.reason)] : null,
+    verification?.validator ? ['Vérificateur', escapeHtml(verification.validator)] : null,
+    finding?.fixSource ? ['Origine du correctif', escapeHtml(FIX_SOURCE_LABELS[finding.fixSource] || finding.fixSource)] : null,
+    finding?.validatedAt ? ['Validée le', escapeHtml(finding.validatedAt)] : null,
+    verification?.evidence?.scanId != null ? ['Scan de vérification', escapeHtml(String(verification.evidence.scanId))] : null,
+    verification?.evidence?.retestId ? ['Re-test', escapeHtml(String(verification.evidence.retestId))] : null,
+    verification?.evidence?.detail ? ['Détail', escapeHtml(verification.evidence.detail)] : null
+  ].filter(Boolean);
+  const actions = [
+    status === 'validated' ? '' : `<button data-verify="1">${status === 'fixed' ? 'Vérifier la correction' : 'Relancer la vérification'}</button>`,
+    finding?.fixSource === 'ai' ? '<button data-rollback="1" class="context-action">Annuler le patch IA</button>' : ''
+  ].filter(Boolean).join('');
+  return `<h2>Vérification</h2><div class="grid block">
+      ${rows.map(([label, value]) => `<div class="label">${label}</div><div>${value}</div>`).join('')}
+    </div>${actions ? `<div class="actions">${actions}</div>` : ''}
+    ${status === 'fixed' ? '<p class="muted">Le correctif est appliqué, mais aucun scanner ne l’a encore confirmé.</p>' : ''}`;
+}
+
 function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
   const reference = finding.helpUri
     ? `<a href="${escapeHtml(finding.helpUri)}">${escapeHtml(finding.helpUri)}</a>`
@@ -293,7 +338,7 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
   const correlation = finding.correlatedTools?.length
     ? `<h2>Corrélation multi-outils</h2><div class="block"><strong>${escapeHtml(finding.correlatedTools.join(' + '))}</strong><br><span class="muted">Confiance ${escapeHtml(finding.correlationConfidence || 'medium')} — cette correspondance aide à prioriser, mais ne remplace pas une validation manuelle.</span></div>`
     : '';
-  const triage = `<h2>Suivi</h2><div class="grid block"><div class="label">Statut</div><div><strong>${escapeHtml(finding.triageStatus || 'new')}</strong></div><div class="label">Contexte</div><div>${escapeHtml(finding.sourceContext || 'non classé')}</div></div>`;
+  const triage = `<h2>Suivi</h2><div class="grid block"><div class="label">Statut</div><div><strong>${escapeHtml(VERIFICATION_LABELS[finding.triageStatus] || finding.triageStatus || 'new')}</strong></div><div class="label">Contexte</div><div>${escapeHtml(finding.sourceContext || 'non classé')}</div></div>${renderVerification(finding)}`;
   const aiAction = finding.absolutePath || finding.file ? '<button id="ai-fix" class="ai-action">✨ Proposer une correction avec Ollama</button>' : '<p class="muted">Correction IA indisponible : aucun fichier source local associé à ce finding.</p>';
   const relatedTraffic = Array.isArray(navigation.relatedTraffic) ? navigation.relatedTraffic : [];
   const backAction = Number.isInteger(navigation.backTrafficIndex) ? `<button class="context-action" data-back-traffic="${navigation.backTrafficIndex}">← Retour à la requête HTTP</button>` : '';
@@ -362,6 +407,8 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
     const aiButton = document.getElementById('ai-fix');
     document.querySelector('[data-back-traffic]')?.addEventListener('click', (event) => vscode.postMessage({ type: 'backToHttpRequest', index: Number(event.currentTarget.dataset.backTraffic) }));
     document.querySelectorAll('[data-http-index]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'openHttpRequest', index: Number(button.dataset.httpIndex) })));
+    document.querySelector('[data-verify]')?.addEventListener('click', (event) => { event.currentTarget.disabled = true; vscode.postMessage({ type: 'verifyFix' }); });
+    document.querySelector('[data-rollback]')?.addEventListener('click', () => vscode.postMessage({ type: 'rollbackAiFix' }));
     aiButton?.addEventListener('click', () => {
       aiButton.disabled = true;
       aiButton.textContent = '⏳ Demande envoyée à Ollama…';

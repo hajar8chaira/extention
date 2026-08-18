@@ -137,12 +137,17 @@ test('le compagnon compact couvre les pages du dashboard, jamais la sidebar', ()
   }
   // La sidebar est une bande étroite : l'arbre des vulnérabilités a besoin de la place.
   const sidebar = renderDashboardHtml({ ...buildDashboardModel([], []), companion: visualFor({ state: 'issues', findings: [live()] }), companionEnabled: true }, 'n', 'sidebar', 'light');
-  assert.ok(!sidebar.includes('sc-widget'));
+  // Le balisage, pas la chaine : le gestionnaire de clic delegue du dashboard
+  // cite '.sc-widget-mascot' dans son selecteur, ce qui faisait echouer une
+  // recherche de sous-chaine sans qu'aucun compagnon ne soit rendu.
+  assert.ok(!/class="sc-widget/.test(sidebar), 'aucun compagnon rendu dans la sidebar');
+  assert.ok(!sidebar.includes('<svg class="mascot'), 'aucune mascotte dans la sidebar');
 });
 
 test('le dashboard ne rend rien quand le réglage est désactivé', () => {
   const html = renderDashboardHtml({ ...buildDashboardModel([], []), companion: visualFor({ state: 'issues', findings: [live()] }), companionEnabled: false }, 'n', 'full', 'light');
-  assert.ok(!html.includes('sc-widget'));
+  assert.ok(!/class="sc-widget/.test(html), 'aucun compagnon rendu quand le reglage est desactive');
+  assert.ok(!html.includes('<svg class="mascot'), 'aucune mascotte quand le reglage est desactive');
   assert.match(html, /operational-banner/, 'la bannière de statut reste intacte');
 });
 
@@ -246,9 +251,16 @@ test('ni la page Live ni le dashboard ne construisent un second modèle', () => 
   }
   const pipelinePage = fs.readFileSync(path.join(__dirname, '..', 'src', 'pipeline-page.js'), 'utf8');
   assert.ok(!pipelinePage.includes('buildCompanionVisualModel'), 'la page pipeline ne construit pas de modèle');
-  // Chaque surface lit le même moteur, câblé une fois par surface dans
-  // extension.js : Live Security, dashboard, Security Pipeline.
-  assert.equal((extensionSource.match(/liveCompanionProvider\.visualModel\(\)/g) || []).length, 3);
+  // Chaque surface lit le meme moteur. Compter les appels etait fragile : un
+  // gestionnaire de clic ajoute au Security Pipeline en a fait un quatrieme sans
+  // qu'aucun second modele n'existe. Ce qui compte est qu'il n'y ait qu'une
+  // source, et qu'extension.js ne construise jamais le sien.
+  const reads = (extensionSource.match(/liveCompanionProvider\.visualModel\(\)/g) || []).length;
+  assert.ok(reads >= 3, `chaque surface doit lire le moteur (${reads} lecture(s))`);
+  assert.ok(!extensionSource.includes('buildCompanionVisualModel('),
+    'extension.js ne construit jamais le modele lui-meme');
+  assert.equal((extensionSource.match(/new LiveCompanionProvider\(/g) || []).length, 1,
+    'un seul moteur compagnon est instancie');
 });
 
 // ------------------------- 16. pas de chemin absolu, pas de secret
