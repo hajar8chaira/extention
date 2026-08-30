@@ -10,10 +10,21 @@ test('n’exécute que le script test déclaré par package.json', async (t) => 
   t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
   fs.writeFileSync(path.join(folder, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
   assert.equal(declaredTestScript(folder).label, 'npm test');
-  const result = await runDeclaredTests(folder, 1000, (_file, args, options, callback) => {
-    assert.deepEqual(args, ['test']); assert.equal(options.cwd, folder); callback(null, 'ok', '');
+  const result = await runDeclaredTests(folder, 1000, (file, args, options, callback) => {
+    // Toujours `npm test`, dans le dossier du projet. Sous Windows le lanceur
+    // passe par l'interpreteur : `execFile('npm.cmd', …)` leve EINVAL depuis la
+    // mitigation CVE-2024-27980.
+    if (process.platform === 'win32') {
+      assert.match(file, /cmd\.exe$/i);
+      assert.deepEqual(args, ['/d', '/s', '/c', 'npm.cmd', 'test']);
+    } else {
+      assert.equal(file, 'npm');
+      assert.deepEqual(args, ['test']);
+    }
+    assert.equal(options.cwd, folder); callback(null, 'ok', '');
   });
   assert.equal(result.status, 'passed');
+  assert.equal(result.command, 'npm test');
 });
 
 test('ignore un projet sans véritable script de tests', () => {

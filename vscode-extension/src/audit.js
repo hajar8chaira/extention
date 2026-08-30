@@ -1,6 +1,6 @@
 'use strict';
 
-const { themeOverridesCss } = require('./theme-controller');
+const { renderSecurityCenterShell } = require('./security-center-shell');
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
@@ -22,7 +22,28 @@ const ACTION_LABELS = {
   'scanner.retry': 'Retry scanner lancé',
   'policy.changed': 'Politique modifiée',
   'scanner.configuration.changed': 'Configuration modifiée',
-  'ai.configuration.changed': 'Configuration IA modifiée'
+  'ai.configuration.changed': 'Configuration IA modifiée',
+  'integration.configuration.changed': 'Intégration configurée',
+  // Policy Gate.
+  'policy.gate.evaluated': 'Politique évaluée',
+  'policy.gate.blocked': 'Livraison bloquée par la politique',
+  // Supply chain.
+  'supplychain.sbom.generated': 'SBOM généré',
+  'supplychain.provenance.generated': 'Provenance générée',
+  'supplychain.key.generated': 'Paire de clés générée',
+  'supplychain.artifact.signed': 'Artefact signé',
+  'supplychain.signature.verified': 'Signature vérifiée',
+  // Unified Fix Verification. Chaque état dit ce qu'il prouve, sans jamais
+  // laisser un patch appliqué se lire comme une correction validée.
+  'fix.verification.validated': 'Correction validée par re-test',
+  'fix.verification.still_present': 'Vulnérabilité toujours présente',
+  'fix.verification.validation_failed': 'Vérification impossible',
+  'fix.verification.inconclusive': 'Vérification non concluante',
+  'fix.verification.regressed': 'Vulnérabilité réapparue',
+  'fix.verification.fixed': 'Correction appliquée, vérification en attente',
+  'fix.verification.fix_proposed': 'Correction proposée',
+  'fix.verification.validating': 'Vérification en cours',
+  'fix.verification.new': 'Alerte ouverte'
 };
 
 function getReadableAction(action) {
@@ -51,7 +72,12 @@ function getReadableAction(action) {
   return action;
 }
 
-function renderAuditLogHtml(events, nonce, selectedTheme = 'light') {
+/**
+ * @param backendError message d'erreur REEL du backend, ou chaine vide.
+ *   La page s'ouvre dans tous les cas : un backend injoignable doit se voir,
+ *   pas faire disparaitre le journal. Aucun evenement n'est invente.
+ */
+function renderAuditLogHtml(events, nonce, selectedTheme = 'light', backendError = '') {
   const eventsJson = JSON.stringify(events.map(e => ({
     ...e,
     readableAction: getReadableAction(e.action)
@@ -88,23 +114,102 @@ function renderAuditLogHtml(events, nonce, selectedTheme = 'light') {
     </tr>`;
   }).join('') : '';
 
-  return `<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';">
-  <style nonce="${nonce}">
-    ${themeOverridesCss()}
+  const content = `
+  ${backendError ? `<section class="backend-banner" role="alert"><strong>Journal d’audit indisponible</strong><p>${escapeHtml(backendError)}</p><p class="backend-hint">Les événements affichés ci-dessous sont vides tant que le backend ne répond pas. Aucune donnée n’est inventée.</p></section>` : ''}
+  <!-- Summary Cards -->
+  <section class="summary-cards">
+    <div class="summary-card">
+      <strong id="kpi-today">0</strong>
+      <small>Aujourd'hui</small>
+    </div>
+    <div class="summary-card">
+      <strong id="kpi-triage">0</strong>
+      <small>Changements de triage</small>
+    </div>
+    <div class="summary-card">
+      <strong id="kpi-fixes">0</strong>
+      <small>Corrections validées</small>
+    </div>
+    <div class="summary-card">
+      <strong id="kpi-failures">0</strong>
+      <small>Échecs scanner</small>
+    </div>
+    <div class="summary-card">
+      <strong id="kpi-rollbacks">0</strong>
+      <small>Rollbacks IA</small>
+    </div>
+  </section>
 
-    body {
-      font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);
-      color: var(--sc-text);
-      background: var(--sc-bg);
-      margin: 0;
-      padding: 24px;
-      box-sizing: border-box;
-    }
+  <!-- Filters Bar -->
+  <section class="filters-bar">
+    <div class="filter-item search">
+      <label for="filter-search">Recherche</label>
+      <input type="text" id="filter-search" placeholder="Scan, alerte, auteur ou justification...">
+    </div>
+    <div class="filter-item">
+      <label for="filter-date">Date</label>
+      <select id="filter-date">
+        <option value="all">Tous les événements</option>
+        <option value="7">7 derniers jours</option>
+        <option value="30">30 derniers jours</option>
+        <option value="90">90 derniers jours</option>
+      </select>
+    </div>
+    <div class="filter-item">
+      <label for="filter-action">Type d’action</label>
+      <select id="filter-action">
+        <option value="all">Toutes les actions</option>
+      </select>
+    </div>
+    <div class="filter-item">
+      <label for="filter-scanner">Scanner</label>
+      <select id="filter-scanner">
+        <option value="all">Tous les scanners</option>
+      </select>
+    </div>
+    <div class="filter-item">
+      <label for="filter-actor">Acteur</label>
+      <select id="filter-actor">
+        <option value="all">Tous les acteurs</option>
+      </select>
+    </div>
+  </section>
 
+  <!-- Table View -->
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Scan / Alerte</th>
+          <th>Action</th>
+          <th>Acteur</th>
+          <th>Justification / Commentaire</th>
+        </tr>
+      </thead>
+      <tbody id="audit-tbody">
+        ${rows || '<tr><td colspan="5" class="empty-state">Aucun événement d’audit.</td></tr>'}
+      </tbody>
+    </table>
+    <div id="audit-empty" class="empty-state" style="display: none;">
+      Aucun événement ne correspond aux filtres actifs.
+    </div>
+  </div>`;
+
+  return renderSecurityCenterShell({
+    surface: 'audit',
+    nonce,
+    theme: selectedTheme,
+    title: 'Journal d’audit',
+    subtitle: 'Historique des actions de sécurité et des changements de configuration sur le projet',
+    content,
+    styles: `
+
+
+    .backend-banner { margin: 0 0 18px; padding: 13px 15px; border: 1px solid var(--sc-warning, #d29922); border-left: 3px solid var(--sc-warning, #d29922); border-radius: 8px; background: var(--sc-warning-bg, rgba(210,153,34,.08)); }
+    .backend-banner strong { display: block; font-size: 13px; }
+    .backend-banner p { margin: 5px 0 0; font-size: 11px; color: var(--sc-text-secondary); }
+    .backend-banner .backend-hint { opacity: .85; }
     .page-header {
       display: flex;
       justify-content: space-between;
@@ -346,116 +451,9 @@ function renderAuditLogHtml(events, nonce, selectedTheme = 'light') {
       .filter-item {
         width: 100%;
       }
-    }
-  </style>
-</head>
-<body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
-  <!-- Page Header -->
-  <header class="page-header">
-    <div>
-      <h1>Journal d’audit</h1>
-      <p>Historique des actions de sécurité et des changements de configuration sur le projet.</p>
-    </div>
-    <button class="btn-secondary" id="btn-back-dashboard">← Dashboard</button>
-  </header>
-
-  <!-- Summary Cards -->
-  <section class="summary-cards">
-    <div class="summary-card">
-      <strong id="kpi-today">0</strong>
-      <small>Aujourd'hui</small>
-    </div>
-    <div class="summary-card">
-      <strong id="kpi-triage">0</strong>
-      <small>Changements de triage</small>
-    </div>
-    <div class="summary-card">
-      <strong id="kpi-fixes">0</strong>
-      <small>Corrections validées</small>
-    </div>
-    <div class="summary-card">
-      <strong id="kpi-failures">0</strong>
-      <small>Échecs scanner</small>
-    </div>
-    <div class="summary-card">
-      <strong id="kpi-rollbacks">0</strong>
-      <small>Rollbacks IA</small>
-    </div>
-  </section>
-
-  <!-- Filters Bar -->
-  <section class="filters-bar">
-    <div class="filter-item search">
-      <label for="filter-search">Recherche</label>
-      <input type="text" id="filter-search" placeholder="Scan, alerte, auteur ou justification...">
-    </div>
-    <div class="filter-item">
-      <label for="filter-date">Date</label>
-      <select id="filter-date">
-        <option value="all">Tous les événements</option>
-        <option value="7">7 derniers jours</option>
-        <option value="30">30 derniers jours</option>
-        <option value="90">90 derniers jours</option>
-      </select>
-    </div>
-    <div class="filter-item">
-      <label for="filter-action">Type d’action</label>
-      <select id="filter-action">
-        <option value="all">Toutes les actions</option>
-      </select>
-    </div>
-    <div class="filter-item">
-      <label for="filter-scanner">Scanner</label>
-      <select id="filter-scanner">
-        <option value="all">Tous les scanners</option>
-      </select>
-    </div>
-    <div class="filter-item">
-      <label for="filter-actor">Acteur</label>
-      <select id="filter-actor">
-        <option value="all">Tous les acteurs</option>
-      </select>
-    </div>
-  </section>
-
-  <!-- Table View -->
-  <div class="table-container">
-    <table>
-      <thead>
-        <tr>
-          <th>Date</th>
-          <th>Scan / Alerte</th>
-          <th>Action</th>
-          <th>Acteur</th>
-          <th>Justification / Commentaire</th>
-        </tr>
-      </thead>
-      <tbody id="audit-tbody">
-        ${rows || '<tr><td colspan="5" class="empty-state">Aucun événement d’audit.</td></tr>'}
-      </tbody>
-    </table>
-    <div id="audit-empty" class="empty-state" style="display: none;">
-      Aucun événement ne correspond aux filtres actifs.
-    </div>
-  </div>
-
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
+    }`,
+    script: `    const vscode = window.__scShellApi || acquireVsCodeApi();
     const events = ${eventsJson};
-
-    // Initialize theme
-    window.addEventListener('message', event => {
-      const message = event.data;
-      if (message.command === 'setTheme') {
-        document.body.classList.remove('theme-light', 'theme-dark');
-        document.body.classList.add('theme-' + message.theme);
-      }
-    });
-
-    // Back to Dashboard
-    document.getElementById('btn-back-dashboard').onclick = () => {
-      vscode.postMessage({ command: 'openDashboard' });
-    };
 
     // Calculate filter list dropdowns
     function populateDropdowns() {
@@ -710,11 +708,9 @@ function renderAuditLogHtml(events, nonce, selectedTheme = 'light') {
 
     // Boot
     populateDropdowns();
-    render();
-  </script>
-</body>
-</html>
-`;
+    render();`,
+    csp: `default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+  });
 }
 
-module.exports = { renderAuditLogHtml };
+module.exports = { ACTION_LABELS, getReadableAction, renderAuditLogHtml };

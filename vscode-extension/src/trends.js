@@ -1,12 +1,36 @@
 'use strict';
 
-const { themeOverridesCss } = require('./theme-controller');
+const { renderSecurityCenterShell } = require('./security-center-shell');
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
 
 const INACTIVE = new Set(['false_positive', 'fixed', 'validated', 'accepted']);
+
+/**
+ * The audit actions that prove a finding was actually resolved.
+ *
+ * Exact names, never a prefix match. `fix.verification.*` covers nine lifecycle
+ * states and only `validated` is a resolution: `fix.verification.fixed` means a
+ * patch was applied and verification is still pending, and counting it would
+ * measure « time to patch » while calling it MTTR.
+ *
+ * `finding.risk.accepted` is deliberately absent for the same reason: accepting
+ * a risk closes a discussion, not a vulnerability.
+ *
+ * The legacy `status:` names are kept so history recorded by earlier versions
+ * keeps contributing to the average instead of silently dropping out.
+ */
+const RESOLUTION_ACTIONS = new Set([
+  // Emitted today by the extension.
+  'finding.fixed',
+  'finding.fix.validated',
+  'fix.verification.validated',
+  // Emitted by earlier versions; still present in existing backends.
+  'status:fixed',
+  'status:validated'
+]);
 
 function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
   const cutoff = new Date(now.getTime() - days * 86400000);
@@ -104,15 +128,20 @@ function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
   for (const scan of ordered) {
     const seenAt = new Date(scan.result.finished_at);
     for (const finding of scan.result.findings) {
-      const identity = finding.fingerprint || finding.id;
-      if (!firstSeen.has(identity)) firstSeen.set(identity, seenAt);
+      // Indexed under both identities on purpose. A scanner that supplies a
+      // fingerprint (Gitleaks, SonarQube, Snyk) is stored under it, but an audit
+      // event carries `finding_id` — looking up only one of the two makes every
+      // fingerprinted finding unresolvable and silently removes it from the MTTR.
+      for (const identity of [finding.fingerprint, finding.id]) {
+        if (identity && !firstSeen.has(identity)) firstSeen.set(identity, seenAt);
+      }
     }
   }
 
   const resolvedIdentities = new Set();
   const resolutionHours = [];
   for (const event of [...auditEvents].sort((a, b) => new Date(a.created_at) - new Date(b.created_at))) {
-    if (!['status:fixed', 'status:validated'].includes(event.action) || resolvedIdentities.has(event.finding_id)) continue;
+    if (!RESOLUTION_ACTIONS.has(event.action) || resolvedIdentities.has(event.finding_id)) continue;
     const started = firstSeen.get(event.finding_id);
     if (!started) continue;
     resolutionHours.push(Math.max(0, (new Date(event.created_at) - started) / 3600000));
@@ -126,7 +155,13 @@ function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
   return { days, points, latest, change: previous ? latest.active - previous.active : null, mttrHours, resolvedCount: resolutionHours.length };
 }
 
-function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
+/**
+ * @param backendError message d'erreur REEL du backend, ou chaine vide.
+ *   Les tendances viennent de l'historique des scans du backend : quand il ne
+ *   repond pas, la page s'ouvre quand meme et le dit. Aucune serie n'est
+ *   fabriquee — les compteurs restent ceux d'un rapport vide.
+ */
+function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendError = '') {
   let reportsObj = reports;
   if (reports && (reports.points || reports.latest)) {
     reportsObj = { 7: reports, 30: reports, 90: reports };
@@ -206,13 +241,129 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
 
   const initialSummary = getChartSummary(defaultReport.points);
 
-  return `<!doctype html>
-<html lang="fr" class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';">
-  <style nonce="${nonce}">
-    ${themeOverridesCss()}
+  const content = `
+  ${backendError ? `<section class="backend-banner" role="alert"><strong>Tendances indisponibles</strong><p>${escapeHtml(backendError)}</p><p class="backend-hint">L’historique des scans provient du backend. Tant qu’il ne répond pas, aucune tendance ne peut être calculée : rien n’est estimé à sa place.</p></section>` : ''}
+  <!-- KPI cards -->
+  <div class="cards">
+    <div class="card card-active">
+      <div class="kpi-icon-container">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 0c-.2 0-.3.1-.4.2l-6 2c-.3.1-.5.4-.5.7v3.5c0 4.1 2.9 8.1 6.6 9.5.2.1.4.1.6 0 3.7-1.4 6.6-5.4 6.6-9.5V2.9c0-.3-.2-.6-.5-.7l-6-2c-.1-.1-.2-.2-.4-.2zm0 1.5l5 1.7v3.2c0 3.2-2.2 6.4-5 7.6-2.8-1.2-5-4.4-5-7.6V3.2l5-1.7z"/></svg>
+      </div>
+      <div class="kpi-content">
+        <strong id="kpi-active-val">${initialActive}</strong>
+        <small>Alertes actives</small>
+        <div class="kpi-subtext">Total à traiter sur le projet</div>
+      </div>
+    </div>
+    <div class="card card-critical">
+      <div class="kpi-icon-container">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M7.938 2.016A.13.13 0 0 1 8.002 2a.13.13 0 0 1 .063.016.146.146 0 0 1 .054.057l6.857 11.667c.036.06.035.124.002.183a.163.163 0 0 1-.054.06.116.116 0 0 1-.066.017H1.146a.115.115 0 0 1-.066-.017.163.163 0 0 1-.054-.06.176.176 0 0 1 .002-.183L7.884 2.073a.147.147 0 0 1 .054-.057zm1.044 8.047a.5.5 0 0 0-.964 0l-.333 3a.5.5 0 1 0 .964 0l.333-3zM8 12a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></svg>
+      </div>
+      <div class="kpi-content">
+        <strong id="kpi-critical-val">${initialCritical}</strong>
+        <small>Failles critiques</small>
+        <div class="kpi-subtext">Priorité de remédiation absolue</div>
+      </div>
+    </div>
+    <div class="card card-crithigh">
+      <div class="kpi-icon-container">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M7.002 11a1 1 0 1 1 2 0 1 1 0 0 1-2 0zM7.1 4.995a.905.905 0 1 1 1.8 0l-.35 3.507a.553.553 0 0 1-1.1 0L7.1 4.995z"/></svg>
+      </div>
+      <div class="kpi-content">
+        <strong id="kpi-critical-high-val">${initialCritHigh}</strong>
+        <small>Critiques + Hautes</small>
+        <div class="kpi-subtext">Bloquants pour la mise en production</div>
+      </div>
+    </div>
+    <div class="card card-mttr">
+      <div class="kpi-icon-container">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M7.5 3a.5.5 0 0 1 .5.5v5.21l3.248 1.856a.5.5 0 0 1-.496.868l-3.5-2A.5.5 0 0 1 7 9V3.5a.5.5 0 0 1 .5-.5z"/></svg>
+      </div>
+      <div class="kpi-content">
+        <strong id="kpi-mttr-val">${initialMttr}</strong>
+        <small>Délai de correction (MTTR)</small>
+        <div class="kpi-subtext" id="kpi-mttr-sub">${initialMttrSub}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SVG Chart Workspace -->
+  <section class="workspace-section">
+    <h2>Évolution des vulnérabilités</h2>
+    <div class="chart-summary-bar" id="chart-summary-text">${initialSummary}</div>
+
+    <div class="comparability-warning" id="comparability-warning" style="display: none;"></div>
+
+    <!-- Legend toggles -->
+    <div class="trend-legend">
+      <button class="legend-btn active" data-series="total"><span class="legend-color" style="background: var(--trend-total);"></span>Total</button>
+      <button class="legend-btn active" data-series="critical"><span class="legend-color" style="background: var(--trend-critical);"></span>Critical</button>
+      <button class="legend-btn active" data-series="high"><span class="legend-color" style="background: var(--trend-high);"></span>High</button>
+      <button class="legend-btn" data-series="medium"><span class="legend-color" style="background: var(--trend-medium);"></span>Medium</button>
+      <button class="legend-btn" data-series="low"><span class="legend-color" style="background: var(--trend-low);"></span>Low</button>
+      <span class="legend-info"><span class="legend-color" style="background: transparent; border: 1.5px dashed var(--vscode-descriptionForeground, #a0a0a0); box-sizing: border-box; width: 10px; height: 10px;"></span>Non comparable</span>
+    </div>
+
+    <!-- Chart container with SVG -->
+    <div class="trend-chart-wrapper" id="chart-wrapper">
+      <svg class="trend-chart" id="svg-chart" viewBox="0 0 900 400" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="trend-tooltip" id="tooltip"></div>
+    </div>
+
+    <!-- Brush timeline for dense histories -->
+    <div class="brush-container" id="brush-container" style="display: none;">
+      <svg class="brush-svg" id="brush-svg" viewBox="0 0 900 50" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+
+    <!-- Chart footer summary + compact activity -->
+    <div class="chart-footer" id="chart-footer">
+      <div class="footer-metrics-grid" id="chart-footer-metrics"></div>
+      <div class="footer-recent-activity">
+        <h3 class="footer-section-title">Activité récente</h3>
+        <ul class="recent-scans-list" id="recent-activity-list">
+          ${initialRecentScans}
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Collapsible raw table -->
+  <details class="raw-history-details" id="history-details">
+    <summary>Historique de la période</summary>
+    <div class="raw-history-content">
+      <table>
+        <thead>
+          <tr>
+            <th>Scan</th>
+            <th>Date</th>
+            <th>Actives</th>
+            <th>Critiques</th>
+            <th>Hautes</th>
+            <th>Moyennes</th>
+            <th>Faibles</th>
+            <th>Tendance <span class="help-icon" title="Variation du nombre d’alertes actives par rapport au snapshot précédent.">ⓘ</span></th>
+          </tr>
+        </thead>
+        <tbody id="raw-scans-tbody">
+          ${initialRows}
+        </tbody>
+      </table>
+    </div>
+  </details>`;
+
+  return renderSecurityCenterShell({
+    surface: 'trends',
+    nonce,
+    theme: selectedTheme,
+    title: 'Tendances de sécurité',
+    subtitle: "Analyse de l'évolution des vulnérabilités dans le temps",
+    headerActions: `      <div class="period-selector">
+        <button class="period-btn active" data-days="7">7 jours</button>
+        <button class="period-btn" data-days="30">30 jours</button>
+        <button class="period-btn" data-days="90">90 jours</button>
+      </div>`,
+    content,
+    styles: `
     
     body {
       --page-background: var(--sc-bg);
@@ -228,20 +379,13 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
       --trend-low: var(--vscode-charts-green, #45B36B);
     }
 
-    html, body, .trend-report-wrapper {
-      background: var(--page-background);
-      color: var(--vscode-foreground);
-    }
+    .trend-report-wrapper { background: var(--page-background); color: var(--vscode-foreground); }
     
-    body {
-      font-family: var(--vscode-font-family);
-      min-height: 100vh;
-      box-sizing: border-box;
-      padding: 24px;
-      max-width: 1100px;
-      margin: auto;
-    }
 
+    .backend-banner { margin: 0 0 18px; padding: 13px 15px; border: 1px solid var(--sc-warning, #d29922); border-left: 3px solid var(--sc-warning, #d29922); border-radius: 8px; background: var(--sc-warning-bg, rgba(210,153,34,.08)); }
+    .backend-banner strong { display: block; font-size: 13px; }
+    .backend-banner p { margin: 5px 0 0; font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .backend-banner .backend-hint { opacity: .85; }
     .page-head {
       display: flex;
       justify-content: space-between;
@@ -875,144 +1019,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
         font-size: 12px;
       }
     }
-  </style>
-</head>
-<body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
-  <header class="page-head">
-    <div class="brand-header">
-      <div class="brand-title">
-        <svg class="brand-logo" viewBox="0 0 16 16" width="20" height="20" fill="currentColor"><path d="M8 0c-.2 0-.3.1-.4.2l-6 2c-.3.1-.5.4-.5.7v3.5c0 4.1 2.9 8.1 6.6 9.5.2.1.4.1.6 0 3.7-1.4 6.6-5.4 6.6-9.5V2.9c0-.3-.2-.6-.5-.7l-6-2c-.1-.1-.2-.2-.4-.2zm0 1.5l5 1.7v3.2c0 3.2-2.2 6.4-5 7.6-2.8-1.2-5-4.4-5-7.6V3.2l5-1.7z"/></svg>
-        <div class="brand-name-group">
-          <span class="brand-name">Secenter</span>
-          <span class="brand-sub">Security Center</span>
-        </div>
-      </div>
-      <div class="page-title-group">
-        <h1>Tendances de sécurité</h1>
-        <p class="page-subtitle">Analyse de l'évolution des vulnérabilités dans le temps</p>
-      </div>
-    </div>
-    <div class="header-actions">
-      <!-- Segmented period selector -->
-      <div class="period-selector">
-        <button class="period-btn active" data-days="7">7 jours</button>
-        <button class="period-btn" data-days="30">30 jours</button>
-        <button class="period-btn" data-days="90">90 jours</button>
-      </div>
-      <button class="back" id="back-dashboard">← Dashboard</button>
-    </div>
-  </header>
 
-  <!-- KPI cards -->
-  <div class="cards">
-    <div class="card card-active">
-      <div class="kpi-icon-container">
-        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 0c-.2 0-.3.1-.4.2l-6 2c-.3.1-.5.4-.5.7v3.5c0 4.1 2.9 8.1 6.6 9.5.2.1.4.1.6 0 3.7-1.4 6.6-5.4 6.6-9.5V2.9c0-.3-.2-.6-.5-.7l-6-2c-.1-.1-.2-.2-.4-.2zm0 1.5l5 1.7v3.2c0 3.2-2.2 6.4-5 7.6-2.8-1.2-5-4.4-5-7.6V3.2l5-1.7z"/></svg>
-      </div>
-      <div class="kpi-content">
-        <strong id="kpi-active-val">${initialActive}</strong>
-        <small>Alertes actives</small>
-        <div class="kpi-subtext">Total à traiter sur le projet</div>
-      </div>
-    </div>
-    <div class="card card-critical">
-      <div class="kpi-icon-container">
-        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M7.938 2.016A.13.13 0 0 1 8.002 2a.13.13 0 0 1 .063.016.146.146 0 0 1 .054.057l6.857 11.667c.036.06.035.124.002.183a.163.163 0 0 1-.054.06.116.116 0 0 1-.066.017H1.146a.115.115 0 0 1-.066-.017.163.163 0 0 1-.054-.06.176.176 0 0 1 .002-.183L7.884 2.073a.147.147 0 0 1 .054-.057zm1.044 8.047a.5.5 0 0 0-.964 0l-.333 3a.5.5 0 1 0 .964 0l.333-3zM8 12a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></svg>
-      </div>
-      <div class="kpi-content">
-        <strong id="kpi-critical-val">${initialCritical}</strong>
-        <small>Failles critiques</small>
-        <div class="kpi-subtext">Priorité de remédiation absolue</div>
-      </div>
-    </div>
-    <div class="card card-crithigh">
-      <div class="kpi-icon-container">
-        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M7.002 11a1 1 0 1 1 2 0 1 1 0 0 1-2 0zM7.1 4.995a.905.905 0 1 1 1.8 0l-.35 3.507a.553.553 0 0 1-1.1 0L7.1 4.995z"/></svg>
-      </div>
-      <div class="kpi-content">
-        <strong id="kpi-critical-high-val">${initialCritHigh}</strong>
-        <small>Critiques + Hautes</small>
-        <div class="kpi-subtext">Bloquants pour la mise en production</div>
-      </div>
-    </div>
-    <div class="card card-mttr">
-      <div class="kpi-icon-container">
-        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="M7.5 3a.5.5 0 0 1 .5.5v5.21l3.248 1.856a.5.5 0 0 1-.496.868l-3.5-2A.5.5 0 0 1 7 9V3.5a.5.5 0 0 1 .5-.5z"/></svg>
-      </div>
-      <div class="kpi-content">
-        <strong id="kpi-mttr-val">${initialMttr}</strong>
-        <small>Délai de correction (MTTR)</small>
-        <div class="kpi-subtext" id="kpi-mttr-sub">${initialMttrSub}</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- SVG Chart Workspace -->
-  <section class="workspace-section">
-    <h2>Évolution des vulnérabilités</h2>
-    <div class="chart-summary-bar" id="chart-summary-text">${initialSummary}</div>
-    
-    <div class="comparability-warning" id="comparability-warning" style="display: none;"></div>
-
-    <!-- Legend toggles -->
-    <div class="trend-legend">
-      <button class="legend-btn active" data-series="total"><span class="legend-color" style="background: var(--trend-total);"></span>Total</button>
-      <button class="legend-btn active" data-series="critical"><span class="legend-color" style="background: var(--trend-critical);"></span>Critical</button>
-      <button class="legend-btn active" data-series="high"><span class="legend-color" style="background: var(--trend-high);"></span>High</button>
-      <button class="legend-btn" data-series="medium"><span class="legend-color" style="background: var(--trend-medium);"></span>Medium</button>
-      <button class="legend-btn" data-series="low"><span class="legend-color" style="background: var(--trend-low);"></span>Low</button>
-      <span class="legend-info"><span class="legend-color" style="background: transparent; border: 1.5px dashed var(--vscode-descriptionForeground, #a0a0a0); box-sizing: border-box; width: 10px; height: 10px;"></span>Non comparable</span>
-    </div>
-
-    <!-- Chart container with SVG -->
-    <div class="trend-chart-wrapper" id="chart-wrapper">
-      <svg class="trend-chart" id="svg-chart" viewBox="0 0 900 400" preserveAspectRatio="xMidYMid meet"></svg>
-      <div class="trend-tooltip" id="tooltip"></div>
-    </div>
-
-    <!-- Brush timeline for dense histories -->
-    <div class="brush-container" id="brush-container" style="display: none;">
-      <svg class="brush-svg" id="brush-svg" viewBox="0 0 900 50" preserveAspectRatio="xMidYMid meet"></svg>
-    </div>
-
-    <!-- Chart footer summary + compact activity -->
-    <div class="chart-footer" id="chart-footer">
-      <div class="footer-metrics-grid" id="chart-footer-metrics"></div>
-      <div class="footer-recent-activity">
-        <h3 class="footer-section-title">Activité récente</h3>
-        <ul class="recent-scans-list" id="recent-activity-list">
-          ${initialRecentScans}
-        </ul>
-      </div>
-    </div>
-  </section>
-
-  <!-- Collapsible raw table -->
-  <details class="raw-history-details" id="history-details">
-    <summary>Historique de la période</summary>
-    <div class="raw-history-content">
-      <table>
-        <thead>
-          <tr>
-            <th>Scan</th>
-            <th>Date</th>
-            <th>Actives</th>
-            <th>Critiques</th>
-            <th>Hautes</th>
-            <th>Moyennes</th>
-            <th>Faibles</th>
-            <th>Tendance <span class="help-icon" title="Variation du nombre d’alertes actives par rapport au snapshot précédent.">ⓘ</span></th>
-          </tr>
-        </thead>
-        <tbody id="raw-scans-tbody">
-          ${initialRows}
-        </tbody>
-      </table>
-    </div>
-  </details>
-
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
+    .sc-topbar-actions .period-selector { margin: 0; }`,
+    script: `    const vscode = window.__scShellApi || acquireVsCodeApi();
     
     // Loaded reports mapped by days
     const reports = ${JSON.stringify(reportsObj)};
@@ -1042,10 +1051,6 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
       medium: '#8B5CF6',
       low: '#45B36B'
     };
-
-    document.getElementById('back-dashboard').addEventListener('click', () => {
-      vscode.postMessage({ command: 'openDashboard' });
-    });
 
     // Setup selector buttons
     document.querySelectorAll('.period-btn').forEach(btn => {
@@ -1975,10 +1980,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light') {
         renderChart();
       });
     }
-    updateUI();
-  </script>
-</body>
-</html>`;
+    updateUI();`,
+    csp: `default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+  });
 }
 
-module.exports = { buildTrendReport, renderTrendReportHtml };
+module.exports = { RESOLUTION_ACTIONS, buildTrendReport, renderTrendReportHtml };

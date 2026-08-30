@@ -21,13 +21,33 @@ test('affiche les historiques local et backend dans une page autonome', () => {
 
 test('applique le thème global clair à toute la page historique', () => {
   const html = renderScanHistoryHtml([], [], '', 'nonce', 'light');
-  assert.match(html, /class="theme-light"/);
-  assert.match(html, /html\{background:var\(--vscode-editor-background\)\}/);
-  assert.match(html, /body\{[^}]*background:var\(--vscode-editor-background\)/);
-  assert.match(html, /\.scan\{[^}]*background:var\(--vscode-sideBar-background/);
+  assert.match(html, /class="theme-light[^"]*"/);
+  assert.match(html, /html \{ background: var\(--sc-bg\); \}/);
+  assert.match(html, /body \{[^}]*background: var\(--sc-bg\)/);
+  assert.match(html, /\.scan \{[^}]*background: var\(--sc-surface\)/);
   assert.doesNotMatch(html, /#24462f|#263c62/);
-  assert.match(html, /← Dashboard/);
-  assert.match(html, /command:'openDashboard'/);
+  // La page vit maintenant dans le cadre applicatif : le retour au dashboard
+  // passe par la navigation partagee, plus par un lien propre a la page.
+  assert.match(html, /class="sc-internal-nav"/);
+  assert.match(html, /data-command="securityCenter\.openDashboard"/);
+  assert.doesNotMatch(html, /← Dashboard/);
+  // L'ouverture d'un scan enregistre garde exactement le meme message.
+  assert.match(html, /command: 'loadScan'/);
+});
+
+test('marque Scan History comme page courante dans la navigation partagée', () => {
+  const html = renderScanHistoryHtml([], [], '', 'nonce', 'light');
+  const active = [...html.matchAll(/<button class="sc-nav-item active"([^>]*)>/g)];
+  assert.equal(active.length, 1, 'exactement un item doit porter l etat courant');
+  assert.match(active[0][1], /data-command="securityCenter\.showScanHistoryPage"/);
+  assert.match(active[0][1], /aria-current="page"/);
+});
+
+test('rend l historique dans les deux thèmes sans changer de structure', () => {
+  const dark = renderScanHistoryHtml([], [], '', 'nonce', 'dark');
+  assert.match(dark, /class="theme-dark[^"]*"/);
+  assert.match(dark, /data-theme="dark"/);
+  assert.match(dark, /class="sc-internal-nav"/);
 });
 
 test('reste utile lorsque le backend est indisponible', () => {

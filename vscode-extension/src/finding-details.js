@@ -1,3 +1,6 @@
+const { renderSecurityCenterShell } = require('./security-center-shell');
+const { buildAssistantCardModel, renderAssistantCard, assistantCardCss, assistantCardScript } = require('./companion-assistant-card');
+const { scannerPresentation, scannerLogoUri } = require('./scanner-presentation');
 const {
   STATE_LABELS: VERIFICATION_LABELS, REASON_LABELS: VERIFICATION_REASONS
 } = require('./fix-verification');
@@ -15,6 +18,34 @@ function escapeHtml(value) {
 
 function valueOrUnavailable(value) {
   return value ? escapeHtml(value) : '<span class="muted">Non fourni par le rapport baseline ZAP</span>';
+}
+
+function severityTone(value) {
+  const severity = String(value || '').toUpperCase();
+  if (['CRITICAL', 'ERROR'].includes(severity)) return 'critical';
+  if (severity === 'HIGH') return 'high';
+  if (['MEDIUM', 'WARNING'].includes(severity)) return 'medium';
+  if (['LOW', 'INFO', 'INFORMATION'].includes(severity)) return 'low';
+  return 'info';
+}
+
+function factBadge(kind, label) {
+  return `<span class="fact ${escapeHtml(kind)}">${escapeHtml(label)}</span>`;
+}
+
+function locationText(finding) {
+  const target = finding.endpoint || finding.file || finding.absolutePath || 'Location unavailable';
+  const line = Number.isFinite(Number(finding.startLine)) && Number(finding.startLine) >= 0 ? `:${Number(finding.startLine) + 1}` : '';
+  return `${target}${line}`;
+}
+
+function renderDetailsScannerLogo(finding, navigation) {
+  const presentation = scannerPresentation(finding.tool);
+  const uri = scannerLogoUri(finding.tool, navigation);
+  if (uri) {
+    return `<span class="detail-scanner-logo" data-scanner-logo="${escapeHtml(presentation.id)}"><img src="${escapeHtml(uri)}" alt="${escapeHtml(presentation.label)} logo"></span>`;
+  }
+  return `<span class="detail-scanner-logo fallback" data-scanner-logo="${escapeHtml(presentation.id)}">${escapeHtml(presentation.label.slice(0, 2).toUpperCase())}</span>`;
 }
 
 function trivyValue(value, emptyLabel = 'Non indiqué par Trivy') {
@@ -283,6 +314,8 @@ function renderVerification(finding) {
 }
 
 function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
+  const companionImageUri = navigation.companionImageUri || '';
+  const cspSource = navigation.cspSource || '';
   const reference = finding.helpUri
     ? `<a href="${escapeHtml(finding.helpUri)}">${escapeHtml(finding.helpUri)}</a>`
     : '<span class="muted">Aucune référence fournie</span>';
@@ -339,22 +372,116 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
     ? `<h2>Corrélation multi-outils</h2><div class="block"><strong>${escapeHtml(finding.correlatedTools.join(' + '))}</strong><br><span class="muted">Confiance ${escapeHtml(finding.correlationConfidence || 'medium')} — cette correspondance aide à prioriser, mais ne remplace pas une validation manuelle.</span></div>`
     : '';
   const triage = `<h2>Suivi</h2><div class="grid block"><div class="label">Statut</div><div><strong>${escapeHtml(VERIFICATION_LABELS[finding.triageStatus] || finding.triageStatus || 'new')}</strong></div><div class="label">Contexte</div><div>${escapeHtml(finding.sourceContext || 'non classé')}</div></div>${renderVerification(finding)}`;
-  const aiAction = finding.absolutePath || finding.file ? '<button id="ai-fix" class="ai-action">✨ Proposer une correction avec Ollama</button>' : '<p class="muted">Correction IA indisponible : aucun fichier source local associé à ce finding.</p>';
+  const aiAction = finding.absolutePath || finding.file ? '<button id="ai-fix" class="ai-action primary-action">✨ Proposer une correction avec Ollama</button>' : '<p class="muted">Correction IA indisponible : aucun fichier source local associé à ce finding.</p>';
   const relatedTraffic = Array.isArray(navigation.relatedTraffic) ? navigation.relatedTraffic : [];
   const backAction = Number.isInteger(navigation.backTrafficIndex) ? `<button class="context-action" data-back-traffic="${navigation.backTrafficIndex}">← Retour à la requête HTTP</button>` : '';
   const relatedEvidence = relatedTraffic.length ? `<h2>Preuves HTTP associées</h2><div class="http-evidence">${relatedTraffic.slice(0, 5).map((traffic) => `<div><strong>${escapeHtml(traffic.method)} ${escapeHtml(traffic.path)}</strong><span>Statut : ${escapeHtml(traffic.status)} · Source : ${escapeHtml(traffic.source)}</span><button data-http-index="${traffic.index}">Ouvrir la requête</button></div>`).join('')}</div>` : '';
-  return `<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style nonce="${nonce}">
-    body { color: var(--vscode-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); padding: 28px; max-width: 1050px; margin: auto; }
+  // La carte d'assistant du rail. Elle lit le finding affiche ici — son etat de
+  // verification, son atteignabilite, son CWE — et la liste des findings du
+  // workspace quand l'appelant la fournit. Ses deux actions passent par les
+  // messages `verifyFix` et `generateAiFix` que ce panneau traite deja.
+  const assistantCard = renderAssistantCard(buildAssistantCardModel({
+    surface: 'finding-details',
+    finding,
+    findings: Array.isArray(navigation.findings) ? navigation.findings : []
+  }), { mascotImageUri: companionImageUri });
+  const presentation = scannerPresentation(finding.tool);
+  const severity = String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase();
+  const reachabilityValue = finding.reachability?.status || finding.reachability?.state || (finding.reachable === true ? 'REACHABLE' : finding.reachable === false ? 'NOT_REACHABLE' : 'UNKNOWN');
+  const reachabilityLabel = REACHABILITY_LABELS[reachabilityValue] || String(reachabilityValue || 'Unknown');
+  const statusLabel = VERIFICATION_LABELS[finding.triageStatus] || finding.triageStatus || 'new';
+  const canVerify = finding.triageStatus !== 'validated';
+  const identifiers = [
+    finding.ruleId ? ['Rule', finding.ruleId] : null,
+    finding.cwe ? ['CWE', finding.cwe] : null,
+    Array.isArray(finding.vulnerabilityAliases) && finding.vulnerabilityAliases.length ? ['CVE', finding.vulnerabilityAliases.filter((alias) => /^CVE-/i.test(alias)).join(', ')] : null
+  ].filter((item) => item && item[1]);
+  const identifierBadges = identifiers.map(([label, value]) => `<span>${escapeHtml(label)} <strong>${escapeHtml(value)}</strong></span>`).join('');
+  const investigationHero = `<section class="finding-detail-hero ${severityTone(severity)}">
+    <div class="detail-watermark" aria-hidden="true">SECURITY CENTER</div>
+    <div class="detail-hero-main">
+      ${renderDetailsScannerLogo(finding, navigation)}
+      <div>
+        <div class="detail-kicker">${escapeHtml(presentation.label)} · ${escapeHtml(presentation.category)}</div>
+        <h2>${escapeHtml(finding.title || 'Security finding')}</h2>
+        <p><code>${escapeHtml(locationText(finding))}</code></p>
+        <div class="detail-facts">
+          ${factBadge('verified', 'Verified scanner finding')}
+          ${factBadge('inferred', `Reachability: ${reachabilityLabel}`)}
+          ${factBadge(reachabilityValue === 'UNKNOWN' ? 'unknown' : 'verified', `Status: ${statusLabel}`)}
+        </div>
+        <div class="identifier-strip">${identifierBadges}</div>
+      </div>
+    </div>
+    <aside class="detail-severity">
+      <span>${escapeHtml(severity)}</span>
+      <strong>Confidence ${escapeHtml(finding.confidence || finding.reachability?.confidence || 'unknown')}</strong>
+    </aside>
+    <div class="finding-action-toolbar">
+      ${finding.absolutePath || finding.file ? '<button id="open-code" class="context-action secondary-action">Open code</button>' : ''}
+      ${aiAction}
+      ${canVerify ? '<button data-verify="1" class="context-action secondary-action">Verify correction</button>' : ''}
+    </div>
+  </section>`;
+  return renderSecurityCenterShell({
+    surface: 'finding-details',
+    nonce,
+    theme: navigation.theme,
+    title: finding.title,
+    subtitle: `${finding.tool} · ${finding.rawSeverity}`,
+    headerActions: `${backAction}`,
+    content: `${investigationHero}
+  <nav class="detail-tabs" aria-label="Investigation sections">
+    <a href="#overview">Overview</a><a href="#evidence">Evidence</a><a href="#reachability">Reachability</a><a href="#remediation">Remediation</a><a href="#verification">Verification</a><a href="#technical">Technical Details</a>
+  </nav>
+  <section id="overview" class="detail-section"><div class="section-heading"><span>Overview</span>${factBadge('verified', 'scanner produced finding')}</div><p>${escapeHtml(developerExplanation(finding))}</p></section>
+  <section id="evidence" class="detail-section"><div class="section-heading"><span>Evidence</span>${factBadge('verified', 'scanner evidence')}</div>${renderIntelligenceSection(finding)}${relatedEvidence || '<p class="muted">No linked HTTP evidence was supplied for this finding.</p>'}</section>
+  <section id="reachability" class="detail-section"><div class="section-heading"><span>Reachability</span>${factBadge(reachabilityValue === 'UNKNOWN' ? 'unknown' : 'inferred', reachabilityLabel)}</div><p>${escapeHtml(finding.reachability?.reason || 'Reachability was not confirmed beyond the data already supplied by the scanners and correlation pipeline.')}</p></section>
+  <section id="impact" class="detail-section"><div class="section-heading"><span>Impact</span>${factBadge('inferred', 'requires validation')}</div><p>${escapeHtml(developerImpact(finding))}</p></section>
+  <section id="remediation" class="detail-section"><div class="section-heading"><span>Remediation</span>${factBadge('inferred', 'recommended action')}</div><p>${escapeHtml(developerAction(finding))}</p></section>
+  <section id="verification" class="detail-section"><div class="section-heading"><span>Verification</span>${factBadge('verified', 'lifecycle state')}</div>${triage}</section>
+  ${correlation ? `<section class="detail-section"><div class="section-heading"><span>Correlation</span>${factBadge('inferred', 'cross-tool signal')}</div>${correlation}</section>` : ''}
+  <section id="technical" class="detail-section technical-details"><div class="section-heading"><span>Technical Details</span>${factBadge('verified', presentation.label)}</div>${content}</section>`,
+    contextRail: assistantCard,
+    styles: `
+    ${assistantCard ? assistantCardCss() : ''}
     body.theme-light { --vscode-foreground:#3f4650; --vscode-descriptionForeground:#6d7480; --vscode-editor-background:#f8f9fb; --vscode-textCodeBlock-background:#eef0f4; --vscode-widget-border:#d8dce3; --vscode-button-background:#4d78d2; --vscode-button-foreground:#fff; --vscode-button-hoverBackground:#3f6fc7; --vscode-badge-background:#e5eaf4; --vscode-badge-foreground:#405677; --vscode-textLink-foreground:#416fce; --vscode-editor-inactiveSelectionBackground:#eef2fa; --vscode-focusBorder:#4d78d2; --vscode-errorForeground:#c84d43; color-scheme:light; }
     body.theme-dark { color-scheme:dark; }
-    h1 { font-size: 26px; margin-bottom: 8px; letter-spacing: -.4px; }
     h2 { font-size: 15px; margin-top: 24px; }
+    .finding-detail-hero { position: relative; overflow: hidden; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px 16px; padding: 18px; border: 1px solid var(--sc-border); border-radius: 18px; background: linear-gradient(135deg, color-mix(in srgb, var(--sc-primary) 9%, var(--sc-surface)), var(--sc-surface)); box-shadow: var(--sc-shadow-sm); }
+    .detail-watermark { position: absolute; right: -16px; bottom: 8px; opacity: .035; font-size: 44px; font-weight: 900; letter-spacing: 5px; pointer-events: none; }
+    .detail-hero-main { position: relative; z-index: 1; display: grid; grid-template-columns: auto minmax(0,1fr); gap: 14px; align-items: start; }
+    .detail-scanner-logo { display: grid; place-items: center; width: 58px; height: 58px; border: 1px solid var(--sc-border); border-radius: 16px; background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); }
+    .detail-scanner-logo img { max-width: 42px; max-height: 42px; }
+    .detail-scanner-logo.fallback { color: var(--sc-primary); font-weight: 900; }
+    .detail-kicker { color: var(--sc-primary); font-size: 10px; font-weight: 900; letter-spacing: .7px; text-transform: uppercase; }
+    .finding-detail-hero h2 { margin: 5px 0 0; color: var(--sc-text); font-size: 24px; line-height: 1.18; letter-spacing: 0; }
+    .finding-detail-hero p { margin: 8px 0 0; }
+    .detail-facts, .identifier-strip, .finding-action-toolbar { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+    .identifier-strip span { padding: 5px 8px; border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 10px; }
+    .detail-severity { position: relative; z-index: 1; display: grid; align-content: start; justify-items: end; gap: 6px; }
+    .detail-severity span { padding: 6px 10px; border: 1px solid currentColor; border-radius: 999px; font-size: 11px; font-weight: 900; }
+    .detail-severity strong { color: var(--sc-muted); font-size: 11px; }
+    .finding-detail-hero.critical .detail-severity span { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 11%, transparent); }
+    .finding-detail-hero.high .detail-severity span { color: var(--sc-high); background: color-mix(in srgb, var(--sc-high) 12%, transparent); }
+    .finding-detail-hero.medium .detail-severity span { color: var(--sc-medium); background: color-mix(in srgb, var(--sc-medium) 13%, transparent); }
+    .finding-detail-hero.low .detail-severity span { color: var(--sc-low); background: color-mix(in srgb, var(--sc-low) 13%, transparent); }
+    .finding-action-toolbar { grid-column: 1 / -1; align-items: center; gap: 10px; padding-top: 12px; border-top: 1px solid var(--sc-border); }
+    .finding-action-toolbar button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; margin: 0; padding: 0 14px; border-radius: 10px; font-size: 12px; font-weight: 800; line-height: 1; }
+    .finding-action-toolbar .primary-action { border: 1px solid transparent; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+    .finding-action-toolbar .primary-action:hover { background: var(--vscode-button-hoverBackground); }
+    .finding-action-toolbar .secondary-action { border: 1px solid var(--sc-border); color: var(--sc-primary); background: var(--sc-surface); }
+    .finding-action-toolbar .secondary-action:hover { border-color: color-mix(in srgb, var(--sc-primary) 36%, var(--sc-border)); background: var(--sc-primary-soft); }
+    .detail-tabs { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; padding: 8px; border: 1px solid var(--sc-border); border-radius: 14px; background: color-mix(in srgb, var(--sc-surface) 94%, transparent); backdrop-filter: blur(12px); }
+    .detail-tabs a { padding: 6px 9px; border-radius: 999px; color: var(--sc-muted); text-decoration: none; font-size: 10px; font-weight: 900; text-transform: uppercase; }
+    .detail-tabs a:hover, .detail-tabs a:focus-visible, .detail-tabs a.active { color: var(--sc-primary); background: var(--sc-primary-soft); outline: none; }
+    .detail-section { margin-top: 12px; padding: 16px; border: 1px solid var(--sc-border); border-radius: 16px; background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .section-heading > span { color: var(--sc-text); font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: .7px; }
+    .fact { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px; font-size: 9px; font-weight: 900; letter-spacing: .45px; text-transform: uppercase; }
+    .fact.verified { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, transparent); }
+    .fact.inferred { color: var(--sc-warning); background: color-mix(in srgb, var(--sc-warning) 12%, transparent); }
+    .fact.unknown { color: var(--sc-muted); background: var(--sc-surface-soft); }
     .badge { display: inline-block; padding: 4px 9px; border-radius: 999px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); margin-right: 6px; font-weight: 700; }
     .grid { display: grid; grid-template-columns: minmax(120px, 180px) 1fr; gap: 8px 14px; }
     .label, .muted { color: var(--vscode-descriptionForeground); }
@@ -377,10 +504,10 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
     details { margin-top: 24px; }
     summary { cursor: pointer; color: var(--vscode-descriptionForeground); font-weight: 700; }
     .technical { margin-top: 10px; }
-    .ai-action { margin: 18px 0 2px; padding: 10px 15px; border: 0; border-radius: 6px; cursor: pointer; font-weight: 700; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+    .ai-action { cursor: pointer; font-weight: 700; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
     .ai-action:hover { background: var(--vscode-button-hoverBackground); }
     .context-action, .http-evidence button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 4px; padding: 7px 10px; cursor: pointer; }
-    .context-action { margin-bottom: 8px; }
+    .context-action { margin-bottom: 0; }
     .http-evidence { border: 1px solid var(--vscode-widget-border); border-radius: 6px; }
     .http-evidence > div { display: grid; grid-template-columns: minmax(0,1fr) minmax(180px,auto) auto; gap: 10px; align-items: center; padding: 9px 11px; border-bottom: 1px solid var(--vscode-widget-border); }
     .http-evidence > div:last-child { border-bottom: 0; }
@@ -389,25 +516,14 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
     ul.plain { list-style: none; margin: 0; padding: 0; }
     ul.plain li { padding: 3px 0; }
     .muted { color: var(--vscode-descriptionForeground); }
-    @media (max-width: 700px) { .two-columns { grid-template-columns: 1fr; } body { padding: 16px; } }
-  </style>
-</head>
-<body class="theme-${navigation.theme === 'dark' ? 'dark' : 'light'}">
-  ${backAction}
-  <h1>${escapeHtml(finding.title)}</h1>
-  <p><span class="badge">${escapeHtml(finding.tool)}</span><span class="badge">${escapeHtml(finding.rawSeverity)}</span><span class="badge">Confiance ${escapeHtml(finding.confidence || 'inconnue')}</span></p>
-  ${aiAction}
-  ${renderIntelligenceSection(finding)}
-  ${content}
-  ${correlation}
-  ${relatedEvidence}
-  ${triage}
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
+    @media (max-width: 700px) { .two-columns, .finding-detail-hero { grid-template-columns: 1fr; } .detail-severity { justify-items: start; } .finding-action-toolbar button { flex: 1 1 180px; } }
+    @media (prefers-reduced-motion: reduce) { .finding-action-toolbar button, .detail-tabs a { transition: none; } }`,
+    script: `    const vscode = window.__scShellApi || acquireVsCodeApi();
     const aiButton = document.getElementById('ai-fix');
     document.querySelector('[data-back-traffic]')?.addEventListener('click', (event) => vscode.postMessage({ type: 'backToHttpRequest', index: Number(event.currentTarget.dataset.backTraffic) }));
     document.querySelectorAll('[data-http-index]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'openHttpRequest', index: Number(button.dataset.httpIndex) })));
-    document.querySelector('[data-verify]')?.addEventListener('click', (event) => { event.currentTarget.disabled = true; vscode.postMessage({ type: 'verifyFix' }); });
+    document.getElementById('open-code')?.addEventListener('click', () => vscode.postMessage({ type: 'openFindingCode' }));
+    document.querySelectorAll('[data-verify]').forEach((button) => button.addEventListener('click', (event) => { event.currentTarget.disabled = true; vscode.postMessage({ type: 'verifyFix' }); }));
     document.querySelector('[data-rollback]')?.addEventListener('click', () => vscode.postMessage({ type: 'rollbackAiFix' }));
     aiButton?.addEventListener('click', () => {
       aiButton.disabled = true;
@@ -420,9 +536,22 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
       if (event.data.status === 'done') { aiButton.disabled = false; aiButton.textContent = '✨ Proposer une nouvelle correction avec Ollama'; }
       if (event.data.status === 'error') { aiButton.disabled = false; aiButton.textContent = '⚠ Réessayer la correction Ollama'; }
     });
-  </script>
-</body>
-</html>`;
+    const tabs = [...document.querySelectorAll('.detail-tabs a')];
+    const sections = tabs.map((tab) => document.querySelector(tab.getAttribute('href'))).filter(Boolean);
+    const activateTab = (hash) => tabs.forEach((tab) => tab.classList.toggle('active', tab.getAttribute('href') === hash));
+    tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.getAttribute('href'))));
+    if (tabs.length) activateTab(window.location.hash || tabs[0].getAttribute('href'));
+    window.addEventListener('hashchange', () => activateTab(window.location.hash || tabs[0]?.getAttribute('href')));
+    if ('IntersectionObserver' in window) {
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries.filter((entry) => entry.isIntersecting).sort((left, right) => right.intersectionRatio - left.intersectionRatio)[0];
+        if (visible?.target?.id) activateTab('#' + visible.target.id);
+      }, { rootMargin: '-20% 0px -65% 0px', threshold: [0.1, 0.4, 0.7] });
+      sections.forEach((section) => observer.observe(section));
+    }
+    ${assistantCard ? assistantCardScript() : ''}`,
+    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';`
+  });
 }
 
 module.exports = {

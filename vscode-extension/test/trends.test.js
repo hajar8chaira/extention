@@ -11,12 +11,80 @@ test('calcule les tendances actives et le MTTR avec preuves temporelles', () => 
     scan(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }, { id: 'b', rawSeverity: 'LOW', triageStatus: 'new' }]),
     scan(2, '2026-08-02T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'validated' }, { id: 'b', rawSeverity: 'LOW', triageStatus: 'new' }])
   ];
-  const report = buildTrendReport(scans, [{ finding_id: 'a', action: 'status:validated', created_at: '2026-08-02T00:00:00Z' }], 90, new Date('2026-08-03T00:00:00Z'));
+  // Nom d'action REEL emis aujourd'hui par l'extension (extension.js — bloc de
+  // revalidation apres re-scan). L'ancien fixture utilisait « status:validated »,
+  // un nom que le produit n'emet plus : le test passait alors que le MTTR etait
+  // mort en production.
+  const report = buildTrendReport(scans, [{ finding_id: 'a', action: 'finding.fix.validated', created_at: '2026-08-02T00:00:00Z' }], 90, new Date('2026-08-03T00:00:00Z'));
   assert.equal(report.points.length, 2);
   assert.equal(report.latest.active, 1);
   assert.equal(report.change, -1);
   assert.equal(report.mttrHours, 24);
   assert.equal(report.resolvedCount, 1);
+});
+
+test('MTTR : chaque nom d’action de resolution reellement emis est reconnu', () => {
+  const scans = [
+    scan(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }]),
+    scan(2, '2026-08-02T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'validated' }])
+  ];
+  // Les trois noms que `createAuditEvent` recoit aujourd'hui pour une correction
+  // reellement verifiee, plus les deux noms historiques encore presents dans les
+  // backends existants.
+  for (const action of ['finding.fixed', 'finding.fix.validated', 'fix.verification.validated', 'status:fixed', 'status:validated']) {
+    const report = buildTrendReport(scans, [{ finding_id: 'a', action, created_at: '2026-08-02T00:00:00Z' }], 90, new Date('2026-08-03T00:00:00Z'));
+    assert.equal(report.mttrHours, 24, `${action} devrait produire un MTTR`);
+    assert.equal(report.resolvedCount, 1, `${action} devrait compter une resolution`);
+  }
+});
+
+test('MTTR : une correction appliquee mais non verifiee ne compte pas', () => {
+  const scans = [
+    scan(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }]),
+    scan(2, '2026-08-02T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'fixed' }])
+  ];
+  // `fix.verification.*` couvre neuf etats du cycle de vie. Seul `validated` est
+  // une resolution : compter `fixed` (patch applique, verification en attente)
+  // mesurerait le delai de patch en l'appelant MTTR. Un risque accepte n'est pas
+  // davantage une correction.
+  for (const action of ['fix.verification.fixed', 'fix.verification.still_present', 'fix.verification.inconclusive', 'fix.verification.validation_failed', 'fix.verification.regressed', 'finding.risk.accepted', 'finding.triage.changed']) {
+    const report = buildTrendReport(scans, [{ finding_id: 'a', action, created_at: '2026-08-02T00:00:00Z' }], 90, new Date('2026-08-03T00:00:00Z'));
+    assert.equal(report.mttrHours, null, `${action} ne doit pas produire de MTTR`);
+    assert.equal(report.resolvedCount, 0, `${action} ne doit pas compter de resolution`);
+  }
+});
+
+test('MTTR : une alerte portant une empreinte est resolvable par son finding_id', () => {
+  // Gitleaks, SonarQube et Snyk fournissent une empreinte. L'index « premiere
+  // apparition » etait alors range sous l'empreinte, alors que l'evenement
+  // d'audit porte `finding_id` : la recherche echouait et l'alerte disparaissait
+  // silencieusement du MTTR, quel que soit le nom d'action.
+  const scans = [
+    scan(1, '2026-08-01T00:00:00Z', [{ id: 'a', fingerprint: 'fp-a', rawSeverity: 'HIGH', triageStatus: 'new' }]),
+    scan(2, '2026-08-02T00:00:00Z', [{ id: 'a', fingerprint: 'fp-a', rawSeverity: 'HIGH', triageStatus: 'validated' }])
+  ];
+  const byId = buildTrendReport(scans, [{ finding_id: 'a', action: 'finding.fix.validated', created_at: '2026-08-02T00:00:00Z' }], 90, new Date('2026-08-03T00:00:00Z'));
+  assert.equal(byId.mttrHours, 24);
+  assert.equal(byId.resolvedCount, 1);
+  // L'empreinte reste une identite valide : rien n'est retire.
+  const byFingerprint = buildTrendReport(scans, [{ finding_id: 'fp-a', action: 'finding.fix.validated', created_at: '2026-08-02T00:00:00Z' }], 90, new Date('2026-08-03T00:00:00Z'));
+  assert.equal(byFingerprint.mttrHours, 24);
+  assert.equal(byFingerprint.resolvedCount, 1);
+});
+
+test('MTTR : les deux evenements emis pour une meme correction ne comptent qu’une fois', () => {
+  // L'extension emet `finding.fixed` PUIS `finding.fix.validated` pour la meme
+  // alerte dans la meme boucle. La resolution ne doit etre comptee qu'une fois.
+  const scans = [
+    scan(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }]),
+    scan(2, '2026-08-02T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'validated' }])
+  ];
+  const report = buildTrendReport(scans, [
+    { finding_id: 'a', action: 'finding.fixed', created_at: '2026-08-02T00:00:00Z' },
+    { finding_id: 'a', action: 'finding.fix.validated', created_at: '2026-08-02T00:00:00Z' }
+  ], 90, new Date('2026-08-03T00:00:00Z'));
+  assert.equal(report.resolvedCount, 1);
+  assert.equal(report.mttrHours, 24);
 });
 
 test('n\u2019invente pas de MTTR sans \u00e9v\u00e9nement de correction', () => {
@@ -36,10 +104,14 @@ test('la page tendances suit le th\u00e8me global et revient au dashboard', () =
   const report = buildTrendReport([], [], 90, new Date('2026-08-03T00:00:00Z'));
   const light = renderTrendReportHtml(report, 'nonce', 'light');
   const dark = renderTrendReportHtml(report, 'nonce', 'dark');
-  assert.match(light, /class="theme-light"/);
-  assert.match(dark, /class="theme-dark"/);
-  assert.match(light, /\u2190 Dashboard/);
-  assert.match(light, /command:\s*'\s*openDashboard\s*'/);
+  assert.match(light, /class="theme-light[^"]*"/);
+  assert.match(dark, /class="theme-dark[^"]*"/);
+  // La page vit dans le cadre applicatif : le retour au dashboard est porte par
+  // la navigation partagee, et Trends & MTTR y est l'item courant.
+  assert.match(light, /class="sc-internal-nav"/);
+  assert.match(light, /data-command="securityCenter\.openDashboard"/);
+  assert.match(light, /<button class="sc-nav-item active"[^>]*data-command="securityCenter\.showTrends"/);
+  assert.doesNotMatch(light, /\u2190 Dashboard/);
   assert.doesNotMatch(light, /#58a6ff/);
 });
 

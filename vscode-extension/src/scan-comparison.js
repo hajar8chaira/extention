@@ -1,4 +1,4 @@
-const { themeOverridesCss } = require('./theme-controller');
+const { renderSecurityCenterShell } = require('./security-center-shell');
 
 /**
  * Stable identity of a finding across scans.
@@ -115,13 +115,254 @@ function escapeHtml(value) {
 }
 
 function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
-  return `<!doctype html>
-<html lang="fr" class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';">
-  <style nonce="${nonce}">
-    ${themeOverridesCss()}
+  const content = `
+  <!-- Selection Cards -->
+  <section class="selection-cards">
+    <!-- Card A -->
+    <div class="selection-card" id="selection-card-A">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <div class="selection-card-title" style="margin: 0;">Scan A — Avant</div>
+        <span class="selection-label-badge label-A">A</span>
+      </div>
+      <div class="selection-card-empty" id="card-A-empty">Aucun scan sélectionné (référence)</div>
+      <div class="selection-card-details" id="card-A-details" style="display: none;">
+        <div class="selection-card-id" id="card-A-id" style="font-size: 20px; font-weight: 700; margin-bottom: 8px;">Scan #—</div>
+        <div id="card-A-date" style="margin-bottom: 4px;">Date : —</div>
+        <div id="card-A-findings" style="margin-bottom: 4px;">— alertes</div>
+        <div id="card-A-severity" style="margin-bottom: 4px;">— critiques / — hautes</div>
+        <div id="card-A-scanners" style="margin-bottom: 4px;">Couverture : —</div>
+        <div id="card-A-quality">Qualité : —</div>
+      </div>
+      <button class="btn-deselect" id="btn-deselect-A" style="display: none;">Désélectionner</button>
+    </div>
+
+    <!-- Card B -->
+    <div class="selection-card" id="selection-card-B">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <div class="selection-card-title" style="margin: 0;">Scan B — Après</div>
+        <span class="selection-label-badge label-B">B</span>
+      </div>
+      <div class="selection-card-empty" id="card-B-empty">Aucun scan sélectionné (comparé)</div>
+      <div class="selection-card-details" id="card-B-details" style="display: none;">
+        <div class="selection-card-id" id="card-B-id" style="font-size: 20px; font-weight: 700; margin-bottom: 8px;">Scan #—</div>
+        <div id="card-B-date" style="margin-bottom: 4px;">Date : —</div>
+        <div id="card-B-findings" style="margin-bottom: 4px;">— alertes</div>
+        <div id="card-B-severity" style="margin-bottom: 4px;">— critiques / — hautes</div>
+        <div id="card-B-scanners" style="margin-bottom: 4px;">Couverture : —</div>
+        <div id="card-B-quality">Qualité : —</div>
+      </div>
+      <button class="btn-deselect" id="btn-deselect-B" style="display: none;">Désélectionner</button>
+    </div>
+  </section>
+
+  <!-- Compare Action Button -->
+  <div class="compare-action-bar">
+    <button class="btn-primary" id="btn-compare-scans" disabled>Comparer les scans</button>
+  </div>
+
+  <!-- Warning Banner -->
+  <div class="warning-banner" id="warning-banner-toast"></div>
+
+  <!-- Available Scans Workspace -->
+  <section class="workspace-section">
+    <h2>Historique des scans disponibles</h2>
+
+    <!-- Filter bar -->
+    <div class="filter-bar" data-debug-theme-fix="scan-comparison-v3">
+      <input type="text" id="search-scan-input" placeholder="Rechercher par ID ou nom de projet...">
+
+      <select id="filter-status-select">
+        <option value="ALL">Tous les statuts</option>
+        <option value="Completed">Complets uniquement</option>
+        <option value="Partial">Partiels</option>
+      </select>
+
+      <select id="sort-order-select">
+        <option value="newest">Plus récent en premier</option>
+        <option value="oldest">Plus ancien en premier</option>
+      </select>
+
+      <label class="checkbox-label">
+        <input type="checkbox" id="comparable-only-checkbox">
+        Comparable uniquement
+      </label>
+    </div>
+
+    <!-- Scans Table -->
+    <div class="scans-table-wrapper">
+      <table class="scans-table">
+        <thead>
+          <tr>
+            <th style="width: 80px; text-align: center;">Sélection</th>
+            <th>Scan</th>
+            <th>Date / Heure</th>
+            <th>Alertes</th>
+            <th>Critical / High</th>
+            <th>Couverture scanners</th>
+            <th>Qualité</th>
+            <th style="width: 60px; text-align: center;">Détails</th>
+          </tr>
+        </thead>
+        <tbody id="scans-table-tbody">
+          <!-- Rows inserted via script -->
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Comparison Output -->
+  <section class="comparison-output-container" id="comparison-result-area">
+    <div class="workspace-section">
+      <h2 id="comparison-report-header">Rapport de comparaison : Scan #A → Scan #B</h2>
+
+      <!-- Metrics KPI row -->
+      <div class="metrics-summary-row">
+        <div class="metric-card" id="metric-before">
+          <strong id="metric-before-val">0</strong>
+          <small>Avant (A)</small>
+        </div>
+        <div class="metric-card" id="metric-after">
+          <strong id="metric-after-val">0</strong>
+          <small>Après (B)</small>
+        </div>
+        <div class="metric-card" id="metric-diff">
+          <strong id="metric-diff-val">0</strong>
+          <small>Différence absolue</small>
+        </div>
+        <div class="metric-card" id="metric-pct">
+          <strong id="metric-pct-val">0 %</strong>
+          <small>Évolution</small>
+        </div>
+      </div>
+
+      <!-- Quick stats summary counts -->
+      <div class="status-summary-grid">
+        <div class="status-summary-card resolved">
+          <small>Résolues</small>
+          <strong id="stat-count-resolved">0</strong>
+        </div>
+        <div class="status-summary-card new">
+          <small>Nouvelles</small>
+          <strong id="stat-count-new">0</strong>
+        </div>
+        <div class="status-summary-card unchanged">
+          <small>Inchangées</small>
+          <strong id="stat-count-unchanged">0</strong>
+        </div>
+        <div class="status-summary-card sevchanged">
+          <small>Sévérité modifiée</small>
+          <strong id="stat-count-sevchanged">0</strong>
+        </div>
+      </div>
+
+      <!-- Severity and Scanner comparison columns -->
+      <div class="output-grid-two-columns">
+        <!-- Severity Comp -->
+        <div>
+          <h3>Évolution par sévérité</h3>
+          <table class="compact-table">
+            <thead>
+              <tr>
+                <th>Sévérité</th>
+                <th>Avant</th>
+                <th>Après</th>
+                <th>Évolution</th>
+              </tr>
+            </thead>
+            <tbody id="severity-comp-tbody">
+              <!-- Severity rows -->
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Scanner Comp -->
+        <div>
+          <h3>Évolution par outil</h3>
+          <table class="compact-table">
+            <thead>
+              <tr>
+                <th>Scanner</th>
+                <th>Avant</th>
+                <th>Après</th>
+                <th>Évolution</th>
+              </tr>
+            </thead>
+            <tbody id="scanner-comp-tbody">
+              <!-- Scanner rows -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Category Breakdown -->
+      <div style="margin-bottom: 24px;">
+        <h3>Répartition par catégorie</h3>
+        <div style="border: 1px solid var(--vscode-panel-border); border-radius: 6px; background: var(--card-background);" id="category-breakdown-list">
+          <!-- Categories list -->
+        </div>
+      </div>
+
+      <!-- Timeline visual -->
+      <div>
+        <h3>Ligne temporelle</h3>
+        <div class="timeline-wrapper">
+          <div class="timeline-node">
+            <strong id="timeline-A-title">Scan #A</strong>
+            <div style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px;" id="timeline-A-time">—</div>
+          </div>
+          <div class="timeline-arrow"></div>
+          <div class="timeline-elapsed" id="timeline-elapsed-text">Écart : —</div>
+          <div class="timeline-arrow"></div>
+          <div class="timeline-node">
+            <strong id="timeline-B-title">Scan #B</strong>
+            <div style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px;" id="timeline-B-time">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Findings Diff tab list -->
+      <div style="margin-top: 30px;">
+        <h3>Détail des alertes comparées</h3>
+        <div class="tabs-nav">
+          <button class="tab-btn active" data-tab="tab-new" id="tab-btn-new">Nouvelles (<span id="tab-count-new">0</span>)</button>
+          <button class="tab-btn" data-tab="tab-resolved" id="tab-btn-resolved">Disparues (<span id="tab-count-resolved">0</span>)</button>
+          <button class="tab-btn" data-tab="tab-persistent" id="tab-btn-persistent">Persistantes (<span id="tab-count-persistent">0</span>)</button>
+          <button class="tab-btn" data-tab="tab-sevchanged" id="tab-btn-sevchanged">Sévérité modifiée (<span id="tab-count-sevchanged">0</span>)</button>
+        </div>
+
+        <div class="tab-content active" id="tab-new">
+          <div class="findings-list-wrapper" id="list-new-findings"></div>
+        </div>
+        <div class="tab-content" id="tab-resolved">
+          <div class="findings-list-wrapper" id="list-resolved-findings"></div>
+        </div>
+        <div class="tab-content" id="tab-persistent">
+          <div class="findings-list-wrapper" id="list-persistent-findings"></div>
+        </div>
+        <div class="tab-content" id="tab-sevchanged">
+          <div class="findings-list-wrapper" id="list-sevchanged-findings"></div>
+        </div>
+      </div>
+
+      <!-- Technical details -->
+      <details class="raw-details-summary">
+        <summary>Détails techniques de comparaison</summary>
+        <div class="raw-details-content" style="font-size: 13px; padding: 14px;">
+          <div style="margin-bottom: 8px;"><strong>Outils comparés :</strong> <span id="raw-comparable-tools">—</span></div>
+          <div><strong>Outils exclus (non complétés dans les deux scans) :</strong> <span id="raw-excluded-tools">—</span></div>
+        </div>
+      </details>
+    </div>
+  </section>`;
+
+  return renderSecurityCenterShell({
+    surface: 'compare-scans',
+    nonce,
+    theme: selectedTheme,
+    title: 'Comparer les scans',
+    subtitle: 'Comparez deux états de sécurité du projet',
+    content,
+    styles: `
 
 
 
@@ -133,21 +374,7 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
       --vscode-panel-border: var(--sc-border);
     }
 
-    html, body {
-      background: var(--page-background);
-      color: var(--vscode-foreground);
-      font-family: var(--vscode-font-family);
-      margin: 0;
-      padding: 0;
-      min-height: 100vh;
-    }
-
-    body {
-      padding: 24px;
-      max-width: 1200px;
-      margin: auto;
-      box-sizing: border-box;
-    }
+    body { background: var(--page-background); color: var(--vscode-foreground); }
 
     /* Page Header */
     .page-header {
@@ -1084,260 +1311,8 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
         border-right: 4px solid transparent;
         border-top: 5px solid var(--vscode-panel-border);
       }
-    }
-  </style>
-</head>
-<body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
-  <!-- Page Header -->
-  <header class="page-header">
-    <div>
-      <h1>Comparer les scans</h1>
-      <p>Comparez deux états de sécurité du projet.</p>
-    </div>
-    <button class="btn-secondary" id="btn-back-dashboard">← Dashboard</button>
-  </header>
-
-  <!-- Selection Cards -->
-  <section class="selection-cards">
-    <!-- Card A -->
-    <div class="selection-card" id="selection-card-A">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-        <div class="selection-card-title" style="margin: 0;">Scan A — Avant</div>
-        <span class="selection-label-badge label-A">A</span>
-      </div>
-      <div class="selection-card-empty" id="card-A-empty">Aucun scan sélectionné (référence)</div>
-      <div class="selection-card-details" id="card-A-details" style="display: none;">
-        <div class="selection-card-id" id="card-A-id" style="font-size: 20px; font-weight: 700; margin-bottom: 8px;">Scan #—</div>
-        <div id="card-A-date" style="margin-bottom: 4px;">Date : —</div>
-        <div id="card-A-findings" style="margin-bottom: 4px;">— alertes</div>
-        <div id="card-A-severity" style="margin-bottom: 4px;">— critiques / — hautes</div>
-        <div id="card-A-scanners" style="margin-bottom: 4px;">Couverture : —</div>
-        <div id="card-A-quality">Qualité : —</div>
-      </div>
-      <button class="btn-deselect" id="btn-deselect-A" style="display: none;">Désélectionner</button>
-    </div>
-
-    <!-- Card B -->
-    <div class="selection-card" id="selection-card-B">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-        <div class="selection-card-title" style="margin: 0;">Scan B — Après</div>
-        <span class="selection-label-badge label-B">B</span>
-      </div>
-      <div class="selection-card-empty" id="card-B-empty">Aucun scan sélectionné (comparé)</div>
-      <div class="selection-card-details" id="card-B-details" style="display: none;">
-        <div class="selection-card-id" id="card-B-id" style="font-size: 20px; font-weight: 700; margin-bottom: 8px;">Scan #—</div>
-        <div id="card-B-date" style="margin-bottom: 4px;">Date : —</div>
-        <div id="card-B-findings" style="margin-bottom: 4px;">— alertes</div>
-        <div id="card-B-severity" style="margin-bottom: 4px;">— critiques / — hautes</div>
-        <div id="card-B-scanners" style="margin-bottom: 4px;">Couverture : —</div>
-        <div id="card-B-quality">Qualité : —</div>
-      </div>
-      <button class="btn-deselect" id="btn-deselect-B" style="display: none;">Désélectionner</button>
-    </div>
-  </section>
-
-  <!-- Compare Action Button -->
-  <div class="compare-action-bar">
-    <button class="btn-primary" id="btn-compare-scans" disabled>Comparer les scans</button>
-  </div>
-
-  <!-- Warning Banner -->
-  <div class="warning-banner" id="warning-banner-toast"></div>
-
-  <!-- Available Scans Workspace -->
-  <section class="workspace-section">
-    <h2>Historique des scans disponibles</h2>
-    
-    <!-- Filter bar -->
-    <div class="filter-bar" data-debug-theme-fix="scan-comparison-v3">
-      <input type="text" id="search-scan-input" placeholder="Rechercher par ID ou nom de projet...">
-      
-      <select id="filter-status-select">
-        <option value="ALL">Tous les statuts</option>
-        <option value="Completed">Complets uniquement</option>
-        <option value="Partial">Partiels</option>
-      </select>
-      
-      <select id="sort-order-select">
-        <option value="newest">Plus récent en premier</option>
-        <option value="oldest">Plus ancien en premier</option>
-      </select>
-
-      <label class="checkbox-label">
-        <input type="checkbox" id="comparable-only-checkbox">
-        Comparable uniquement
-      </label>
-    </div>
-
-    <!-- Scans Table -->
-    <div class="scans-table-wrapper">
-      <table class="scans-table">
-        <thead>
-          <tr>
-            <th style="width: 80px; text-align: center;">Sélection</th>
-            <th>Scan</th>
-            <th>Date / Heure</th>
-            <th>Alertes</th>
-            <th>Critical / High</th>
-            <th>Couverture scanners</th>
-            <th>Qualité</th>
-            <th style="width: 60px; text-align: center;">Détails</th>
-          </tr>
-        </thead>
-        <tbody id="scans-table-tbody">
-          <!-- Rows inserted via script -->
-        </tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Comparison Output -->
-  <section class="comparison-output-container" id="comparison-result-area">
-    <div class="workspace-section">
-      <h2 id="comparison-report-header">Rapport de comparaison : Scan #A → Scan #B</h2>
-      
-      <!-- Metrics KPI row -->
-      <div class="metrics-summary-row">
-        <div class="metric-card" id="metric-before">
-          <strong id="metric-before-val">0</strong>
-          <small>Avant (A)</small>
-        </div>
-        <div class="metric-card" id="metric-after">
-          <strong id="metric-after-val">0</strong>
-          <small>Après (B)</small>
-        </div>
-        <div class="metric-card" id="metric-diff">
-          <strong id="metric-diff-val">0</strong>
-          <small>Différence absolue</small>
-        </div>
-        <div class="metric-card" id="metric-pct">
-          <strong id="metric-pct-val">0 %</strong>
-          <small>Évolution</small>
-        </div>
-      </div>
-
-      <!-- Quick stats summary counts -->
-      <div class="status-summary-grid">
-        <div class="status-summary-card resolved">
-          <small>Résolues</small>
-          <strong id="stat-count-resolved">0</strong>
-        </div>
-        <div class="status-summary-card new">
-          <small>Nouvelles</small>
-          <strong id="stat-count-new">0</strong>
-        </div>
-        <div class="status-summary-card unchanged">
-          <small>Inchangées</small>
-          <strong id="stat-count-unchanged">0</strong>
-        </div>
-        <div class="status-summary-card sevchanged">
-          <small>Sévérité modifiée</small>
-          <strong id="stat-count-sevchanged">0</strong>
-        </div>
-      </div>
-
-      <!-- Severity and Scanner comparison columns -->
-      <div class="output-grid-two-columns">
-        <!-- Severity Comp -->
-        <div>
-          <h3>Évolution par sévérité</h3>
-          <table class="compact-table">
-            <thead>
-              <tr>
-                <th>Sévérité</th>
-                <th>Avant</th>
-                <th>Après</th>
-                <th>Évolution</th>
-              </tr>
-            </thead>
-            <tbody id="severity-comp-tbody">
-              <!-- Severity rows -->
-            </tbody>
-          </table>
-        </div>
-
-        <!-- Scanner Comp -->
-        <div>
-          <h3>Évolution par outil</h3>
-          <table class="compact-table">
-            <thead>
-              <tr>
-                <th>Scanner</th>
-                <th>Avant</th>
-                <th>Après</th>
-                <th>Évolution</th>
-              </tr>
-            </thead>
-            <tbody id="scanner-comp-tbody">
-              <!-- Scanner rows -->
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- Category Breakdown -->
-      <div style="margin-bottom: 24px;">
-        <h3>Répartition par catégorie</h3>
-        <div style="border: 1px solid var(--vscode-panel-border); border-radius: 6px; background: var(--card-background);" id="category-breakdown-list">
-          <!-- Categories list -->
-        </div>
-      </div>
-
-      <!-- Timeline visual -->
-      <div>
-        <h3>Ligne temporelle</h3>
-        <div class="timeline-wrapper">
-          <div class="timeline-node">
-            <strong id="timeline-A-title">Scan #A</strong>
-            <div style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px;" id="timeline-A-time">—</div>
-          </div>
-          <div class="timeline-arrow"></div>
-          <div class="timeline-elapsed" id="timeline-elapsed-text">Écart : —</div>
-          <div class="timeline-arrow"></div>
-          <div class="timeline-node">
-            <strong id="timeline-B-title">Scan #B</strong>
-            <div style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px;" id="timeline-B-time">—</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Findings Diff tab list -->
-      <div style="margin-top: 30px;">
-        <h3>Détail des alertes comparées</h3>
-        <div class="tabs-nav">
-          <button class="tab-btn active" data-tab="tab-new" id="tab-btn-new">Nouvelles (<span id="tab-count-new">0</span>)</button>
-          <button class="tab-btn" data-tab="tab-resolved" id="tab-btn-resolved">Disparues (<span id="tab-count-resolved">0</span>)</button>
-          <button class="tab-btn" data-tab="tab-persistent" id="tab-btn-persistent">Persistantes (<span id="tab-count-persistent">0</span>)</button>
-          <button class="tab-btn" data-tab="tab-sevchanged" id="tab-btn-sevchanged">Sévérité modifiée (<span id="tab-count-sevchanged">0</span>)</button>
-        </div>
-
-        <div class="tab-content active" id="tab-new">
-          <div class="findings-list-wrapper" id="list-new-findings"></div>
-        </div>
-        <div class="tab-content" id="tab-resolved">
-          <div class="findings-list-wrapper" id="list-resolved-findings"></div>
-        </div>
-        <div class="tab-content" id="tab-persistent">
-          <div class="findings-list-wrapper" id="list-persistent-findings"></div>
-        </div>
-        <div class="tab-content" id="tab-sevchanged">
-          <div class="findings-list-wrapper" id="list-sevchanged-findings"></div>
-        </div>
-      </div>
-
-      <!-- Technical details -->
-      <details class="raw-details-summary">
-        <summary>Détails techniques de comparaison</summary>
-        <div class="raw-details-content" style="font-size: 13px; padding: 14px;">
-          <div style="margin-bottom: 8px;"><strong>Outils comparés :</strong> <span id="raw-comparable-tools">—</span></div>
-          <div><strong>Outils exclus (non complétés dans les deux scans) :</strong> <span id="raw-excluded-tools">—</span></div>
-        </div>
-      </details>
-    </div>
-  </section>
-
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
+    }`,
+    script: `    const vscode = window.__scShellApi || acquireVsCodeApi();
 
     // Safe date formatting helper to prevent RangeError: Invalid time value
     function formatDate(dateVal) {
@@ -1400,11 +1375,6 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
         quality: quality,
         raw: s
       };
-    });
-
-    // Handle back dashboard
-    document.getElementById('btn-back-dashboard').addEventListener('click', () => {
-      vscode.postMessage({ command: 'openDashboard' });
     });
 
     // Handle Selection deselect buttons
@@ -2052,10 +2022,9 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
       }
     }
 
-    preselectDefaultScans();
-  </script>
-</body>
-</html>`;
+    preselectDefaultScans();`,
+    csp: `default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+  });
 }
 
 module.exports = { findingIdentity, completedTools, compareScans, renderScanComparisonHtml };

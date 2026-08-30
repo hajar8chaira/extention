@@ -203,7 +203,16 @@ test('une image absente est annoncée sans prétendre l’avoir téléchargée',
 test('le mode local affiche version et emplacement', async () => {
   const html = await renderWith('semgrep', { configuredMode: 'local' });
   assert.match(html, /<dt>Version<\/dt><dd>1\.0\.0<\/dd>/);
-  assert.match(html, /<dt>Emplacement<\/dt><dd class="path">\/bin\/semgrep<\/dd>/);
+  assert.match(html, /<dt>Emplacement<\/dt><dd class="path" title="\/bin\/semgrep">\/bin\/semgrep<\/dd>/);
+});
+
+test('la carte scanner modernisee garde les logos, modes segmentes et actions existantes', async () => {
+  const html = await renderWith('gitleaks', { configuredMode: 'auto' });
+  assert.match(html, /class="tool-identity"[\s\S]*data-scanner-logo="gitleaks"/);
+  assert.match(html, /class="actions mode-selector"/);
+  assert.match(html, /class="mode-option" data-scanner-mode="auto" data-scanner="gitleaks"[^>]*aria-current="true"/);
+  assert.match(html, /class="actions maintenance-actions"/);
+  assert.match(html, /data-recheck="gitleaks"/);
 });
 
 test('un scanner épinglé sur Docker ne propose plus d’installation locale', async () => {
@@ -261,6 +270,9 @@ test('la page conserve les quatre scanners et SonarQube côte à côte', async (
 test('le thème sombre reste pris en charge par la page enrichie', async () => {
   const statuses = [{ ...status('semgrep'), diagnostic: await diagnose('semgrep', { configuredMode: 'auto', status: status('semgrep') }) }];
   const html = renderScannerSetupHtml(statuses, 'n', 'dark', {}, null, null);
-  assert.match(html, /<html data-theme="dark">/);
-  assert.match(html, /body class="theme-dark"/);
+  assert.match(html, /<html lang="fr" data-theme="dark">/);
+  assert.match(html, /body class="theme-dark[^"]*"/);
+  // La page est desormais hebergee par le cadre applicatif partage.
+  assert.match(html, /class="sc-internal-nav"/);
+  assert.match(html, /<button class="sc-nav-item active"[^>]*data-command="securityCenter\.openScannerSetup"/);
 });

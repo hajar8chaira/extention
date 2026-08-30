@@ -38,20 +38,17 @@ function pageProvider({ state = 'clean', findings = [], pipeline = {}, executed 
 
 // ------------------------------------------------ mouvements par état
 
-test('chaque état visuel a des mouvements réels, sur les membres existants', () => {
+test('chaque état visuel a un mouvement CSS leger sur l’image locale', () => {
   const css = mascotCss();
   const expected = {
-    idle: [/\.mascot-idle \.sc-figure\{animation:sc-breathe/, /\.mascot-idle \.sc-eye-dot\{opacity:1;animation:sc-blink/],
-    watching: [/\.mascot-watching \.sc-eyes\{animation:sc-look/, /\.mascot-watching \.sc-head\{animation:sc-tilt-soft/, /\.mascot-watching \.sc-arm-right\{animation:sc-point/],
-    thinking: [/\.mascot-thinking \.sc-scanline\{opacity:\.9;animation:sc-scan/, /\.mascot-thinking \.sc-dots\{opacity:1\}/, /\.mascot-thinking \.sc-arm-right\{animation:sc-work/, /\.mascot-thinking \.sc-figure\{animation:sc-hop/],
-    warning: [/\.mascot-warning \.sc-figure\{animation:sc-recoil/, /\.mascot-warning \.sc-eye-alert\{opacity:1/, /\.mascot-warning \.sc-arm-left\{animation:sc-raise-left/],
-    critical: [/\.mascot-critical \.sc-arm-left\{transform:rotate\(-42deg\)\}/, /\.mascot-critical \.sc-arm-right\{transform:rotate\(42deg\)\}/, /\.mascot-critical \.sc-figure\{animation:sc-pulse 2s/],
-    success: [/\.mascot-success \.sc-figure\{animation:sc-jump/, /\.mascot-success \.sc-arm-left\{animation:sc-cheer-left/, /\.mascot-success \.sc-check\{opacity:1/],
-    error: [/\.mascot-error \.sc-figure\{animation:sc-shake/, /\.mascot-error \.sc-eye-cross\{opacity:1/, /\.mascot-error \.sc-arm-left\{transform:rotate\(-28deg\)\}/],
-    // Le corps s'abaisse : c'est la posture qui compte, pas le nombre exact de
-    // pixels. L'ancienne assertion figeait 6px et cassait dès que la pose a été
-    // approfondie, sans rien garantir de plus sur l'UX.
-    sleeping: [/\.mascot-sleeping \.sc-figure\{transform:translateY\([1-9]\d*px\)/, /\.mascot-sleeping \.sc-eye-closed\{opacity:1\}/, /\.mascot-sleeping \.sc-zzz\{opacity:1\}/]
+    idle: [/\.mascot-idle,\.mascot-watching\{animation:sc-breathe/, /@keyframes sc-breathe\{[\s\S]*translateY\(-3px\) scale\(1\.012\)/],
+    watching: [/\.mascot-idle,\.mascot-watching\{animation:sc-breathe/],
+    thinking: [/\.mascot-thinking\{animation:sc-scan/, /@keyframes sc-scan\{[\s\S]*drop-shadow\(0 0 22px var\(--sc-accent/],
+    warning: [/\.mascot-warning\{animation:sc-attend/, /@keyframes sc-attend\{[\s\S]*translateY\(-2px\) scale\(1\.014\)/],
+    critical: [/\.mascot-critical\{animation:sc-pulse 2s/, /@keyframes sc-pulse\{[\s\S]*drop-shadow\(0 0 24px var\(--sc-danger/],
+    success: [/\.mascot-success\{animation:sc-success-pulse/, /@keyframes sc-success-pulse\{[\s\S]*translateY\(-2px\) scale\(1\.01\)/],
+    error: [/\.mascot-error\{animation:sc-shake/, /@keyframes sc-shake\{[\s\S]*translateX\(-2px\)/],
+    sleeping: [/\.mascot-sleeping\{opacity:\.72;transform:translateY\(8px\)\}/]
   };
   for (const [state, patterns] of Object.entries(expected)) {
     for (const pattern of patterns) assert.match(css, pattern, `${state} : ${pattern} absent`);
@@ -65,20 +62,14 @@ test('chaque état visuel a des mouvements réels, sur les membres existants', (
 test('les états d’alerte ne clignotent pas et les états calmes ne s’agitent pas', () => {
   const css = mascotCss();
   // Le critique pulse lentement — jamais un stroboscope.
-  const pulse = css.match(/\.mascot-critical \.sc-figure\{animation:sc-pulse (\d+(?:\.\d+)?)s/);
+  const pulse = css.match(/\.mascot-critical\{animation:sc-pulse (\d+(?:\.\d+)?)s/);
   assert.ok(pulse && Number(pulse[1]) >= 1.5, 'la pulsation critique doit rester lente');
-  // Le sommeil n'a qu'un Zz qui flotte, rien sur le corps.
-  assert.ok(!/\.mascot-sleeping \.sc-figure\{animation/.test(css), 'le sommeil ne doit pas animer le corps');
-  // Warning et success se jouent un nombre fini de fois. La réaction peut être
-  // composée avec la respiration de repos — ce qui compte est qu'aucune des deux
-  // ne boucle : l'ancienne assertion exigeait que le saut soit la seule
-  // animation, ce qui interdisait la composition sans rien protéger de plus.
-  const finiteCount = (state, name, count) =>
-    new RegExp(`\\.mascot-${state} \\.sc-figure\\{animation:${name} [\\d.]+s [^;}]*?\\b${count}\\b`);
-  assert.match(css, finiteCount('warning', 'sc-recoil', 2), 'le recul d’alerte doit être fini');
-  assert.match(css, finiteCount('success', 'sc-jump', 1), 'le saut de succès doit être fini');
-  assert.ok(!/animation:sc-recoil [\d.]+s [^,;}]*infinite/.test(css), 'le recul ne boucle jamais');
-  assert.ok(!/animation:sc-jump [\d.]+s [^,;}]*infinite/.test(css), 'le saut ne boucle jamais');
+  // Le sommeil est une pose statique, pas une animation continue.
+  assert.ok(!/\.mascot-sleeping\{[^}]*animation/.test(css), 'le sommeil ne doit pas animer le corps');
+  // Warning et success restent lents et subtils, sans secousse agressive.
+  assert.match(css, /\.mascot-warning\{animation:sc-attend 2\.8s ease-in-out infinite\}/);
+  assert.match(css, /\.mascot-success\{animation:sc-success-pulse 4\.8s ease-in-out infinite\}/);
+  assert.ok(!/bounce|spin|rotate\([^)]*360deg|requestAnimationFrame/.test(css), 'pas d animation distrayante ou JS');
   // La seule animation d'opacité des états d'alerte reste lente : c'est elle
   // qui produirait un stroboscope si elle accélérait.
   for (const [, duration] of css.matchAll(/animation:sc-pulse ([\d.]+)s/g)) {
@@ -90,9 +81,9 @@ test('aucune animation ne planifie de travail et le mouvement est désactivable 
   const css = mascotCss();
   assert.ok(!/requestAnimationFrame|setInterval|setTimeout/.test(css));
   assert.match(css, /@media\(prefers-reduced-motion:reduce\)/);
-  assert.match(css, /\.no-motion \.mascot \*\{animation:none!important/);
+  assert.match(css, /\.no-motion \.mascot\{animation:none!important/);
   const widgetCss = companionWidgetCss();
-  assert.match(widgetCss, /\.sc-no-motion \.mascot \*\{animation:none!important\}/);
+  assert.match(widgetCss, /\.sc-no-motion \.mascot\{animation:none!important;transition:none!important\}/);
   // Et le composant lui-même n'ouvre aucune boucle.
   const widget = fs.readFileSync(path.join(__dirname, '..', 'src', 'live', 'companionWidget.js'), 'utf8');
   assert.ok(!/setInterval|setTimeout|requestAnimationFrame/.test(widget), 'aucun minuteur dans le composant');

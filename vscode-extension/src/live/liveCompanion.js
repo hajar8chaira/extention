@@ -128,7 +128,7 @@ function renderCompanionHtml(model, nonce, companionImageUri = '', cspSource = '
         ${detail ? `<span class="bubble-detail">${escapeHtml(detail)}</span>` : ''}
       </button>
       <button class="mascot-button" data-action="mascot" title="Security Companion" aria-label="Security Companion">
-        ${renderMascotSvg(visual)}
+        ${renderMascotSvg(visual, 'Security Companion', { src: companionImageUri })}
       </button>
       ${model.findings.length ? `<div class="tally"><strong>${model.findings.length} ${model.findings.length === 1 ? 'Live issue' : 'Live issues'}</strong>${breakdown ? `<span>${escapeHtml(breakdown)}</span>` : ''}</div>` : ''}
     </div>

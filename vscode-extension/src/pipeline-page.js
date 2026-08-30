@@ -14,8 +14,11 @@
  */
 
 const { dataAvailability } = require('./pipeline');
+const { STATE_LABELS: VERIFICATION_LABELS, REASON_LABELS: VERIFICATION_REASONS } = require('./fix-verification');
 const { renderCompanionWidget, companionWidgetCss } = require('./live/companionWidget');
-const { themeOverridesCss } = require('./theme-controller');
+const { renderSecurityCenterShell } = require('./security-center-shell');
+const { buildAssistantCardModel, renderAssistantCard, assistantCardCss, assistantCardScript } = require('./companion-assistant-card');
+const { scannerLogoUri } = require('./scanner-presentation');
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
@@ -72,7 +75,8 @@ const TABS = Object.freeze([
   ['reachability', 'Reachability'],
   ['priorities', 'Priorités'],
   ['policy', 'Policy Gate'],
-  ['supply-chain', 'Supply Chain']
+  ['supply-chain', 'Supply Chain'],
+  ['remediation', 'Corrections']
 ]);
 
 /**
@@ -157,15 +161,25 @@ function getStatusBadge(state) {
   return `<span class="status-badge ${badge.cssClass}" title="${escapeHtml(stateLabel)}">${escapeHtml(badge.label)} <small class="state-label-text" style="display: none;">${escapeHtml(stateLabel)}</small></span>`;
 }
 
-function renderScanCard(stage) {
-  const toolsLabel = stage.tools && stage.tools.length ? stage.tools.join(' · ') : '';
+function renderToolBadge(tool, assets = {}, className = 'tool-chip') {
+  const uri = scannerLogoUri(tool, assets);
+  return `<span class="${escapeHtml(className)}" title="${escapeHtml(tool)}">
+      ${uri ? `<img class="tool-logo-img" src="${escapeHtml(uri)}" alt="${escapeHtml(tool)} logo" loading="lazy">` : ''}
+      <span>${escapeHtml(tool)}</span>
+    </span>`;
+}
+
+function renderScanCard(stage, assets = {}) {
+  const toolBadges = Array.isArray(stage.tools) && stage.tools.length
+    ? stage.tools.map((tool) => renderToolBadge(tool, assets)).join('')
+    : '';
   return `<div class="pipeline-card ${escapeHtml(stateClass(stage.state))}" data-stage="${escapeHtml(stage.id)}" tabindex="0" role="button" aria-label="${escapeHtml(stage.label)} — ${escapeHtml(STATE_LABELS[stage.state] || stage.state)}">
       <div class="card-top">
-        <span class="card-icon">◇</span>
+        <span class="card-icon" aria-hidden="true">◇</span>
         <span class="card-title">${escapeHtml(stage.label)}</span>
         ${getStatusBadge(stage.state)}
       </div>
-      ${toolsLabel ? `<div class="card-subtitle">${escapeHtml(toolsLabel)}</div>` : ''}
+      ${toolBadges ? `<div class="card-tools">${toolBadges}</div>` : ''}
       <p class="card-detail">${escapeHtml(stage.detail || 'Aucun résultat')}</p>
     </div>`;
 }
@@ -228,7 +242,7 @@ function renderPolicyBanner(model) {
     </div>`;
 }
 
-function renderVisualPipelineFlowHtml(model, stages) {
+function renderVisualPipelineFlowHtml(model, stages, assets = {}) {
   const scans = stages.filter((stage) => stage.kind === 'scan');
   const intelligenceFailed = model.intelligence?.status === 'failed';
   
@@ -279,7 +293,7 @@ function renderVisualPipelineFlowHtml(model, stages) {
       symbol = '×';
       cssClass = 'status-failed';
     }
-    scannerStatuses.push({ name: tool, symbol, cssClass });
+    scannerStatuses.push({ name: tool, symbol, cssClass, logoUri: scannerLogoUri(tool, assets) });
   }
 
   // 3. SECURITY INTELLIGENCE state
@@ -420,7 +434,7 @@ function renderVisualPipelineFlowHtml(model, stages) {
           <div class="node-label">DETECTION</div>
           <div class="node-sub">Security Scanners</div>
           <div class="node-scanners-micro">
-            ${scannerStatuses.map(s => `<span class="micro-scanner ${escapeHtml(s.cssClass)}" title="${escapeHtml(s.name)}">${escapeHtml(s.name[0])}<small style="margin-left: 2px;">${escapeHtml(s.symbol)}</small></span>`).join('')}
+            ${scannerStatuses.map(s => `<span class="micro-scanner ${escapeHtml(s.cssClass)}" title="${escapeHtml(s.name)}">${s.logoUri ? `<img class="micro-scanner-logo" src="${escapeHtml(s.logoUri)}" alt="${escapeHtml(s.name)} logo" loading="lazy">` : `<span>${escapeHtml(s.name[0])}</span>`}<small>${escapeHtml(s.symbol)}</small></span>`).join('')}
           </div>
         </div>
       </div>
@@ -474,7 +488,7 @@ function renderVisualPipelineFlowHtml(model, stages) {
   `;
 }
 
-function renderPipelineTab(model) {
+function renderPipelineTab(model, assets = {}) {
   const stages = model.stages || [];
   const intelligenceFailed = model.intelligence?.status === 'failed';
   
@@ -498,13 +512,13 @@ function renderPipelineTab(model) {
   }
 
   return `${intelligenceBanner}
-    ${renderVisualPipelineFlowHtml(model, stages)}
+    ${renderVisualPipelineFlowHtml(model, stages, assets)}
     <div class="pipeline-flow">
       <!-- Section 1: ANALYSE -->
       <section class="flow-section">
         <h3 class="flow-section-title">1. ANALYSE</h3>
         <div class="pipeline-grid">
-          ${scans.map(renderScanCard).join('')}
+          ${scans.map((stage) => renderScanCard(stage, assets)).join('')}
         </div>
       </section>
 
@@ -517,7 +531,7 @@ function renderPipelineTab(model) {
           <div class="intelligence-row">
             ${intelligenceItems.map(stage => `
               <div class="intel-subcard ${escapeHtml(stateClass(stage.state))}" data-stage="${escapeHtml(stage.id)}" tabindex="0" role="button" aria-label="${escapeHtml(stage.label)} — ${escapeHtml(STATE_LABELS[stage.state] || stage.state)}">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <div class="intel-subcard-head">
                   <span class="intel-subcard-title">${escapeHtml(stage.label)}</span>
                   ${getStatusBadge(stage.state)}
                 </div>
@@ -789,6 +803,87 @@ function renderReachabilityTab(model) {
     ${renderScanFooter(model)}`;
 }
 
+/**
+ * Corrections appliquées.
+ *
+ * Reads what the fix lifecycle already stores on each finding — no second
+ * persistence, no second correction engine. A finding qualifies when it carries
+ * a fix source, an applied timestamp or a verification verdict.
+ *
+ * Deliberately absent: a before/after diff. Security Center persists the
+ * rollback text for the *last* patch only, in memory; there is no per-finding
+ * diff to reuse, so none is shown and no « Voir le diff » button is offered
+ * rather than rendering one that would be dead for every historical entry.
+ */
+const REMEDIATION_STATES = Object.freeze(['fixed', 'validating', 'validated', 'still_present', 'validation_failed', 'inconclusive', 'regressed']);
+
+const FIX_SOURCE_LABELS = Object.freeze({
+  ai: 'Correction IA (Ollama)',
+  'quick-fix': 'Quick Fix déterministe',
+  quickfix: 'Quick Fix déterministe',
+  manual: 'Correction manuelle'
+});
+
+const REMEDIATION_TONE = Object.freeze({
+  validated: 'ok', still_present: 'bad', regressed: 'bad',
+  validation_failed: 'warn', inconclusive: 'warn', fixed: 'muted', validating: 'muted'
+});
+
+function appliedCorrections(findings = []) {
+  return findings
+    .map((finding, index) => ({ finding, index }))
+    .filter(({ finding }) => finding && (finding.fixSource || finding.fixedAt || finding.verification
+      || REMEDIATION_STATES.includes(String(finding.triageStatus || ''))))
+    .sort((left, right) => String(right.finding.fixedAt || right.finding.verification?.at || '')
+      .localeCompare(String(left.finding.fixedAt || left.finding.verification?.at || '')));
+}
+
+function localTime(value) {
+  if (!value) return '';
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? new Date(time).toLocaleString('fr-FR') : '';
+}
+
+function remediationRow({ finding, index }) {
+  const status = String(finding.triageStatus || '');
+  const verification = finding.verification || null;
+  const location = [finding.file || finding.endpoint || '', finding.startLine ? `:${finding.startLine}` : ''].join('');
+  // Chaque ligne n'affiche que ce qui existe reellement.
+  const facts = [
+    ['Source', FIX_SOURCE_LABELS[String(finding.fixSource || '').toLowerCase()] || (finding.fixSource ? String(finding.fixSource) : '')],
+    ['Appliquée le', localTime(finding.fixedAt)],
+    ['Vérificateur', verification?.evidence?.tool || verification?.validator || ''],
+    ['Vérifiée le', localTime(verification?.at)],
+    ['Résultat', verification?.reason ? (VERIFICATION_REASONS[verification.reason] || verification.reason) : ''],
+    ['Scan de vérification', verification?.evidence?.scanId != null ? String(verification.evidence.scanId) : ''],
+    ['Résumé du modèle', finding.aiSummary || '']
+  ].filter(([, value]) => String(value || '').trim());
+  return `<article class="card compact remediation-entry">
+      <div class="card-head">
+        <div><strong>${escapeHtml(finding.title || 'Finding')}</strong><small>${escapeHtml(finding.tool || '')}${finding.ruleId ? ` · ${escapeHtml(finding.ruleId)}` : ''}${location ? ` · ${escapeHtml(location)}` : ''}</small></div>
+        <span class="state-chip ${escapeHtml(REMEDIATION_TONE[status] || 'muted')}">${escapeHtml(VERIFICATION_LABELS[status] || status || '—')}</span>
+      </div>
+      <dl class="remediation-facts">${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>
+      <div class="actions">
+        <button class="secondary" data-remediation-finding="${index}">Voir le finding</button>
+        ${finding.absolutePath ? `<button class="secondary" data-remediation-code="${index}">Ouvrir le code</button>` : ''}
+        <button class="secondary" data-remediation-verify="${index}">${status === 'validated' ? 'Revérifier' : 'Vérifier'}</button>
+      </div>
+    </article>`;
+}
+
+function renderRemediationTab(model) {
+  const entries = appliedCorrections(model.findings || []);
+  return `<section class="tab-panel">
+    <div class="section-heading"><span>Corrections appliquées</span></div>
+    <p class="tab-intro">Ce que Security Center a réellement appliqué et vérifié, dans l’ordre le plus récent d’abord.</p>
+    <p class="remediation-caveat">« Validée » signifie que le finding d’origine n’était plus signalé par le scanner de vérification concerné. Cela ne remplace pas un test fonctionnel.</p>
+    ${entries.length
+      ? `<div class="card-grid">${entries.map(remediationRow).join('')}</div>`
+      : '<div class="empty-state">Aucune correction appliquée pour l’instant. Une correction apparaît ici dès qu’un patch est appliqué à un finding.</div>'}
+  </section>`;
+}
+
 function renderPrioritiesTab(model) {
   const summary = model.priority;
   const empty = renderAvailability(availabilityFor(model, 'priorities', {
@@ -895,22 +990,173 @@ function renderSupplyChainTab(model) {
     </article>`;
 }
 
-function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
+/**
+ * Le rail de contexte de Security Pipeline.
+ *
+ * Chaque nombre vient d'un resume que le pipeline a REELLEMENT produit :
+ * `model.correlation` (correlation-v2), `model.reachability` (reachability),
+ * `model.priority` (prioritization) et `model.policy` (policy-gate). Le rail ne
+ * recalcule rien, ne repondere rien et n'affiche aucune carte dont les faits
+ * manquent — un resume absent fait disparaitre sa carte, il ne devient pas zero.
+ */
+function renderPipelineRail(model, assistantCard) {
+  const cards = [];
+
+  // Etat du dernier passage. `scanId` et `finishedAt` sont persistes par le
+  // pipeline ; « restaure » dit que les donnees viennent du workspaceState.
+  if (model.scanId || model.finishedAt) {
+    const intelligenceFailed = model.intelligence?.status === 'failed';
+    cards.push(`<section class="sc-context-card rail-card">
+      <div class="rail-head"><strong>Dernier passage</strong>
+        <span class="rail-pill ${intelligenceFailed ? 'bad' : 'ok'}">${intelligenceFailed ? '✕ Partiel' : '✓ Terminé'}</span></div>
+      <div class="rail-facts">
+        ${model.scanId ? `<div class="rail-fact"><span>Scan</span><strong title="${escapeHtml(String(model.scanId))}">${escapeHtml(String(model.scanId))}</strong></div>` : ''}
+        ${model.finishedAt ? `<div class="rail-fact"><span>Terminé</span><strong>${escapeHtml(new Date(model.finishedAt).toLocaleString('fr-FR'))}</strong></div>` : ''}
+        <div class="rail-fact"><span>Findings</span><strong>${escapeHtml(String((model.findings || []).length))}</strong></div>
+        ${model.restored ? '<div class="rail-fact"><span>Source</span><strong>Restauré</strong></div>' : ''}
+      </div>
+    </section>`);
+  }
+
+  // Correlation : total, confirmes et outils contributeurs. Les outils sont
+  // comptes sur les clusters reellement presents, pas devines.
+  const correlation = model.correlation;
+  if (correlation && Number.isFinite(Number(correlation.total))) {
+    const tools = new Set();
+    for (const cluster of model.clusters || []) {
+      for (const source of cluster.sources || []) if (source.tool) tools.add(source.tool);
+    }
+    cards.push(`<section class="sc-context-card rail-card">
+      <div class="rail-head"><strong>Corrélation</strong></div>
+      <div class="rail-facts">
+        <div class="rail-fact"><span>Groupes</span><strong>${escapeHtml(String(correlation.total))}</strong></div>
+        ${Number.isFinite(Number(correlation.confirmed)) ? `<div class="rail-fact"><span>Confirmés</span><strong class="tone-ok">${escapeHtml(String(correlation.confirmed))}</strong></div>` : ''}
+        ${correlation.byTier ? `<div class="rail-fact"><span>Probables</span><strong>${escapeHtml(String(correlation.byTier.probable || 0))}</strong></div>` : ''}
+        ${tools.size ? `<div class="rail-fact"><span>Outils</span><strong>${escapeHtml(String(tools.size))}</strong></div>` : ''}
+      </div>
+      <button class="rail-link secondary" data-tab="correlations">Voir les corrélations →</button>
+    </section>`);
+  }
+
+  // Atteignabilite. `analysed: false` est un fait a montrer, pas un zero.
+  const reachability = model.reachability;
+  if (reachability) {
+    const counts = reachability.counts || {};
+    cards.push(`<section class="sc-context-card rail-card">
+      <div class="rail-head"><strong>Atteignabilité</strong>
+        <span class="rail-pill ${reachability.analysed ? 'ok' : 'bad'}">${reachability.analysed ? '✓ Analysée' : '✕ Non analysée'}</span></div>
+      <div class="rail-facts">
+        ${Object.entries(counts).slice(0, 4).map(([key, value]) => `<div class="rail-fact"><span>${escapeHtml(REACHABILITY_LABELS[key] || key)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join('')}
+        ${Number.isFinite(Number(reachability.scannedFiles)) ? `<div class="rail-fact"><span>Fichiers analysés</span><strong>${escapeHtml(String(reachability.scannedFiles))}</strong></div>` : ''}
+      </div>
+      <button class="rail-link secondary" data-tab="reachability">Voir l’atteignabilité →</button>
+    </section>`);
+  }
+
+  // Priorisation : le score le plus haut et la distribution P0..P3, tels que
+  // l'algorithme existant les a produits. Aucun recalcul dans la presentation.
+  const priority = model.priority;
+  if (priority && priority.distribution) {
+    const distribution = priority.distribution;
+    cards.push(`<section class="sc-context-card rail-card">
+      <div class="rail-head"><strong>Priorisation</strong>
+        ${Number.isFinite(Number(priority.highest)) ? `<span class="rail-pill">Max ${escapeHtml(String(priority.highest))}</span>` : ''}</div>
+      <div class="rail-facts">
+        ${['P0', 'P1', 'P2', 'P3'].map((code) => `<div class="rail-fact"><span>${code}</span><strong class="${code === 'P0' ? 'tone-bad' : code === 'P1' ? 'tone-warn' : ''}">${escapeHtml(String(distribution[code] || 0))}</strong></div>`).join('')}
+      </div>
+      <button class="rail-link secondary" data-tab="priorities">Voir les priorités →</button>
+    </section>`);
+  }
+
+  // Policy Gate : le verdict existant, plus le decompte de ses regles. Une
+  // politique non configuree le dit, et propose l'action de configuration.
+  const policy = model.policy;
+  if (policy) {
+    const status = String(policy.status || '').toUpperCase();
+    const configured = policy.configured !== false && status !== 'NOT_CONFIGURED';
+    const tone = status === 'PASS' ? 'ok' : status === 'WARN' ? 'warn' : status === 'BLOCK' || status === 'ERROR' ? 'bad' : 'muted';
+    const glyph = { ok: '✓', warn: '!', bad: '✕', muted: '·' }[tone];
+    cards.push(`<section class="sc-context-card rail-card">
+      <div class="rail-head"><strong>Policy Gate</strong>
+        <span class="rail-pill ${tone}">${glyph} ${escapeHtml(POLICY_STATE_LABELS[status] || status || 'Inconnu')}</span></div>
+      ${configured ? `<div class="rail-facts">
+        <div class="rail-fact"><span>Blocages</span><strong class="tone-bad">${escapeHtml(String((policy.violations || []).length))}</strong></div>
+        <div class="rail-fact"><span>Avertissements</span><strong class="tone-warn">${escapeHtml(String((policy.warnings || []).length))}</strong></div>
+        ${Number.isFinite(Number(policy.counts?.evaluatedFindings)) ? `<div class="rail-fact"><span>Évalués</span><strong>${escapeHtml(String(policy.counts.evaluatedFindings))}</strong></div>` : ''}
+      </div>` : '<p class="rail-note">Aucune politique projet n’est configurée : le gate ne rend aucun verdict.</p>'}
+      <button class="rail-link secondary" data-command="securityCenter.openProjectPolicy">${configured ? 'Ouvrir la politique →' : 'Configurer la politique →'}</button>
+    </section>`);
+  }
+
+  return `${assistantCard}${cards.join('')}`;
+}
+
+/** Le style du rail, en tokens partages — aucune couleur en dur. */
+function pipelineRailCss() {
+  return `
+    .rail-card{display:grid;gap:9px}
+    .rail-head{display:flex;justify-content:space-between;align-items:center;gap:8px}
+    .rail-head strong{font-size:11.5px;color:var(--sc-text)}
+    .rail-pill{flex:none;padding:3px 8px;border-radius:999px;font-size:8.5px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;color:var(--sc-text-secondary);background:var(--sc-surface-secondary);white-space:nowrap}
+    .rail-pill.ok{color:var(--sc-success);background:var(--sc-success-bg)}
+    .rail-pill.warn{color:var(--sc-warning);background:var(--sc-warning-bg)}
+    .rail-pill.bad{color:var(--sc-danger);background:var(--sc-danger-bg)}
+    .rail-facts{display:grid;gap:6px}
+    .rail-fact{display:flex;justify-content:space-between;align-items:baseline;gap:9px;min-width:0}
+    .rail-fact span{flex:none;color:var(--sc-text-secondary);font-size:10px}
+    .rail-fact strong{min-width:0;font-size:10.5px;color:var(--sc-text);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .rail-note{margin:0;color:var(--sc-text-secondary);font-size:10px;line-height:1.45}
+    .rail-link{width:100%;margin-top:2px;padding:6px 9px;border:1px solid var(--sc-border);border-radius:var(--sc-radius-md,8px);
+      color:var(--sc-text);background:var(--sc-surface);font:600 10px var(--vscode-font-family);cursor:pointer;text-align:center}
+    .rail-link:hover{background:var(--sc-surface-secondary)}
+    .rail-link:focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:1px}
+    .tone-ok{color:var(--sc-success)}.tone-warn{color:var(--sc-warning)}.tone-bad{color:var(--sc-danger)}`;
+}
+
+function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light', assets = {}) {
+  const companionImageUri = typeof assets === 'string' ? assets : assets?.companionImageUri || '';
+  const cspSource = typeof assets === 'object' ? assets?.cspSource || '' : '';
   const activeTab = TABS.some(([id]) => id === model.tab) ? model.tab : 'pipeline';
   // COMPACT mode: a presence, not an assistant. This page has its own decision
   // story to tell, so the companion stays small and only speaks when the state
   // it reports actually warrants it. Same shared model as the Live Security page.
-  const companion = renderCompanionWidget(model.companion, {
-    variant: 'compact', enabled: model.companionEnabled !== false
+  // L'assistant du rail parle de la porte de politique telle que le pipeline
+  // vient de la rendre — jamais d'un verdict recalcule ici. Sans verdict connu,
+  // il ne s'affiche pas.
+  const assistantCard = renderAssistantCard(buildAssistantCardModel({
+    surface: 'pipeline',
+    companion: model.companionEnabled === false ? null : model.companion,
+    pipeline: { policyStatus: model.policy?.status || '' },
+    enabled: model.companionEnabled !== false
+  }), { mascotImageUri: companionImageUri });
+  // Une seule mascotte par surface : la carte remplace le widget flottant
+  // lorsqu'elle a quelque chose a dire, et lui rend la place sinon.
+  const companion = assistantCard ? '' : renderCompanionWidget(model.companion, {
+    variant: 'compact', enabled: model.companionEnabled !== false, imageUri: companionImageUri
   });
+  const contextRail = renderPipelineRail(model, assistantCard);
   const body = activeTab === 'correlations' ? renderCorrelationsTab(model)
     : activeTab === 'reachability' ? renderReachabilityTab(model)
       : activeTab === 'priorities' ? renderPrioritiesTab(model)
         : activeTab === 'policy' ? renderPolicyTab(model)
           : activeTab === 'supply-chain' ? renderSupplyChainTab(model)
-            : renderPipelineTab(model);
-  return `<!doctype html><html data-theme="${escapeHtml(theme)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>
-    ${themeOverridesCss()}
+            : activeTab === 'remediation' ? renderRemediationTab(model)
+            : renderPipelineTab(model, assets);
+  return renderSecurityCenterShell({
+    surface: 'pipeline',
+    nonce,
+    theme,
+    title: 'Security Pipeline',
+    subtitle: 'De la détection à la décision : corrélation, atteignabilité, priorité, politique projet et preuves supply chain',
+    headerActions: `<button data-command="securityCenter.scanWorkspace">Relancer l’analyse</button>`,
+    content: `<nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${escapeHtml(id)}"${id === activeTab ? ' aria-current="true"' : ''}>${escapeHtml(label)}</button>`).join('')}</nav>
+  <section>${body}</section>`,
+    // Le companion garde son modele et son rendu : il change seulement de place,
+    // du coin de la page vers le rail de contexte du cadre.
+    contextRail: `${contextRail}${companion}`,
+    styles: `
+    ${assistantCard ? assistantCardCss() : ''}
+    ${pipelineRailCss()}
 
     body {
       --bg: var(--sc-bg);
@@ -977,16 +1223,16 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
 
     /* Visual Pipeline Flow styles */
     .visual-pipeline-flow {
-      display: flex;
-      flex-direction: row;
-      align-items: stretch;
-      justify-content: space-between;
+      display: grid;
+      grid-template-columns: minmax(118px,1fr) minmax(24px,44px) minmax(150px,1.2fr) minmax(24px,44px) minmax(160px,1.25fr) minmax(24px,44px) minmax(132px,1fr) minmax(24px,44px) minmax(132px,1fr);
+      align-items: center;
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 16px;
+      padding: 14px;
       margin-bottom: 24px;
-      gap: 4px;
+      gap: 0;
+      overflow: hidden;
     }
     
     .flow-node {
@@ -995,8 +1241,7 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 10px 12px;
-      flex: 1 1 0;
-      min-width: 140px;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       justify-content: flex-start;
@@ -1061,11 +1306,10 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     /* Connectors */
     .flow-line {
       align-self: center;
-      flex-grow: 1;
       height: 2px;
       background: var(--border);
       position: relative;
-      min-width: 16px;
+      min-width: 24px;
     }
     .flow-line.connector-completed {
       background: var(--ok);
@@ -1097,7 +1341,7 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     .node-scanners-micro {
       display: flex;
       flex-wrap: wrap;
-      gap: 3px;
+      gap: 4px;
       margin-top: 5px;
       border-top: 1px solid var(--border);
       padding-top: 5px;
@@ -1105,13 +1349,19 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     .micro-scanner {
       display: inline-flex;
       align-items: center;
+      justify-content:center;
+      gap:3px;
+      min-width:22px;
+      height:18px;
       font-size: 8px;
       font-weight: 700;
-      padding: 0px 3px;
+      padding: 0 4px;
       border-radius: 2px;
       border: 1px solid var(--border);
       background: var(--card);
     }
+    .micro-scanner small{font-size:8px;line-height:1}
+    .micro-scanner-logo{width:12px;height:12px;object-fit:contain;display:block}
     .micro-scanner.status-completed {
       color: var(--ok);
       border-color: var(--ok);
@@ -1150,20 +1400,19 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     }
 
     /* Responsive pipeline visual flow overrides */
-    @media (max-width: 820px) {
+    @media (max-width: 1050px) {
       .visual-pipeline-flow {
-        flex-direction: column;
-        align-items: center;
+        grid-template-columns: minmax(0,1fr);
+        align-items: stretch;
         width: 100%;
-        gap: 0;
         padding: 12px;
       }
       .flow-node {
         width: 100%;
-        max-width: 300px;
         min-height: 70px;
       }
       .flow-line {
+        justify-self:center;
         width: 2px;
         height: 24px;
         min-height: 24px;
@@ -1292,23 +1541,10 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     /* Responsive grids */
     .pipeline-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 178px), 1fr));
       gap: 12px;
-    }
-    @media (min-width: 900px) {
-      .pipeline-grid {
-        grid-template-columns: repeat(4, 1fr);
-      }
-    }
-    @media (min-width: 600px) and (max-width: 899px) {
-      .pipeline-grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-    }
-    @media (max-width: 599px) {
-      .pipeline-grid {
-        grid-template-columns: 1fr;
-      }
+      width:100%;
+      min-width:0;
     }
     
     .pipeline-card {
@@ -1320,7 +1556,8 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      min-height: 85px;
+      min-width:0;
+      min-height: 118px;
       transition: all 0.15s ease;
     }
     .pipeline-card:hover {
@@ -1336,7 +1573,9 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap:7px;
       margin-bottom: 8px;
+      min-width:0;
     }
     .card-icon {
       font-size: 14px;
@@ -1346,20 +1585,40 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     .card-title {
       font-weight: 600;
       font-size: 13px;
-      flex-grow: 1;
+      flex:1 1 auto;
+      min-width:0;
+      overflow-wrap:anywhere;
     }
-    .card-subtitle {
-      font-size: 11px;
-      color: var(--muted);
+    .card-tools {
+      display:flex;
+      flex-wrap:wrap;
+      gap:5px;
       margin-bottom: 8px;
+      min-width:0;
     }
+    .tool-chip {
+      display:inline-flex;
+      align-items:center;
+      gap:5px;
+      max-width:100%;
+      min-width:0;
+      padding:3px 6px;
+      border:1px solid var(--border);
+      border-radius:5px;
+      background:var(--bg);
+      color:var(--muted);
+      font-size:10px;
+      font-weight:700;
+      line-height:1.2;
+    }
+    .tool-chip span{min-width:0;overflow-wrap:anywhere}
+    .tool-logo-img{display:block;width:14px;height:14px;object-fit:contain;flex:none}
+    .status-badge{flex:none}
     .card-detail {
       font-size: 11px;
       color: var(--muted);
       margin: 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      overflow-wrap:anywhere;
     }
     
     /* Status Badge component */
@@ -1402,8 +1661,8 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     .intelligence-container {
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 12px;
-      background: rgba(120, 120, 120, 0.02);
+      padding: 14px;
+      background: linear-gradient(180deg,color-mix(in srgb,var(--sc-primary) 5%,var(--card)),var(--card));
     }
     .intelligence-container.failed {
       border-color: var(--bad);
@@ -1411,7 +1670,7 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     }
     .intelligence-row {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
       gap: 12px;
     }
     
@@ -1423,9 +1682,11 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
       display: flex;
       flex-direction: column;
       gap: 8px;
+      min-width:0;
       cursor: pointer;
       transition: all 0.15s ease;
     }
+    .intel-subcard-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px}
     .intel-subcard:hover {
       border-color: var(--accent);
     }
@@ -1437,6 +1698,7 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
       font-size: 11px;
       color: var(--muted);
       margin: 0;
+      overflow-wrap:anywhere;
     }
     
     /* Policy Callout Banner */
@@ -1607,13 +1869,8 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     .option.number { justify-content:space-between; align-items:center; cursor:default }
     .option.number input { width:88px; padding:5px 7px; border:1px solid var(--border); border-radius:4px; background:var(--bg); color:var(--text); font:inherit }
     @media(max-width:760px){body{padding:16px}.hero{display:block}dl>div{grid-template-columns:1fr}}
-    ${companion ? companionWidgetCss() : ''}
-  </style></head><body class="theme-${theme === 'dark' ? 'dark' : 'light'}"><main class="wrap">
-  <header class="hero"><div><h1>Security Pipeline</h1><p>De la détection à la décision : corrélation, atteignabilité, priorité, politique projet et preuves supply chain.</p></div><div class="actions"><button data-command="securityCenter.scanWorkspace">Relancer l’analyse</button><button class="secondary" data-command="securityCenter.openDashboard">← Dashboard</button></div></header>
-  <nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${escapeHtml(id)}"${id === activeTab ? ' aria-current="true"' : ''}>${escapeHtml(label)}</button>`).join('')}</nav>
-  <section>${body}</section>
-  </main>${companion}
-  <script nonce="${nonce}">const vscode=acquireVsCodeApi();
+    ${companion ? companionWidgetCss() : ''}`,
+    script: `const vscode=window.__scShellApi||acquireVsCodeApi();
   document.addEventListener('click', (e) => {
     const companionClick = e.target.closest('.sc-widget-mascot') || e.target.closest('.sc-widget-bubble');
     if (companionClick) {
@@ -1621,27 +1878,28 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light') {
     }
   });
   document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'tab',tab:b.dataset.tab}));
-  document.querySelectorAll('[data-command]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'command',command:b.dataset.command}));
-window.addEventListener('message', (event) => {
-  const msg = event.data;
-  if (msg?.command === 'setTheme' && ['light','dark'].includes(msg.theme)) {
-    document.body.classList.toggle('theme-dark', msg.theme === 'dark');
-    document.body.classList.toggle('theme-light', msg.theme === 'light');
-  }
-});
-});
+  // Le rail navigue par le meme message d'onglet que les barres du haut : les
+  // deux chemins arrivent sur le seul handler existant, sans route en double.
+  // La carte d'assistant apporte son propre relais : l'exclure ici evite que le
+  // meme clic parte deux fois.
+  document.querySelectorAll('[data-command]:not(.sc-nav-item):not(.sc-assistant [data-command])').forEach(b=>b.onclick=()=>vscode.postMessage({type:'command',command:b.dataset.command}));
   // The gate form is read at submit time, so the page keeps no state of its own:
   // the checkboxes are a view of security-center.yml, never a second copy of it.
   const policySelection=()=>{const s={};document.querySelectorAll('[data-policy-field]').forEach(i=>{s[i.dataset.policyField]=i.type==='checkbox'?i.checked:(i.value.trim()===''?null:Number(i.value));});return s;};
   document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'action',action:b.dataset.action,selection:b.dataset.action==='savePolicy'?policySelection():undefined}));
   document.querySelectorAll('[data-stage]').forEach(el=>{el.onclick=()=>vscode.postMessage({type:'stage',stage:el.dataset.stage});el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();vscode.postMessage({type:'stage',stage:el.dataset.stage});}};});
   document.querySelectorAll('[data-finding-index]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'finding',index:Number(b.dataset.findingIndex)}));
+  document.querySelectorAll('[data-remediation-finding]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'remediation',action:'finding',index:Number(b.dataset.remediationFinding)}));
+  document.querySelectorAll('[data-remediation-code]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'remediation',action:'code',index:Number(b.dataset.remediationCode)}));
+  document.querySelectorAll('[data-remediation-verify]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'remediation',action:'verify',index:Number(b.dataset.remediationVerify)}));
   document.querySelectorAll('[data-cluster-index]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'clusterSource',cluster:Number(b.dataset.clusterIndex),source:Number(b.dataset.sourceIndex)}));
-  </script></body></html>`;
+  ${assistantCard ? assistantCardScript() : ''}`,
+    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`
+  });
 }
 
 module.exports = {
-  renderPipelinePageHtml, renderPipelineTab, renderCorrelationsTab, renderReachabilityTab,
+  renderPipelinePageHtml, renderPipelineRail, pipelineRailCss, renderPipelineTab, renderCorrelationsTab, renderReachabilityTab,
   renderPrioritiesTab, renderPolicyTab, renderPolicyBanner, renderViolation,
   renderSupplyChainTab, renderStage, renderCluster, renderArtifactCard,
   renderAvailability, renderScanFooter,

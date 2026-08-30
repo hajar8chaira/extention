@@ -79,38 +79,129 @@ const TOOLS = Object.freeze({
   }
 });
 
-function request(url, headers = {}) {
+/** Installation lifecycle, shared by the manager and the UI. */
+const INSTALL_PHASE = Object.freeze({
+  DOWNLOADING: 'downloading',
+  VERIFYING: 'verifying',
+  INSTALLING: 'installing',
+  READY: 'ready',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled'
+});
+
+const INSTALL_ERROR = Object.freeze({
+  TIMEOUT: 'TIMEOUT',
+  STALLED: 'STALLED',
+  CANCELLED: 'CANCELLED'
+});
+
+/** No useful byte for this long means the transfer is dead, not slow. */
+const DEFAULT_STALL_MS = 120000;
+/** Ceiling for one HTTP response to complete. Large binaries need room. */
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 900000;
+
+class InstallCancelledError extends Error {
+  constructor(message = 'Installation annulée.') {
+    super(message);
+    this.name = 'InstallCancelledError';
+    this.code = INSTALL_ERROR.CANCELLED;
+    this.cancelled = true;
+  }
+}
+
+class InstallTimeoutError extends Error {
+  constructor(message, code = INSTALL_ERROR.TIMEOUT) {
+    super(message);
+    this.name = 'InstallTimeoutError';
+    this.code = code;
+  }
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw new InstallCancelledError();
+}
+
+function request(url, headers = {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new InstallCancelledError());
     // VS Code/Node does not always inherit the Windows certificate store.
     // Merge it with Node's bundled roots so official downloads continue to
     // use strict TLS validation behind managed/corporate HTTPS inspection.
     const systemCa = typeof tls.getCACertificates === 'function'
       ? [...new Set([...tls.getCACertificates('default'), ...tls.getCACertificates('system')])]
       : undefined;
-    const run = (current, redirects = 0) => https.get(current, { ca: systemCa, headers: { 'User-Agent': 'security-center-vscode', Accept: 'application/vnd.github+json', ...headers } }, (response) => {
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location && redirects < 5) {
-        response.resume(); return run(new URL(response.headers.location, current).toString(), redirects + 1);
-      }
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        response.resume(); return reject(new Error(`Téléchargement refusé (HTTP ${response.statusCode}).`));
-      }
-      resolve(response);
-    }).on('error', reject);
+    // A connection that never answers used to hang the installer forever: the
+    // request had no socket timeout and no way to be aborted, so a stalled TLS
+    // handshake left the UI frozen on whatever percentage it had reached.
+    let settled = false;
+    let active = null;
+    const cleanup = () => { signal?.removeEventListener?.('abort', onAbort); };
+    const fail = (error) => { if (settled) return; settled = true; cleanup(); active?.destroy(); reject(error); };
+    function onAbort() { fail(new InstallCancelledError()); }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+
+    const run = (current, redirects = 0) => {
+      active = https.get(current, { ca: systemCa, headers: { 'User-Agent': 'security-center-vscode', Accept: 'application/vnd.github+json', ...headers } }, (response) => {
+        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location && redirects < 5) {
+          response.resume(); return run(new URL(response.headers.location, current).toString(), redirects + 1);
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          response.resume(); return fail(new Error(`Téléchargement refusé (HTTP ${response.statusCode}).`));
+        }
+        if (settled) { response.resume(); return; }
+        settled = true; cleanup();
+        // The abort still has to reach the body stream once headers are in.
+        signal?.addEventListener?.('abort', () => response.destroy(new InstallCancelledError()), { once: true });
+        resolve(response);
+      });
+      active.setTimeout(timeoutMs, () => fail(new InstallTimeoutError(`Téléchargement interrompu après ${Math.round(timeoutMs / 1000)} s.`)));
+      active.on('error', fail);
+    };
     run(url);
   });
 }
 
-async function download(url, destination, onProgress = () => {}) {
-  const response = await request(url);
+/**
+ * Downloads to `destination`, abortable and never unbounded.
+ *
+ * Three failure modes are now distinguishable instead of hanging: the caller
+ * cancelled, the connection never answered, or bytes stopped arriving. The
+ * partial file is removed on every one of them — and only that file.
+ *
+ * `total` is reported as `0` when the server sends no Content-Length; the caller
+ * must then show an indeterminate state rather than compute a percentage from a
+ * denominator it does not have.
+ */
+async function download(url, destination, onProgress = () => {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS, stallTimeoutMs = DEFAULT_STALL_MS } = {}) {
+  throwIfAborted(signal);
+  const response = await request(url, {}, { signal, timeoutMs });
   const total = Number(response.headers['content-length'] || 0);
   let received = 0;
+  let lastProgressAt = Date.now();
   const handle = await fs.open(destination, 'w');
   try {
-    for await (const chunk of response) {
-      await handle.write(chunk); received += chunk.length;
-      onProgress({ phase: 'download', received, total });
-    }
-  } finally { await handle.close(); }
+    const stallTimer = setInterval(() => {
+      if (Date.now() - lastProgressAt > stallTimeoutMs) {
+        response.destroy(new InstallTimeoutError('Téléchargement interrompu — aucune progression détectée.', INSTALL_ERROR.STALLED));
+      }
+    }, Math.max(1000, Math.min(stallTimeoutMs, 5000)));
+    try {
+      for await (const chunk of response) {
+        throwIfAborted(signal);
+        await handle.write(chunk);
+        received += chunk.length;
+        lastProgressAt = Date.now();
+        onProgress({ phase: INSTALL_PHASE.DOWNLOADING, received, total });
+      }
+    } finally { clearInterval(stallTimer); }
+  } catch (error) {
+    await handle.close().catch(() => {});
+    // Only the incomplete artefact of this run. Never an installed version,
+    // never another tool's cache, never any configuration.
+    await fs.rm(destination, { force: true }).catch(() => {});
+    throw error;
+  }
+  await handle.close();
 }
 
 async function downloadText(url) {
@@ -210,7 +301,7 @@ class ScannerToolManager {
    * storage. Nothing is written outside that directory and the system PATH is
    * never modified.
    */
-  async installSonarScanner(tool, onProgress, platform = sonarScannerPlatform()) {
+  async installSonarScanner(tool, onProgress, platform = sonarScannerPlatform(), { signal } = {}) {
     if (!platform) throw new Error(`SonarScanner CLI n’est pas distribué pour ${process.platform}/${process.arch}. Utilisez le mode Docker.`);
     const version = await this.latestSonarScannerVersion(tool.version);
     const name = `sonar-scanner-cli-${version}-${platform}.zip`;
@@ -219,7 +310,7 @@ class ScannerToolManager {
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'security-center-sonarscanner-'));
     const archive = path.join(temporary, name);
     try {
-      await download(archiveUrl, archive, onProgress);
+      await download(archiveUrl, archive, onProgress, { signal });
       const expected = String(await downloadText(`${archiveUrl}.sha256`)).match(/[a-f0-9]{64}/i)?.[0]?.toLowerCase();
       if (!expected) throw new Error(`SonarSource ne publie pas d’empreinte SHA-256 pour ${name}. Installation refusée par sécurité.`);
       const actual = await sha256(archive);
@@ -261,14 +352,14 @@ class ScannerToolManager {
    * storage. No npm, no administrator rights, no system PATH change: the file
    * is verified against Snyk's published SHA-256 list before it is kept.
    */
-  async installSnyk(tool, onProgress, asset = snykCliAsset()) {
+  async installSnyk(tool, onProgress, asset = snykCliAsset(), { signal } = {}) {
     if (!asset) throw new Error(`Snyk CLI n’est pas distribué pour ${process.platform}/${process.arch}. Utilisez le mode Docker.`);
     const binaryUrl = `${tool.base}/${asset}`;
     onProgress({ phase: 'metadata', message: `${asset} depuis downloads.snyk.io` });
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'security-center-snyk-'));
     const downloaded = path.join(temporary, asset);
     try {
-      await download(binaryUrl, downloaded, onProgress);
+      await download(binaryUrl, downloaded, onProgress, { signal });
       const expected = parseSnykChecksums(await downloadText(`${tool.base}/sha256sums.txt.asc`), asset);
       if (!expected) throw new Error(`Snyk ne publie pas d’empreinte SHA-256 pour ${asset}. Installation refusée par sécurité.`);
       const actual = await sha256(downloaded);
@@ -317,19 +408,19 @@ class ScannerToolManager {
     await walk(base);
   }
 
-  async install(id, onProgress = () => {}) {
+  async install(id, onProgress = () => {}, { signal } = {}) {
     const tool = TOOLS[id];
     if (!tool) throw new Error('Scanner inconnu.');
     await fs.mkdir(this.toolDirectory(id), { recursive: true });
-    if (tool.kind === 'python') return this.installSemgrep(onProgress);
-    if (tool.kind === 'sonarsource') return this.installSonarScanner(tool, onProgress);
-    if (tool.kind === 'snyk') return this.installSnyk(tool, onProgress);
+    if (tool.kind === 'python') return this.installSemgrep(onProgress, { signal });
+    if (tool.kind === 'sonarsource') return this.installSonarScanner(tool, onProgress, sonarScannerPlatform(), { signal });
+    if (tool.kind === 'snyk') return this.installSnyk(tool, onProgress, snykCliAsset(), { signal });
     const release = await this.githubRelease(tool);
     onProgress({ phase: 'metadata', message: `${release.version} trouvé sur ${tool.repo}` });
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), `security-center-${id}-`));
     const archive = path.join(temp, release.asset.name);
     try {
-      await download(release.asset.browser_download_url, archive, onProgress);
+      await download(release.asset.browser_download_url, archive, onProgress, { signal });
       let expected = String(release.asset.digest || '').match(/sha256:([a-f0-9]{64})/i)?.[1]?.toLowerCase();
       if (!expected && release.checksum) {
         const checksums = await downloadText(release.checksum.browser_download_url);
@@ -361,7 +452,7 @@ class ScannerToolManager {
     }
     return '';
   }
-  async installSemgrep(onProgress) {
+  async installSemgrep(onProgress, { signal } = {}) {
     const python = await this.findOnPath('python') || await this.findOnPath('python3');
     if (!python) throw new Error('Python est requis pour Semgrep. Installez Python puis réessayez.');
     const venv = path.join(this.toolDirectory('semgrep'), 'venv');
@@ -379,6 +470,8 @@ class ScannerToolManager {
 
 module.exports = {
   ScannerToolManager, TOOLS, sha256, commandVersion, versionInvocation,
+  INSTALL_PHASE, INSTALL_ERROR, DEFAULT_STALL_MS, DEFAULT_DOWNLOAD_TIMEOUT_MS,
+  InstallCancelledError, InstallTimeoutError, download, request,
   sonarScannerPlatform, compareVersions, SONARSCANNER_BASE, SONARSCANNER_PINNED_VERSION,
   snykCliAsset, parseSnykChecksums, SNYK_CLI_BASE
 };

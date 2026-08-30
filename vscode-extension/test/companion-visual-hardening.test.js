@@ -46,11 +46,11 @@ test('chaque couleur du compagnon a un repli littéral', () => {
   assert.ok(!/background:\s*#(000|111|222)\b/i.test(css));
 });
 
-test('la mascotte garde sa palette repliée, dans les deux thèmes', () => {
+test('la mascotte image garde des replis de presentation, dans les deux themes', () => {
   const css = companionWidgetCss();
-  for (const token of ['--sc-body', '--sc-line', '--sc-visor', '--sc-accent', '--sc-warn', '--sc-danger', '--sc-ok']) {
-    assert.match(css, new RegExp(`${token}:var\\(--vscode-[\\w-]+,#[0-9a-fA-F]+\\)`), `${token} sans repli`);
-  }
+  assert.match(css, /\.mascot\{[^}]*object-fit:contain/);
+  assert.match(css, /filter:drop-shadow/);
+  assert.match(css, /var\(--sc-accent-soft,rgba\(91,95,239,\.\d+\)\)/);
 });
 
 // ------------------------------------------------- couche non bloquante
@@ -75,11 +75,11 @@ test('la zone de sécurité s’adapte et s’éloigne du bas de l’éditeur', 
 
 test('le niveau d’empilement reste sous les modales et les popovers', () => {
   const dashboard = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard.js'), 'utf8');
-  // Les niveaux déjà en place : 20 = backdrop de confirmation, 1000 = popover.
-  assert.match(dashboard, /\.zap-confirmation-backdrop \{[^}]*z-index: 20/);
+  // Le garde-fou ZAP vit dans la modale VS Code, pas dans une overlay webview.
+  assert.doesNotMatch(dashboard, /zap-confirmation-backdrop/);
   assert.match(dashboard, /\.pipeline-popover \{[^}]*z-index: 1000/);
   assert.ok(WIDGET_Z_INDEX > 10, 'au-dessus du contenu épinglé');
-  assert.ok(WIDGET_Z_INDEX < 20, 'sous toute confirmation modale');
+  assert.ok(WIDGET_Z_INDEX < 1000, 'sous les popovers du dashboard');
   assert.ok(WIDGET_Z_INDEX < 100, 'pas de valeur absurde');
   assert.match(companionWidgetCss(), new RegExp(`z-index:${WIDGET_Z_INDEX}`));
 });
@@ -113,7 +113,7 @@ test('le mode compact se tait sauf quand l’état est important', () => {
   for (const state of ['clean', 'idle', 'analyzing']) {
     const quiet = renderCompanionWidget(visualFor({ state }), { variant: 'compact' });
     assert.ok(!quiet.includes('sc-widget-bubble'), `l’état ${state} ne doit pas parler en compact`);
-    assert.match(quiet, /<svg class="mascot/, 'la mascotte reste visible');
+    assert.match(quiet, /<img class="mascot/, 'la mascotte reste visible');
   }
   // En mode full, l'analyse et l'état propre s'expriment.
   assert.match(renderCompanionWidget(visualFor({ state: 'analyzing' }), { variant: 'full' }), /sc-widget-bubble/);
@@ -182,14 +182,15 @@ test('un finding Live courant reprend toujours le titre au scan complet', () => 
 
 // ------------------------------------------------------- couverture pages
 
-test('le Security Pipeline rend le compagnon en mode compact', () => {
+test('le Security Pipeline rend le compagnon dans le hero du rail', () => {
   const visual = visualFor({ state: 'issues', findings: [live()] });
   const html = renderPipelinePageHtml({ tab: 'pipeline', stages: [], companion: visual, companionEnabled: true }, 'n', 'light');
-  assert.match(html, /class="sc-widget sc-widget-compact/);
-  assert.equal((html.match(/<svg class="mascot/g) || []).length, 1);
+  assert.match(html, /class="sc-assistant sc-assistant-hero"/);
+  assert.ok(!/class="sc-widget/.test(html), 'aucun widget flottant ne double le hero');
+  assert.equal((html.match(/<img class="mascot/g) || []).length, 1);
   // Désactivé, la page ne porte aucune trace du compagnon.
   const off = renderPipelinePageHtml({ tab: 'pipeline', stages: [], companion: visual, companionEnabled: false }, 'n', 'light');
-  assert.ok(!/class="sc-widget/.test(off), 'aucun compagnon rendu quand le reglage est desactive');
+  assert.ok(!/class="sc-widget|class="sc-assistant/.test(off), 'aucun compagnon rendu quand le reglage est desactive');
   assert.match(off, /Security Pipeline/);
 });
 
@@ -208,7 +209,12 @@ test('deux pages ouvertes montrent le même état à partir du même modèle', (
   ];
   const postures = surfaces.map((html) => (html.match(/class="mascot mascot-(\w+)/) || [])[1]);
   assert.deepEqual(postures, ['warning', 'warning', 'warning']);
-  const counts = surfaces.map((html) => (html.match(/sc-widget-count">(\d+)/) || [])[1]);
+  const liveCount = (html) => (
+    html.match(/sc-widget-count">(\d+)/)
+    || html.match(/data-assistant-fact-scope="live-file"[\s\S]*?<strong[^>]*>(\d+)<\/strong>[\s\S]*?Live issues/)
+    || []
+  )[1];
+  const counts = surfaces.map(liveCount);
   assert.deepEqual(counts, ['2', '2', '2']);
 });
 
@@ -222,8 +228,8 @@ test('l’état n’est jamais porté par la seule couleur', () => {
   assert.match(critical, /data-companion-state="critical"/);
   // Le badge dit ce qu'il compte, pour un lecteur d'écran.
   assert.match(critical, /class="sc-widget-sr"> problème\(s\) Live dans ce fichier</);
-  // Et l'expression du visage change avec l'état.
-  assert.match(companionWidgetCss(), /\.mascot-critical \.sc-eye-alert\{opacity:1/);
+  // Et la posture d'attention change avec l'état.
+  assert.match(companionWidgetCss(), /\.mascot-critical\{animation:sc-pulse/);
 });
 
 test('un état calme reste annoncé poliment et le mouvement reste désactivable', () => {
@@ -232,7 +238,7 @@ test('un état calme reste annoncé poliment et le mouvement reste désactivable
   const still = renderCompanionWidget({ ...visualFor({ state: 'clean' }), animations: false }, { variant: 'full' });
   assert.match(still, /sc-no-motion/);
   assert.match(companionWidgetCss(), /@media\(prefers-reduced-motion:reduce\)/);
-  assert.match(companionWidgetCss(), /\.sc-no-motion \.mascot \*\{animation:none!important\}/);
+  assert.match(companionWidgetCss(), /\.sc-no-motion \.mascot\{animation:none!important;transition:none!important\}/);
 });
 
 test('aucun chemin absolu ni secret dans le compagnon durci', () => {
@@ -277,7 +283,9 @@ test('un panneau fermé libère ses abonnements et ne rend plus rien', () => {
   });
   provider.open();
   assert.ok(provider.panel, 'le panneau est ouvert');
-  assert.ok(provider.panel.webview.html.includes('sc-widget'), 'le compagnon est rendu');
+  // Le compagnon est rendu — porté ici par la carte d'assistant du rail, qui
+  // remplace le widget flottant dès qu'elle a un fait réel à rapporter.
+  assert.ok(provider.panel.webview.html.includes('sc-assistant'), 'le compagnon est rendu');
   // Fermeture par l'utilisateur : le panneau disparaît du provider.
   panel.dispose();
   assert.equal(provider.panel, undefined);

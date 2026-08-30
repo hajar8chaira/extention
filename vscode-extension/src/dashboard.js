@@ -1,6 +1,10 @@
 const { renderCompanionWidget, companionWidgetCss } = require('./live/companionWidget');
 const { renderDynamicSections, dynamicSectionsCss, dynamicSectionsScript } = require('./dynamic-workspace');
 const { remediationCounters } = require('./triage');
+const { renderInternalSidebar, renderSecurityCenterAtmosphere, pageAtmosphereKind, compactIcon, shellLayoutCss } = require('./security-center-shell');
+const { buildAssistantCardModel, renderAssistantCard, renderAssistantHeroCard, renderAssistantPanelCard, assistantCardCss, assistantCardScript } = require('./companion-assistant-card');
+const { scannerPresentation, scannerLogoUri, scannerIdForTool } = require('./scanner-presentation');
+const { isTerminalScannerStatus, successfulScannerCount, finishedScannerCount } = require('./security-snapshot');
 
 function countBy(items, selector) {
   const counts = {};
@@ -23,12 +27,46 @@ function riskLevel(score) {
   return 'faible';
 }
 
+/**
+ * The correlation model Security Center *shows*.
+ *
+ * One engine decides what a correlation is, and it is the same one the Security
+ * Pipeline reports: Correlation V2. Its clusters are already attached to every
+ * finding by `mergeIntelligence` (`correlationClusters`), and the local scan
+ * cache persists them alongside the findings — so this reads intelligence that
+ * has already been computed and never re-runs correlation from a render path.
+ *
+ * Legacy V1 keeps running untouched for the backend record and for the source
+ * attribution on dynamic finding cards, which depend on its own `endpoint-source`
+ * vocabulary. It simply no longer decides the number on screen.
+ */
+function visibleCorrelationClusters(findings = [], options = {}) {
+  // An explicitly supplied set wins, so a restored scan can hand over exactly
+  // the clusters it persisted rather than relying on the findings carrying them.
+  if (Array.isArray(options.correlationClusters)) return options.correlationClusters;
+  const byId = new Map();
+  for (const finding of findings) {
+    for (const cluster of finding?.correlationClusters || []) {
+      if (cluster?.id && !byId.has(cluster.id)) byId.set(cluster.id, cluster);
+    }
+  }
+  return [...byId.values()];
+}
+
 function buildDashboardModel(findings = [], scanners = [], options = {}) {
-  const correlations = Array.isArray(options.correlations) ? options.correlations : [];
+  // Legacy V1 output. Still produced, still persisted, still read by the source
+  // attribution below — but no longer the visible correlation summary.
+  const legacyCorrelations = Array.isArray(options.correlations) ? options.correlations : [];
+  const correlations = visibleCorrelationClusters(findings, options);
   const activeFindings = findings.filter((finding) => !['false_positive', 'fixed', 'validated', 'accepted'].includes(finding.triageStatus));
+  const currentRunFindings = Array.isArray(options.currentRunFindings)
+    ? options.currentRunFindings
+    : scanners.flatMap((scanner) => Array.isArray(scanner.currentRun?.findings) ? scanner.currentRun.findings : []);
   const riskScore = calculateRiskScore(activeFindings);
   return {
     findings,
+    workspacePostureFindings: findings,
+    currentRunFindings,
     total: findings.length,
     activeTotal: activeFindings.length,
     byTool: countBy(findings, (finding) => finding.tool),
@@ -36,12 +74,18 @@ function buildDashboardModel(findings = [], scanners = [], options = {}) {
     byContext: countBy(findings, (finding) => finding.sourceContext || 'non classé'),
     byStatus: countBy(findings, (finding) => finding.triageStatus || 'new'),
     correlations,
+    // V2 clusters use the same `high`/`medium`/`low` confidence vocabulary as V1,
+    // so the « Confiance élevée » card reads the new source without any change.
     correlationCounts: countBy(correlations, (correlation) => correlation.confidence),
+    // Preserved for the dynamic source attribution, which relies on V1 types.
+    legacyCorrelations,
     riskScore,
     riskLevel: riskLevel(riskScore),
     productionPriority: activeFindings.filter((finding) => finding.sourceContext === 'production' && ['CRITICAL', 'HIGH'].includes(String(finding.rawSeverity).toUpperCase())).length,
     runtimeFindings: activeFindings.filter((finding) => finding.sourceContext === 'runtime').length,
-    completedScanners: scanners.filter((scanner) => scanner.status === 'completed').length,
+    successfulScanners: successfulScannerCount(scanners),
+    completedScanners: successfulScannerCount(scanners),
+    finishedScanners: finishedScannerCount(scanners),
     httpScenarioCount: Number(options.httpScenarioCount || 0),
     httpScenarios: Array.isArray(options.httpScenarios) ? options.httpScenarios : [],
     burpConnected: Boolean(options.burpConnected),
@@ -70,7 +114,8 @@ function buildDashboardModel(findings = [], scanners = [], options = {}) {
     lastExecution: options.lastExecution || null,
     executionType: options.executionType || '',
     scanHistory: Array.isArray(options.scanHistory) ? options.scanHistory : [],
-    mttrHours: Number.isFinite(options.mttrHours) ? options.mttrHours : null
+    mttrHours: Number.isFinite(options.mttrHours) ? options.mttrHours : null,
+    enterprise: options.enterprise && typeof options.enterprise === 'object' ? options.enterprise : null
   };
 }
 
@@ -83,6 +128,9 @@ function escapeHtml(value) {
 function summarizeScannerError(value) {
   const error = String(value || '').trim();
   if (!error) return 'Le scanner a échoué sans fournir de cause exploitable.';
+  if (/SonarQube .*injoignable|serveur SonarQube .*injoignable|SERVER_UNAVAILABLE/i.test(error)) {
+    return 'SonarQube inaccessible. Démarrez le serveur configuré ou corrigez l’URL SonarQube, puis relancez ce scanner.';
+  }
   if (/unexpected EOF|error waiting for container|docker API|dockerDesktopLinuxEngine|daemon is running/i.test(error)) {
     return 'Docker Desktop a interrompu la connexion avec son moteur Linux. Redémarrez Docker Desktop, attendez que le moteur soit prêt, puis relancez ce scanner.';
   }
@@ -130,35 +178,65 @@ function formatDuration(durationMs) {
   return minutes ? `${minutes} min ${seconds} s` : `${seconds} s`;
 }
 
-const SCANNER_PRESENTATION = {
-  Semgrep: ['Analyse statique du code (SAST)', 'code'],
-  Gitleaks: ['Détection de secrets', 'key'],
-  Trivy: ['Dépendances, conteneurs et IaC', 'cube'],
-  'OSV-Scanner': ['Vulnérabilités des dépendances', 'shield'],
-  SonarQube: ['Qualité et sécurité du code (SAST)', 'code'],
-  Snyk: ['Dépendances, code et IaC (SCA/SAST/IaC)', 'shield'],
-  ZAP: ['Analyse dynamique (DAST)', 'pulse']
-};
-
-function compactIcon(name) {
-  const paths = {
-    code: '<path d="M8 4 3 9l5 5M12 4l5 5-5 5M11 2 9 16"/>',
-    key: '<circle cx="6" cy="8" r="3"/><path d="m9 8 7 0m-2 0v3m-3-3v2"/>',
-    cube: '<path d="m9 2 7 4v8l-7 4-7-4V6zM2 6l7 4 7-4M9 10v8"/>',
-    shield: '<path d="M9 2 16 5v5c0 4-3 6-7 8-4-2-7-4-7-8V5zM6 10l2 2 4-5"/>',
-    pulse: '<path d="M2 10h3l2-5 3 10 2-5h4"/>',
-    play: '<path d="m6 4 9 5-9 5z"/>',
-    history: '<path d="M3 5v4h4M4 8a6 6 0 1 1 2 5M9 6v4l3 2"/>',
-    chart: '<path d="M3 15V9m5 6V4m5 11V7m4 8H1"/>',
-    report: '<path d="M4 2h8l3 3v11H4zM12 2v4h4M7 9h5m-5 3h5"/>',
-    settings: '<circle cx="9" cy="9" r="3"/><path d="M9 1v2m0 12v2M1 9h2m12 0h2M3 3l2 2m8 8 2 2M15 3l-2 2M5 13l-2 2"/>',
-    compare: '<path d="M3 5h11m-3-3 3 3-3 3M15 13H4m3-3-3 3 3 3"/>'
-  };
-  return `<svg class="compact-icon" viewBox="0 0 18 18" aria-hidden="true">${paths[name] || paths.shield}</svg>`;
-}
-
 function actionButton(command, label, icon, primary = false) {
   return `<button class="${primary ? 'primary' : 'secondary'}" data-command="${escapeHtml(command)}">${compactIcon(icon)}<span>${escapeHtml(label)}</span></button>`;
+}
+
+function renderScannerLogoHtml(tool, status = '', assets = {}) {
+  const presentation = scannerPresentation(tool);
+  const uri = scannerLogoUri(tool, assets);
+  const statusClass = status ? ` ${escapeHtml(status)}` : '';
+  if (uri) {
+    return `<span class="scanner-logo${statusClass}" data-scanner-logo="${escapeHtml(presentation.id)}"><img class="scanner-logo-img" src="${escapeHtml(uri)}" alt="${escapeHtml(presentation.label)} logo" loading="lazy"></span>`;
+  }
+  return `<span class="scanner-logo fallback${statusClass}" data-scanner-logo="${escapeHtml(presentation.id)}">${compactIcon(presentation.fallbackIcon)}</span>`;
+}
+
+function scannerStatusLabel(status) {
+  return ({
+    completed: 'COMPLETED',
+    failed: 'FAILED',
+    running: 'RUNNING',
+    refreshing: 'RUNNING',
+    pending: 'WAITING',
+    cancelled: 'CANCELLED',
+    skipped: 'SKIPPED',
+    disabled: 'NOT CONFIGURED'
+  })[status] || String(status || 'WAITING').toUpperCase();
+}
+
+function scannerCategoryLabel(tool) {
+  const category = scannerPresentation(tool).category || '';
+  return category.replace(/\//g, ' / ');
+}
+
+function currentScannerFindings(scanner, allFindings) {
+  if (!scanner || scanner.status !== 'completed') return [];
+  if (Array.isArray(scanner.currentRun?.findings)) return scanner.currentRun.findings;
+  return allFindings.filter((finding) => finding.tool === scanner.tool);
+}
+
+function currentScannerResultCount(scanner, allFindings) {
+  if (!scanner || scanner.status !== 'completed') return null;
+  const count = Number(scanner.currentRun?.resultCount);
+  if (Number.isFinite(count)) return count;
+  return currentScannerFindings(scanner, allFindings).length;
+}
+
+function scannerResultSummary(scanner, allFindings) {
+  if (!scanner) return 'No current execution';
+  if (scanner.status === 'failed') return summarizeScannerError(scanner.error || scanner.details);
+  if (scanner.status === 'cancelled') return 'Cancelled before producing current results';
+  if (scanner.status === 'running' || scanner.status === 'refreshing') return 'Analysis in progress';
+  if (scanner.status === 'pending') return 'Waiting for current execution';
+  if (scanner.status !== 'completed') return 'No current result';
+  const count = currentScannerResultCount(scanner, allFindings);
+  const word = scanner.tool === 'Gitleaks'
+    ? (count === 1 ? 'secret' : 'secrets')
+    : scanner.tool === 'OSV-Scanner'
+      ? (count === 1 ? 'vulnerability' : 'vulnerabilities')
+      : count === 1 ? 'finding' : 'findings';
+  return `${count} ${word}`;
 }
 
 function deduplicateByFingerprint(findings) {
@@ -722,14 +800,17 @@ function renderPipeline(scanners, scanStatus, durationMs, findings = []) {
   const endStatus = allFinished ? (hasFailure || hasCancellation ? 'failed' : 'completed') : 'pending';
   const stage = (label, status, subtitle = '', scannerFindings = null) => {
     const interactive = Array.isArray(scannerFindings);
+    const hasExplicitCount = interactive && Object.prototype.hasOwnProperty.call(scannerFindings, 'resultCount');
+    const findingCount = hasExplicitCount ? scannerFindings.resultCount : Array.isArray(scannerFindings) ? scannerFindings.length : null;
+    const countLabel = findingCount === null ? '— finding(s)' : `${findingCount} finding(s)`;
     const severityRank = (value) => ({ CRITICAL: 5, HIGH: 4, MEDIUM: 3, WARNING: 2, LOW: 1, INFO: 0 }[String(value || '').toUpperCase()] || 0);
     const priority = interactive
       ? [...scannerFindings].sort((left, right) => severityRank(right.rawSeverity || right.severity) - severityRank(left.rawSeverity || left.severity)).slice(0, 5)
       : [];
     const tooltipId = interactive ? `pipeline-${String(label).toLowerCase().replace(/[^a-z0-9]+/g, '-')}-findings` : '';
     const popover = interactive ? `<div id="${tooltipId}" class="pipeline-popover" role="tooltip">
-      <strong>${escapeHtml(label)} · ${scannerFindings.length} finding(s)</strong>
-      ${priority.length ? priority.map((finding) => `<span><b>${escapeHtml(String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase())}</b> ${escapeHtml(finding.title || finding.ruleId || 'Finding')}</span>`).join('') : `<span>${['running', 'refreshing'].includes(status) ? 'Analyse en cours…' : status === 'failed' ? 'Le scanner a échoué. Les anciens résultats valides restent conservés.' : 'Aucun finding pour ce scanner.'}</span>`}
+      <strong>${escapeHtml(label)} · ${escapeHtml(countLabel)}</strong>
+      ${priority.length ? priority.map((finding) => `<span><b>${escapeHtml(String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase())}</b> ${escapeHtml(finding.title || finding.ruleId || 'Finding')}</span>`).join('') : `<span>${['running', 'refreshing'].includes(status) ? 'Analysis in progress' : status === 'pending' ? 'No current result for this execution yet.' : status === 'failed' ? 'Scanner failed. No previous result is used as the current result.' : status === 'cancelled' ? 'Scanner cancelled before producing a current result.' : 'Aucun finding pour ce scanner.'}</span>`}
       ${scannerFindings.length > priority.length ? `<small>+ ${scannerFindings.length - priority.length} autre(s)</small>` : ''}
       ${status === 'failed' ? `<button class="pipeline-retry" data-retry-scanner="${escapeHtml(label)}">Relancer ${escapeHtml(label)}</button>` : ''}
     </div>` : '';
@@ -751,7 +832,15 @@ function renderPipeline(scanners, scanStatus, durationMs, findings = []) {
       : scanner.status === 'failed' ? 'Échec · relance disponible'
       : scanner.status === 'cancelled' ? 'Annulé · relance disponible'
       : 'En attente';
-    parts.push(stage(scanner.tool, scanner.status, scannerSubtitle, findings.filter((finding) => finding.tool === scanner.tool)));
+    const currentFindings = Array.isArray(scanner.currentRun?.findings)
+      ? [...scanner.currentRun.findings]
+      : scanner.status === 'completed'
+        ? findings.filter((finding) => finding.tool === scanner.tool)
+        : [];
+    currentFindings.resultCount = scanner.status === 'completed'
+      ? Number(scanner.currentRun?.resultCount ?? currentFindings.length)
+      : null;
+    parts.push(stage(scanner.tool, scanner.status, scannerSubtitle, currentFindings));
   }
   parts.push(`<div class="pipeline-line ${allFinished ? 'active' : 'pending'}"></div>`);
   const endSubtitle = !allFinished ? 'En attente' : hasCancellation ? `Scan partiel • ${formatDuration(durationMs)}` : hasFailure ? `Terminé avec erreur • ${formatDuration(durationMs)}` : formatDuration(durationMs);
@@ -774,7 +863,186 @@ function renderDonutChart(values, label) {
   return `<div class="donut-card"><div class="donut-wrap"><svg viewBox="0 0 100 100" role="img" aria-label="${escapeHtml(label)}"><circle class="donut-track" cx="50" cy="50" r="42"></circle>${segments}</svg><div class="donut-total"><strong>${total}</strong><span>total</span></div></div><div class="donut-legend">${legend}</div></div>`;
 }
 
-function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'light', uiState = {}) {
+/**
+ * Les quatre paliers de severite, dans l'ordre du plus grave au moins grave.
+ * L'ordre est celui de la lecture, pas celui des donnees : une repartition qui
+ * commence par « low » se lit a l'envers.
+ */
+const SEVERITY_SLICES = Object.freeze([
+  ['critical', 'Critical'],
+  ['high', 'High'],
+  ['medium', 'Medium'],
+  ['low', 'Low']
+]);
+
+/**
+ * La repartition par severite, dessinee avec les couleurs de severite plutot
+ * qu'avec la palette generique des graphiques : une part « critical » qui n'est
+ * pas rouge serait une couleur qui ment sur une gravite.
+ *
+ * Les comptes viennent de l'appelant. Cette fonction dessine, elle ne compte
+ * pas, n'agrege pas et n'estime aucun pourcentage manquant : un palier absent
+ * des donnees est simplement absent du dessin.
+ */
+function renderSeverityDonut(counts) {
+  const entries = SEVERITY_SLICES
+    .map(([key, label]) => ({ key, label, count: Number(counts[key] || 0) }))
+    .filter((entry) => entry.count > 0);
+  const total = entries.reduce((sum, entry) => sum + entry.count, 0);
+  if (!total) return '<div class="empty">Aucune alerte active a repartir.</div>';
+  let offset = 0;
+  const segments = entries.map((entry) => {
+    const percent = entry.count / total * 100;
+    const segment = `<circle class="sev-segment sev-${entry.key}" cx="50" cy="50" r="40" pathLength="100" stroke-dasharray="${percent.toFixed(2)} ${(100 - percent).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(2)}"><title>${escapeHtml(entry.label)} : ${entry.count}</title></circle>`;
+    offset += percent;
+    return segment;
+  }).join('');
+  const legend = entries.map((entry) => `<div class="sev-legend-row"><span class="sev-swatch sev-${entry.key}"></span><span class="sev-name">${escapeHtml(entry.label)}</span><strong>${entry.count}</strong><small>${Math.round(entry.count / total * 100)} %</small></div>`).join('');
+  return `<div class="sev-donut"><div class="sev-ring"><svg viewBox="0 0 100 100" role="img" aria-label="Repartition des alertes actives par severite"><circle class="sev-track" cx="50" cy="50" r="40"></circle>${segments}</svg><div class="sev-total"><strong>${total}</strong><span>actives</span></div></div><div class="sev-legend">${legend}</div></div>`;
+}
+
+/**
+ * Les fichiers et endpoints les plus exposes, tels que la liste deja affichee
+ * les decrit.
+ *
+ * C'est un regroupement d'un tableau deja en memoire, pas une nouvelle analyse :
+ * aucun scan n'est declenche, rien n'est persiste, aucune severite n'est
+ * recalculee. Un finding sans emplacement n'est pas invente : il est ignore.
+ */
+function topRiskyTargets(findings, limit = 5) {
+  const rank = { CRITICAL: 4, ERROR: 4, HIGH: 3, MEDIUM: 2, WARNING: 2, LOW: 1 };
+  const buckets = new Map();
+  for (const finding of findings) {
+    const target = finding.file || finding.endpoint || '';
+    if (!target) continue;
+    const severity = String(finding.rawSeverity || finding.severity || '').toUpperCase();
+    const entry = buckets.get(target) || { target, count: 0, severity: '', rank: 0 };
+    entry.count += 1;
+    if ((rank[severity] || 0) > entry.rank) {
+      entry.rank = rank[severity] || 0;
+      entry.severity = severity;
+    }
+    buckets.set(target, entry);
+  }
+  return [...buckets.values()]
+    .sort((left, right) => right.rank - left.rank || right.count - left.count)
+    .slice(0, limit);
+}
+
+/**
+ * Severite -> palier semantique. `semanticClass` ne distingue que trois tons et
+ * confondait « medium » avec « high » ; les cartes de severite en demandent
+ * quatre, car un « medium » peint comme un « high » est une couleur qui exagere.
+ */
+function severityTone(value) {
+  const severity = String(value || '').toUpperCase();
+  if (['CRITICAL', 'ERROR'].includes(severity)) return 'critical';
+  if (severity === 'HIGH') return 'high';
+  if (['MEDIUM', 'WARNING'].includes(severity)) return 'medium';
+  if (['LOW', 'INFO', 'INFORMATION'].includes(severity)) return 'low';
+  return 'neutral';
+}
+
+/**
+ * Les evenements du cycle de vie d'une correction, tels que le finding les
+ * porte deja.
+ *
+ * Un evenement n'existe ici que s'il a une date reelle dans le modele. Il n'y a
+ * volontairement aucune ligne « Alerte detectee » generique : seuls certains
+ * scanners datent leur detection, et inventer cette date pour les autres
+ * donnerait une chronologie fausse. Un cycle incomplet s'affiche incomplet.
+ */
+function verificationTimeline(finding) {
+  if (!finding) return [];
+  const events = [];
+  const push = (at, label, tone) => {
+    const time = Date.parse(at || '');
+    if (Number.isFinite(time)) events.push({ at, time, label, tone });
+  };
+  push(finding.createdAt, 'Alerte signalée par le scanner', 'neutral');
+  push(finding.fixedAt, finding.fixSource ? `Correction appliquée (${finding.fixSource})` : 'Correction appliquée', 'medium');
+  push(finding.validationStartedAt, 'Vérification lancée', 'neutral');
+  for (const entry of Array.isArray(finding.verificationHistory) ? finding.verificationHistory : []) {
+    if (!entry?.state) continue;
+    push(entry.at, VERIFICATION_EVENT_LABELS[entry.state] || entry.state, entry.state === 'validated' ? 'low' : 'critical');
+  }
+  if (!finding.verificationHistory?.length && finding.verification?.state) {
+    push(finding.verification.at, VERIFICATION_EVENT_LABELS[finding.verification.state] || finding.verification.state,
+      finding.verification.state === 'validated' ? 'low' : 'critical');
+  }
+  return events.sort((left, right) => left.time - right.time);
+}
+
+/** Verdicts du cycle unifie, dits avec les mots du cycle et pas ceux du code. */
+const VERIFICATION_EVENT_LABELS = Object.freeze({
+  fix_proposed: 'Correction proposée', fixed: 'Correction appliquée', validating: 'Vérification en cours',
+  validated: 'Disparition confirmée par re-scan', still_present: 'Toujours présente après vérification',
+  validation_failed: 'Vérification impossible', inconclusive: 'Vérification non concluante',
+  regressed: 'Réapparue après validation'
+});
+
+/** Le dernier segment d'un chemin : ce que l'oeil cherche en premier. */
+function targetLabel(value) {
+  const text = String(value);
+  const parts = text.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : text;
+}
+
+/**
+ * Les surfaces hebergees par le cadre applicatif partage.
+ *
+ * `sidebar` (la vue etroite de la barre d'activite) et `history` (un scan
+ * archive, ouvert en lecture seule) restent hors cadre : la premiere n'a pas la
+ * largeur d'une navigation, la seconde n'est pas une page de l'application
+ * courante. Toutes les autres ouvrent desormais la meme coquille.
+ */
+const SHELLED_SURFACES = new Set(['full', 'findings', 'scans', 'dynamic', 'analytics', 'burp-settings', 'scanner-details']);
+
+/** Titre et sous-titre de la barre superieure, par page. */
+const SURFACE_TITLES = {
+  full: ['Dashboard', ''],
+  findings: ['Findings', 'Alertes, triage et corrections'],
+  scans: ['Scans', 'État, résultats et exécution des scanners'],
+  dynamic: ['Dynamic Security', 'Cible, tests dynamiques, findings et trafic HTTP capturé'],
+  analytics: ['Analytics', 'Répartition des alertes et signaux de sécurité'],
+  'burp-settings': ['Paramètres Burp', 'État du connecteur et de la capture sécurisée'],
+  'scanner-details': ['Scanner Details', 'Résultats détaillés du scanner sélectionné']
+};
+
+function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'light', uiState = {}, assets = {}) {
+  const companionImageUri = typeof assets === 'string' ? assets : assets?.companionImageUri || '';
+  const cspSource = typeof assets === 'object' ? assets?.cspSource || '' : '';
+  const renderScannerLogo = (tool, status = '') => renderScannerLogoHtml(tool, status, assets);
+  const scannerId = (tool) => scannerIdForTool(tool);
+  const renderZapPreflightModal = (preflight = {}) => {
+    const modeLabel = preflight.mode === 'openapi' ? 'OpenAPI active' : 'Active DAST';
+    return `<div class="sc-modal-overlay sc-modal-backdrop" role="presentation">
+      <section class="sc-zap-preflight" role="dialog" aria-modal="true" aria-labelledby="zap-preflight-title" aria-describedby="zap-preflight-copy" data-zap-preflight-id="${escapeHtml(preflight.id || '')}" tabindex="-1">
+        <div class="sc-zap-modal-head">
+          <div class="sc-zap-modal-logo">${renderScannerLogo('ZAP', 'running')}</div>
+          <div>
+            <span>Dynamic Security · ZAP</span>
+            <h2 id="zap-preflight-title">Autoriser l’analyse ZAP active ?</h2>
+          </div>
+          <button class="sc-modal-close" type="button" data-zap-preflight-decision="cancel" aria-label="Cancel analysis">×</button>
+        </div>
+        <p id="zap-preflight-copy" class="sc-zap-modal-copy">ZAP will send active security-test requests to this target. Active testing can send attack-like requests to the application.</p>
+        <div class="sc-zap-target">
+          <span>Target · ${escapeHtml(modeLabel)}</span>
+          <code>${escapeHtml(preflight.target || 'http://127.0.0.1:3000')}</code>
+        </div>
+        <div class="sc-zap-warning"><strong>Authorized targets only</strong><span>Only continue if you own this application or are authorized to test it.</span></div>
+        <div class="sc-zap-modal-actions">
+          <button class="secondary" type="button" data-zap-preflight-decision="passive">Use passive scan</button>
+          <button class="primary" type="button" data-zap-preflight-decision="active">Authorize active scan</button>
+          <button class="quiet-action" type="button" data-zap-preflight-decision="cancel">Cancel analysis</button>
+        </div>
+      </section>
+    </div>`;
+  };
+  const zapPreflightModal = uiState?.zapPreflight ? renderZapPreflightModal(uiState.zapPreflight) : '';
+  const inShell = SHELLED_SURFACES.has(surface);
+  const modalRoot = `<div id="security-center-modal-root">${zapPreflightModal}</div>`;
   const statusLabels = { new: 'Nouvelle', triaged: 'Triée', probable: 'Probable', confirmed: 'Confirmée', fixed: 'Corrigée — validation en attente', validated: 'Validée par re-scan', false_positive: 'Faux positif', accepted: 'Risque accepté',
     // Verification outcomes. Without these a row would print its raw slug.
     fix_proposed: 'Correction proposée', validating: 'Vérification en cours',
@@ -784,40 +1052,93 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const scanResultsTrusted = model.scanStatus === 'completed' || model.snapshotAvailable;
   const partialResultsAvailable = ['partial', 'cancelled'].includes(model.scanStatus) && completedTools.size > 0;
   const resultsAvailable = scanResultsTrusted || partialResultsAvailable;
+  const currentExecutionActive = model.scanStatus !== 'idle'
+    && !['completed', 'partial', 'cancelled', 'failed'].includes(model.scanStatus)
+    && (model.activeExecution || model.scanners.some((scanner) => scanner.currentRun));
+  const completedCurrentRunFindings = deduplicateByFingerprint(model.currentRunFindings || []);
   const optionTags = (values) => Object.keys(values).sort().map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join('');
+  const scannerOptionTags = (values) => Object.keys(values).sort().map((tool) => `<option value="${escapeHtml(scannerId(tool))}">${escapeHtml(scannerPresentation(tool).label)}</option>`).join('');
+  const reachabilityFor = (finding) => {
+    const status = finding.reachability?.status || finding.reachability?.state;
+    if (status) return String(status);
+    if (finding.reachable === true) return 'REACHABLE';
+    if (finding.reachable === false) return 'NOT_REACHABLE';
+    return 'UNKNOWN';
+  };
+  const reachabilityLabel = (value) => ({
+    REACHABLE: 'Reachable',
+    POTENTIALLY_REACHABLE: 'Potentially reachable',
+    NOT_REACHABLE: 'Not reachable',
+    UNKNOWN: 'Unknown',
+    dynamically_confirmed: 'Dynamically confirmed',
+    statically_reachable: 'Statically reachable',
+    imported: 'Imported',
+    present: 'Present',
+    not_reachable: 'Not reachable',
+    unknown: 'Unknown'
+  })[value] || String(value || 'Unknown');
+  const factBadge = (type, label) => `<span class="fact-badge ${escapeHtml(type)}">${escapeHtml(label)}</span>`;
   const findingCards = model.findings.length
     ? model.findings.map((finding, index) => {
         const severity = String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase();
         const context = finding.sourceContext || 'non classé';
         const status = finding.triageStatus || 'new';
         const location = finding.endpoint || finding.file || 'Emplacement non fourni';
-        const line = finding.startLine > 0 ? `:${finding.startLine + 1}` : '';
-        const searchable = [finding.title, finding.tool, severity, context, status, location, finding.ruleId, finding.cwe]
+        const line = Number.isFinite(Number(finding.startLine)) && Number(finding.startLine) >= 0 ? `:${Number(finding.startLine) + 1}` : '';
+        const presentation = scannerPresentation(finding.tool);
+        const stableScannerId = scannerId(finding.tool);
+        const reachability = reachabilityFor(finding);
+        const confidence = finding.confidence || finding.reachability?.confidence || finding.priority?.confidence || 'unknown';
+        const searchable = [finding.title, finding.tool, presentation.label, severity, context, status, location, finding.ruleId, finding.cwe, reachability, confidence]
           .filter(Boolean).join(' ').toLowerCase();
-        return `<article class="finding-card" tabindex="0" data-search="${escapeHtml(searchable)}" data-tool="${escapeHtml(finding.tool)}" data-severity="${escapeHtml(severity)}" data-status="${escapeHtml(status)}" data-title="${escapeHtml(finding.title)}" data-location="${escapeHtml(location)}${escapeHtml(line)}" data-rule="${escapeHtml(finding.ruleId || finding.cwe || 'Règle non renseignée')}">
+        return `<article class="finding-card" tabindex="0"
+          data-search="${escapeHtml(searchable)}"
+          data-tool="${escapeHtml(finding.tool)}"
+          data-tool-id="${escapeHtml(stableScannerId)}"
+          data-tool-label="${escapeHtml(presentation.label)}"
+          data-severity="${escapeHtml(severity)}"
+          data-status="${escapeHtml(status)}"
+          data-context="${escapeHtml(context)}"
+          data-reachability="${escapeHtml(reachability)}"
+          data-reachability-label="${escapeHtml(reachabilityLabel(reachability))}"
+          data-title="${escapeHtml(finding.title || 'Security finding')}"
+          data-location="${escapeHtml(location)}${escapeHtml(line)}"
+          data-rule="${escapeHtml(finding.ruleId || finding.cwe || 'Rule unavailable')}"
+          data-confidence="${escapeHtml(confidence)}"
+          data-description="${escapeHtml(finding.description || finding.developerSummary || 'No short description was provided by the scanner.')}">
           <div class="finding-accent ${semanticClass(severity)}"></div>
+          <div class="finding-source">
+            ${renderScannerLogo(finding.tool, status)}
+            <span>${escapeHtml(presentation.label)}</span>
+          </div>
           <div class="finding-main">
             <div class="finding-top">
               <span class="severity-badge ${semanticClass(severity)}">${escapeHtml(severity)}</span>
-              <span class="tool-badge">${escapeHtml(finding.tool)}</span>
-              <span class="context-badge">${escapeHtml(context)}</span>
-              <span class="triage-badge">${escapeHtml(statusLabels[status] || status)}</span>
+              ${factBadge('status', statusLabels[status] || status)}
+              ${factBadge('context', context)}
+              ${factBadge('reachability', reachabilityLabel(reachability))}
               ${finding.staleFromPreviousScan ? '<span class="triage-badge">Données du scan précédent</span>' : ''}
             </div>
-            <strong class="finding-title">${escapeHtml(finding.title)}</strong>
+            <strong class="finding-title">${escapeHtml(finding.title || 'Security finding')}</strong>
             <span class="finding-location">${escapeHtml(location)}${escapeHtml(line)}</span>
-            <small>${escapeHtml(finding.ruleId || finding.cwe || 'Règle non renseignée')}</small>
+            <small>${escapeHtml(finding.ruleId || finding.cwe || 'Rule unavailable')} · Confidence ${escapeHtml(confidence)}</small>
+          </div>
+          <div class="finding-state">
+            <span>${escapeHtml(statusLabels[status] || status)}</span>
+            <small>${escapeHtml(reachabilityLabel(reachability))}</small>
           </div>
           <div class="finding-card-actions">
             ${finding.absolutePath ? `<button class="finding-code" data-finding-code-index="${index}" title="Ouvrir le fichier à la ligne concernée">Ouvrir le code</button>` : ''}
-            <button class="finding-open" data-finding-index="${index}" title="Afficher toutes les preuves et recommandations">Voir les détails →</button>
+            <button class="finding-open" data-finding-index="${index}" title="Afficher toutes les preuves et recommandations">Investigate →</button>
           </div>
         </article>`;
       }).join('')
     : '<div class="empty">Aucune vulnérabilité à afficher. Lancez une analyse du workspace.</div>';
-  const currentFindings = resultsAvailable
-    ? model.findings.filter((finding) => !finding.staleFromPreviousScan && (model.snapshotAvailable || scanResultsTrusted || completedTools.has(finding.tool)))
-    : [];
+  const currentFindings = currentExecutionActive
+    ? completedCurrentRunFindings
+    : resultsAvailable
+      ? model.findings.filter((finding) => !finding.staleFromPreviousScan && (model.snapshotAvailable || scanResultsTrusted || completedTools.has(finding.tool)))
+      : [];
   const priorityFindings = currentFindings
     .filter((finding) => !finding.staleFromPreviousScan
       && !['false_positive', 'fixed', 'validated', 'accepted'].includes(finding.triageStatus)
@@ -1090,7 +1411,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       const endpoint = finding.endpoint || finding.url || finding.route || finding.file || 'Endpoint non fourni';
       const method = finding.method ? `${String(finding.method).toUpperCase()} ` : '';
       const matchingBurpScenario = burpScenarios.find((scenario) => linkedFindingsForScenario(scenario, [finding]).length > 0);
-      const correlations = model.correlations.filter((correlation) => correlation.findingIds?.includes(finding.id));
+      // Source attribution stays on V1 on purpose: it is keyed on the V1
+      // `endpoint-source` type and on pairwise correlations. Switching it to V2
+      // would silently downgrade every « Likely source » to « Possible source ».
+      const correlations = model.legacyCorrelations.filter((correlation) => correlation.findingIds?.includes(finding.id));
       const sources = [...new Set([
         finding.tool,
         ...(finding.correlatedTools || []),
@@ -1100,7 +1424,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       const sourceLabel = sources.length > 1 ? sources.join(' + ') : sources[0] || 'Dynamic';
       const correlationLabel = sources.length > 1 ? `<span class="dynamic-correlation">${sources.length} sources</span>` : '';
       const status = finding.triageStatus || 'new';
-      const sourceCorrelation = sourceCorrelationForFinding(finding, model.findings, model.correlations);
+      const sourceCorrelation = sourceCorrelationForFinding(finding, model.findings, model.legacyCorrelations);
       const sourceLocation = sourceCorrelation
         ? `${sourceCorrelation.finding.file || sourceCorrelation.finding.absolutePath}${sourceCorrelation.finding.startLine ? `:${sourceCorrelation.finding.startLine}` : ''}`
         : '';
@@ -1115,66 +1439,101 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .join('') || '<div class="empty">Aucun finding dynamique HIGH ou CRITICAL actif.</div>';
   const recentDynamicRows = model.httpScenarios.slice(0, 8).map((scenario) => `<div class="dynamic-row"><div><strong>${escapeHtml(scenario.name || `${scenario.request?.method || 'HTTP'} ${endpointPath(scenario.request?.url)}`)}</strong><small>${escapeHtml(scenario.request?.method || 'HTTP')} • ${escapeHtml(scenario.request?.url || 'URL non fournie')} • ${escapeHtml(scenario.source || 'capture')}</small></div></div>`).join('') || '<div class="empty">Aucun test dynamique récent.</div>';
   const scannerRows = model.scanners.length
-    ? model.scanners.map((scanner, index) => `<div class="scanner">
-        <div class="scanner-index ${scanner.status}">${scanner.status === 'completed' ? '✓' : scanner.status === 'failed' ? '!' : index + 1}</div>
-        <div class="scanner-copy"><strong>${escapeHtml(scanner.tool)}</strong>${scanner.details ? `<small>${escapeHtml(scanner.details)}</small>` : ''}${scanner.error ? `<small class="scanner-error">${escapeHtml(summarizeScannerError(scanner.error))}</small>` : ''}</div>
-        <span class="status ${scanner.status}">${escapeHtml(scanner.status)}</span>
-      </div>`).join('')
+    ? model.scanners.map((scanner) => {
+      const count = currentScannerResultCount(scanner, currentFindings);
+      const duration = scanner.status === 'completed' && scanner.durationMs ? formatDuration(scanner.durationMs) : '—';
+      const completedAt = scanner.completedAt ? new Date(scanner.completedAt).toLocaleString('fr-FR') : '—';
+      const resultSummary = scannerResultSummary(scanner, currentFindings);
+      const failedActions = scanner.status === 'failed'
+        ? `<div class="scan-row-actions"><button class="secondary" data-retry-scanner="${escapeHtml(scanner.tool)}">Retry</button><button class="secondary" data-command="securityCenter.openScannerSetup">Configure</button></div>`
+        : '';
+      const details = scanner.status === 'failed' && scanner.error
+        ? `<small class="scan-row-error">${escapeHtml(summarizeScannerError(scanner.error))}</small>`
+        : scanner.details
+          ? `<small>${escapeHtml(scanner.details)}</small>`
+          : '';
+      return `<article class="scanner scan-scanner-row overview-scanner ${escapeHtml(scanner.status)}" data-scanner-id="${escapeHtml(scannerId(scanner.tool))}">
+        ${renderScannerLogo(scanner.tool, scanner.status)}
+        <div class="scanner-identity"><strong>${escapeHtml(scannerPresentation(scanner.tool).label)}</strong><small>${escapeHtml(scannerCategoryLabel(scanner.tool))}</small>${details}</div>
+        <span class="scanner-result-summary ${escapeHtml(scanner.status)}">${escapeHtml(resultSummary)}</span>
+        <span class="scanner-value"><strong>${count === null ? '—' : count}</strong><small>current run</small></span>
+        <span class="scanner-value"><strong>${escapeHtml(duration)}</strong><small>duration</small></span>
+        <time>${escapeHtml(completedAt)}</time>
+        <span class="scan-status-chip ${escapeHtml(scanner.status)}">${escapeHtml(scannerStatusLabel(scanner.status))}</span>
+        ${failedActions}
+        <button class="scanner-chevron" data-scanner-id="${escapeHtml(scannerId(scanner.tool))}" data-scanner="${escapeHtml(scanner.tool)}" aria-label="Voir les détails de ${escapeHtml(scanner.tool)}">›</button>
+      </article>`;
+    }).join('')
     : '<div class="empty">Aucun scanner exécuté</div>';
-  const disabledScannerRows = model.disabledScanners.map((tool) => `<div class="scanner disabled">
-        <div class="scanner-index disabled">–</div>
-        <div class="scanner-copy"><strong>${escapeHtml(tool)}</strong><small>Non inclus dans cette analyse</small></div>
-        <span class="status disabled">Désactivé</span>
-      </div>`).join('');
+  const disabledScannerRows = model.disabledScanners.map((tool) => `<article class="scanner scan-scanner-row overview-scanner disabled" data-scanner-id="${escapeHtml(scannerId(tool))}">
+        ${renderScannerLogo(tool, 'disabled')}
+        <div class="scanner-identity"><strong>${escapeHtml(scannerPresentation(tool).label)}</strong><small>${escapeHtml(scannerCategoryLabel(tool))}</small><small>Désactivé · Non inclus dans cette analyse</small></div>
+        <span class="scanner-result-summary disabled">No current execution</span>
+        <span class="scanner-value"><strong>—</strong><small>current run</small></span>
+        <span class="scanner-value"><strong>—</strong><small>duration</small></span>
+        <time>—</time>
+        <span class="scan-status-chip disabled">NOT CONFIGURED</span>
+        <button class="scanner-chevron" data-command="securityCenter.openScannerSetup" data-scanner-id="${escapeHtml(scannerId(tool))}" aria-label="Configurer ${escapeHtml(tool)}">›</button>
+      </article>`).join('');
   const overviewScannerRows = model.scanners.length
     ? model.scanners.map((scanner) => {
-      const count = currentFindings.filter((finding) => finding.tool === scanner.tool).length;
-      const [description, icon] = SCANNER_PRESENTATION[scanner.tool] || ['Scanner de sécurité', 'shield'];
+      const scannerRunFindings = Array.isArray(scanner.currentRun?.findings) ? scanner.currentRun.findings : [];
+      const count = scanner.status === 'completed'
+        ? Number(scanner.currentRun?.resultCount ?? currentFindings.filter((finding) => finding.tool === scanner.tool).length)
+        : null;
+      const presentation = scannerPresentation(scanner.tool);
+      const description = presentation.description;
       const completedAt = scanner.completedAt ? new Date(scanner.completedAt).toLocaleString('fr-FR') : '—';
-      const duration = scanner.durationMs ? formatDuration(scanner.durationMs) : '—';
+      const duration = scanner.status === 'completed' && scanner.durationMs ? formatDuration(scanner.durationMs) : '—';
       const statusLabel = scanner.status === 'completed' ? 'Prêt' : scanner.status === 'running' || scanner.status === 'refreshing' ? 'En cours' : scanner.status === 'failed' ? 'Échec' : 'En attente';
       return `<div class="overview-scanner">
-        <span class="scanner-logo ${escapeHtml(scanner.status)}">${compactIcon(icon)}</span>
+        ${renderScannerLogo(scanner.tool, scanner.status)}
         <div class="scanner-identity"><strong>${escapeHtml(scanner.tool)}</strong><small>${escapeHtml(description)}</small></div>
         <span class="scanner-ready ${escapeHtml(scanner.status)}">${escapeHtml(statusLabel)}</span>
-        <span class="scanner-value"><strong>${count}</strong><small>alertes</small></span>
+        <span class="scanner-value"><strong>${count === null ? '—' : count}</strong><small>alertes${scannerRunFindings.length && scanner.status === 'completed' ? ' run' : ''}</small></span>
         <span class="scanner-value"><strong>${escapeHtml(duration)}</strong><small>durée</small></span>
         <time>${escapeHtml(completedAt)}</time>
-        <button class="scanner-chevron" data-scanner="${escapeHtml(scanner.tool)}" aria-label="Voir les détails de ${escapeHtml(scanner.tool)}">›</button>
+        <button class="scanner-chevron" data-scanner-id="${escapeHtml(scannerId(scanner.tool))}" data-scanner="${escapeHtml(scanner.tool)}" aria-label="Voir les détails de ${escapeHtml(scanner.tool)}">›</button>
       </div>`;
     }).join('')
     : '<div class="empty">Aucun scanner exécuté.</div>';
   // No finding count and no duration: these scanners never ran.
   const overviewDisabledRows = model.disabledScanners.map((tool) => {
-    const [description, icon] = SCANNER_PRESENTATION[tool] || ['Scanner de sécurité', 'shield'];
+    const presentation = scannerPresentation(tool);
+    const description = presentation.description;
     return `<div class="overview-scanner disabled">
-        <span class="scanner-logo disabled">${compactIcon(icon)}</span>
+        ${renderScannerLogo(tool, 'disabled')}
         <div class="scanner-identity"><strong>${escapeHtml(tool)}</strong><small>${escapeHtml(description)}</small></div>
         <span class="scanner-ready disabled">Désactivé</span>
         <span class="scanner-value"><strong>—</strong><small>alertes</small></span>
         <span class="scanner-value"><strong>—</strong><small>durée</small></span>
         <time>—</time>
-        <button class="scanner-chevron" data-command="securityCenter.openScannerSetup" aria-label="Configurer ${escapeHtml(tool)}">›</button>
+        <button class="scanner-chevron" data-command="securityCenter.openScannerSetup" data-scanner-id="${escapeHtml(scannerId(tool))}" aria-label="Configurer ${escapeHtml(tool)}">›</button>
       </div>`;
   }).join('');
   const correlationRows = model.correlations.length
     ? model.correlations.map((correlation) => `<div class="correlation">
         <strong>${escapeHtml(correlation.title)}</strong>
         <span>${escapeHtml(correlation.tools.join(' + '))} • confiance ${escapeHtml(correlation.confidence)}</span>
-        <small>${escapeHtml(correlation.reason)}</small>
+        <small>${escapeHtml(Array.isArray(correlation.reasons) ? correlation.reasons.join(' · ') : correlation.reason)}</small>
       </div>`).join('')
     : '<div class="empty">Aucune correspondance multi-outils</div>';
   const terminalStatuses = ['completed', 'partial', 'cancelled', 'failed'];
   const statusClass = model.scanStatus === 'completed' ? 'completed' : ['failed', 'cancelled', 'partial'].includes(model.scanStatus) ? 'failed' : 'running';
   const scanRunning = model.scanStatus !== 'idle' && !terminalStatuses.includes(model.scanStatus);
   const hasScanned = model.scanners.length > 0 || model.total > 0 || terminalStatuses.includes(model.scanStatus);
-  const completedCount = model.scanners.filter((scanner) => scanner.status === 'completed' || scanner.previousValidResult).length;
-  const failedTools = model.scanners.filter((scanner) => scanner.status === 'failed' && !scanner.previousValidResult).map((scanner) => scanner.tool);
+  const finishedCount = Number.isFinite(Number(model.finishedScanners))
+    ? Number(model.finishedScanners)
+    : model.scanners.filter(isTerminalScannerStatus).length;
+  const successfulCount = Number.isFinite(Number(model.successfulScanners))
+    ? Number(model.successfulScanners)
+    : model.scanners.filter((scanner) => scanner.status === 'completed').length;
+  const failedTools = model.scanners.filter((scanner) => scanner.status === 'failed').map((scanner) => scanner.tool);
   const failedScanners = model.scanners.filter((scanner) => scanner.status === 'failed');
   const cancelledTools = model.scanners.filter((scanner) => scanner.status === 'cancelled').map((scanner) => scanner.tool);
   const scanStatusLabel = model.scanStatus === 'cancelled'
-    ? `Scan partiel — ${completedCount}/${model.scanners.length} scanners terminés${cancelledTools.length ? ` — ${cancelledTools.join(', ')} annulé${cancelledTools.length > 1 ? 's' : ''}` : ''}`
-    : model.scanStatus === 'partial' ? `Scan partiel — ${completedCount}/${model.scanners.length} scanners terminés` : model.scanStatus;
+    ? `Scan partiel — ${finishedCount}/${model.scanners.length} scanners terminés${cancelledTools.length ? ` — ${cancelledTools.join(', ')} annulé${cancelledTools.length > 1 ? 's' : ''}` : ''}`
+    : model.scanStatus === 'partial' ? `Scan partiel — ${finishedCount}/${model.scanners.length} scanners terminés${failedScanners.length ? ` — ${successfulCount}/${model.scanners.length} réussis` : ''}` : model.scanStatus;
   const scanLabel = scanRunning ? 'Analyse en cours…' : hasScanned ? '↻ Relancer' : '▶ Lancer';
   const fullHeaderAction = surface === 'full'
     ? `<button class="header-scan" data-command="securityCenter.scanWorkspace" ${scanRunning ? 'disabled' : ''}>${scanLabel}</button>`
@@ -1203,15 +1562,37 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   // inside it would have been invisible on the full dashboard. The sidebar keeps
   // none — it is a narrow strip and the tree below it needs the space.
   const COMPANION_SURFACES = ['full', 'findings', 'scans', 'dynamic', 'analytics'];
-  const companionPresence = COMPANION_SURFACES.includes(surface)
+  // Une seule mascotte par surface. La carte d'assistant du rail porte desormais
+  // le personnage sur les pages ou elle s'affiche ; le widget flottant n'y est
+  // donc plus dessine. Il reste la presence par defaut partout ou la carte n'a
+  // aucun fait reel a rapporter. `assistantCard` est calcule plus bas, avec le
+  // reste du rail : cette variable est resolue apres lui.
+  const companionWidgetFor = (assistantCard) => (COMPANION_SURFACES.includes(surface) && !assistantCard
     ? renderCompanionWidget(model.companion, { variant: 'compact', enabled: model.companionEnabled !== false, interactive: true })
-    : '';
+    : '');
   const failureDiagnostics = surface === 'full' && failedScanners.length
-    ? `<section class="failure-diagnostics"><div><span class="failure-kicker">⚠ Scan incomplet</span><strong>${completedCount}/${model.scanners.length} scanners terminés</strong><p>${failedScanners.map((scanner) => `${escapeHtml(scanner.tool)} : ${escapeHtml(summarizeScannerError(scanner.error))}`).join(' • ')}</p></div><div class="failure-actions"><button class="secondary" data-command="securityCenter.scanSelected">Réessayer</button><button class="quiet-action" data-command="securityCenter.showLogs">Journal →</button></div></section>`
+    ? `<section class="failure-diagnostics"><div><span class="failure-kicker">⚠ Scan incomplet</span><strong>${finishedCount}/${model.scanners.length} scanners terminés · ${successfulCount}/${model.scanners.length} réussis</strong><p>${failedScanners.map((scanner) => `${escapeHtml(scanner.tool)} : ${escapeHtml(summarizeScannerError(scanner.error))}`).join(' • ')}</p></div><div class="failure-actions"><button class="secondary" data-command="securityCenter.scanSelected">Réessayer</button><button class="quiet-action" data-command="securityCenter.showLogs">Journal →</button></div></section>`
     : '';
   const currentRiskScore = calculateRiskScore(currentActiveFindings);
   const displayedRiskScore = resultsAvailable ? currentRiskScore : 0;
-  const displayedRiskLevel = scanRunning && !model.snapshotAvailable ? 'en recalcul' : partialResultsAvailable && !model.snapshotAvailable ? `${riskLevel(currentRiskScore)} (partiel)` : scanResultsTrusted ? riskLevel(currentRiskScore) : 'non évalué';
+  const displayedRiskLevel = currentExecutionActive
+    ? (completedCurrentRunFindings.length ? `${riskLevel(currentRiskScore)} (run partiel)` : 'en recalcul')
+    : scanRunning && !model.snapshotAvailable ? 'en recalcul' : partialResultsAvailable && !model.snapshotAvailable ? `${riskLevel(currentRiskScore)} (partiel)` : scanResultsTrusted ? riskLevel(currentRiskScore) : 'non évalué';
+  const riskExplanation = currentExecutionActive
+    ? (currentActiveFindings.length
+      ? 'Score partiel calculé uniquement avec les scanners déjà terminés dans le run courant.'
+      : 'Run courant en attente du premier scanner terminé : aucun ancien résultat n’est compté ici.')
+    : scanRunning && model.snapshotAvailable
+      ? `La posture workspace reste visible depuis le snapshot consolidé pendant l’actualisation ${escapeHtml(model.executionType || 'partielle')}.`
+      : scanRunning
+        ? 'Calcul en attente du premier résultat exploitable.'
+        : partialResultsAvailable
+          ? `Score partiel calculé uniquement avec ${completedTools.size} scanner(s) terminé(s). Un outil en échec n’est jamais interprété comme zéro alerte.`
+          : scanResultsTrusted
+            ? 'Score calculé à partir des résultats valides les plus récents de chaque scanner.'
+            : 'Aucun scanner n’a terminé avec des résultats exploitables. Le risque courant ne peut pas être évalué.';
+  const activeFindingsCardLabel = currentExecutionActive ? 'Alertes actives du run' : 'Alertes actives';
+  const scanResultsCardLabel = currentExecutionActive ? 'Résultats du run courant' : 'Résultats du scan';
   const riskClass = displayedRiskScore >= 80 ? 'critical' : displayedRiskScore >= 55 ? 'high' : displayedRiskScore >= 25 ? 'medium' : 'low';
   const zapScanner = model.scanners.find((scanner) => scanner.tool === 'ZAP');
   const zapPolicy = model.policyResult?.policy;
@@ -1240,16 +1621,324 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const targetEvidenceLabel = targetEvidence
     ? `${targetEvidence.source === 'zap-scan' ? 'Confirmée par l’analyse ZAP' : 'Vérifiée directement'} le ${new Date(targetEvidence.at).toLocaleString('fr-FR')}`
     : '';
-  const zapCard = `<section class="zap-card ${escapeHtml(zapScanner?.status || 'idle')}"><div><span class="zap-kicker">Analyse dynamique</span><h4>ZAP — ${escapeHtml(zapMode)}</h4><p>${escapeHtml(zapScanner?.error ? summarizeScannerError(zapScanner.error) : `${zapFindingCount} alerte(s) runtime • ${zapAuth}`)}</p></div><div class="zap-meta"><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP uniquement</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Installer / configurer ZAP</button></div></section>`;
+  const zapCurrentCount = currentScannerResultCount(zapScanner, currentFindings);
+  const zapDuration = zapScanner?.durationMs ? formatDuration(zapScanner.durationMs) : '';
+  const zapLastScan = zapScanner?.completedAt ? new Date(zapScanner.completedAt).toLocaleString('fr-FR') : '';
+  const zapCard = surface === 'scans'
+    ? `<section class="zap-card zap-execution-card ${escapeHtml(zapScanner?.status || 'idle')}">
+      <div class="zap-execution-head">
+        <span class="zap-kicker">Dynamic Security</span>
+        <div class="zap-title-row">${renderScannerLogo('ZAP', zapScanner?.status || 'pending')}<div><h4>ZAP</h4><p>${escapeHtml(zapMode)}</p></div></div>
+      </div>
+      <div class="zap-execution-grid">
+        <div class="zap-execution-fact"><span>Findings</span><strong>${zapCurrentCount === null ? '—' : escapeHtml(zapCurrentCount)}</strong><small>${zapScanner?.status === 'completed' ? 'current run' : escapeHtml(scannerResultSummary(zapScanner, currentFindings))}</small></div>
+        <div class="zap-execution-fact"><span>Scan mode</span><strong>${escapeHtml(zapAuth)}</strong><small>${escapeHtml(zapMode)}</small></div>
+        ${zapDuration ? `<div class="zap-execution-fact"><span>Last scan</span><strong>${escapeHtml(zapDuration)}</strong>${zapLastScan ? `<small>${escapeHtml(zapLastScan)}</small>` : ''}</div>` : ''}
+        ${targetOrigin ? `<div class="zap-execution-fact target"><span>Target</span><strong>${escapeHtml(targetOrigin)}</strong>${targetEvidenceLabel ? `<small>${escapeHtml(targetEvidenceLabel)}</small>` : ''}</div>` : ''}
+      </div>
+      ${zapScanner?.error ? `<p class="zap-execution-error">${escapeHtml(summarizeScannerError(zapScanner.error))}</p>` : ''}
+      <div class="zap-meta"><span class="scan-status-chip ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(scannerStatusLabel(zapScanner?.status || 'pending'))}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Configurer</button></div>
+    </section>`
+    : `<section class="zap-card ${escapeHtml(zapScanner?.status || 'idle')}"><div><span class="zap-kicker">Analyse dynamique</span><h4>ZAP — ${escapeHtml(zapMode)}</h4><p>${escapeHtml(zapScanner?.error ? summarizeScannerError(zapScanner.error) : `${zapFindingCount} alerte(s) runtime • ${zapAuth}`)}</p></div><div class="zap-meta"><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP uniquement</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Installer / configurer ZAP</button></div></section>`;
+  const scanSuccessCount = model.scanners.filter((scanner) => scanner.status === 'completed').length;
+  const scanWaitingCount = model.scanners.filter((scanner) => ['pending', 'running', 'refreshing'].includes(scanner.status)).length;
+  const scansCurrentFindingTotal = model.scanners.reduce((sum, scanner) => {
+    const count = currentScannerResultCount(scanner, currentFindings);
+    return count === null ? sum : sum + count;
+  }, 0);
+  const scansExecutionSummary = surface === 'scans'
+    ? `<section class="scan-execution-summary" aria-label="Résumé d'exécution des scanners">
+        <div class="scan-summary-copy"><span>Execution and scanner health</span><strong>${escapeHtml(finishedCount)}/${escapeHtml(model.scanners.length)} scanners terminés</strong></div>
+        <div class="scan-summary-metrics">
+          <div class="scan-summary-stat success"><span>Successful</span><strong>${scanSuccessCount}</strong></div>
+          <div class="scan-summary-stat failed"><span>Failed</span><strong>${failedScanners.length}</strong></div>
+          <div class="scan-summary-stat waiting"><span>Waiting</span><strong>${scanWaitingCount}</strong></div>
+          <div class="scan-summary-stat total"><span>Total findings</span><strong>${scansCurrentFindingTotal}</strong></div>
+          <div class="scan-summary-stat dynamic"><span>Dynamic</span><strong>${zapCurrentCount === null ? '—' : zapCurrentCount}</strong></div>
+        </div>
+      </section>`
+    : '';
+  // Le chrono et le bouton de theme existent en un seul exemplaire dans le
+  // document : les deux en-tetes se les partagent, jamais ne les dupliquent.
+  const initialThemeIcon = selectedTheme === 'dark' ? '☀' : '☾';
+  const initialThemeLabel = selectedTheme === 'dark' ? 'Passer au thème clair' : 'Passer au thème sombre';
+  const themeToggleButton = `<button id="theme-toggle" class="theme-toggle" title="${initialThemeLabel}" aria-label="${initialThemeLabel}"><span class="theme-toggle-icon" aria-hidden="true">${initialThemeIcon}</span></button>`;
+  const scanChronoBadge = scanRunning
+    ? `<span id="scan-chrono" class="scan-chrono" data-started-at="${escapeHtml(model.scanStartedAt)}" data-elapsed="${model.scanDurationMs}">◷ ${escapeHtml(formatDuration(model.scanDurationMs))}</span>`
+    : '';
+  const backendTone = model.backendStatus === 'online' ? 'online' : ['offline', 'error', 'unreachable'].includes(String(model.backendStatus)) ? 'offline' : 'unknown';
+  // Le dashboard complet porte deja son nom dans la barre laterale interne : le
+  // haut de page nomme la vue, pas le produit. Les autres surfaces gardent leur
+  // en-tete d'origine, inchange.
+  // Une seule barre superieure pour toutes les pages hebergees. Le nom du
+  // produit vit dans le rail de navigation : le repeter au-dessus de chaque page
+  // etait le signe visuel que l'on venait d'ouvrir une autre application.
+  const [surfaceTitle, surfaceSubtitle] = SURFACE_TITLES[surface] || ['Security Center', ''];
+  const shellSubtitle = surface === 'full'
+    ? `Vue de sécurité du workspace <span class="sc-topbar-workspace">${escapeHtml(model.workspace)}</span>`
+    : surface === 'scanner-details' && model.activeScanner
+      ? escapeHtml(String(model.activeScanner))
+      : escapeHtml(surfaceSubtitle);
+  const headerBar = inShell
+    ? `<header class="sc-topbar">
+      <div class="sc-topbar-title"><h1>${escapeHtml(surfaceTitle)}</h1><p>${shellSubtitle}</p></div>
+      <div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend ${backendTone}">Backend ${escapeHtml(model.backendStatus)}</span></div></div>
+    </header>`
+    : `<div class="header"><div><h2>Security Center</h2><div class="workspace">${escapeHtml(model.workspace)}</div></div><div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend">Backend ${escapeHtml(model.backendStatus)}</span></div></div></div>`;
+
+  // Zones les plus exposees : un regroupement de `currentActiveFindings`, la
+  // liste que la page affiche deja. Aucune analyse supplementaire.
+  const riskyTargets = topRiskyTargets(currentActiveFindings);
+  const riskyTargetRows = riskyTargets.length
+    ? riskyTargets.map((entry) => `<div class="risky-target"><span class="risky-dot ${severityTone(entry.severity)}"></span><div class="risky-copy"><strong>${escapeHtml(targetLabel(entry.target))}</strong><small>${escapeHtml(entry.target)}</small></div><span class="risky-severity ${severityTone(entry.severity)}">${escapeHtml(entry.severity || '—')}</span><span class="risky-count">${entry.count}</span></div>`).join('')
+    : `<div class="empty">${resultsAvailable ? 'Aucune alerte active rattachée à un fichier ou un endpoint.' : 'Les zones exposées apparaîtront après un premier scanner terminé.'}</div>`;
+
+  const overviewTripleRow = `<div class="overview-triple">
+    <section class="overview-panel"><div class="overview-panel-head"><strong>Alertes par sévérité</strong><button data-command="securityCenter.openFindingsPage">Voir tout →</button></div>${renderSeverityDonut(prioritySummary)}</section>
+    <section class="overview-panel"><div class="overview-panel-head"><strong>Dernières analyses</strong><button data-command="securityCenter.showScanHistoryPage">Voir tout l'historique →</button></div><div class="recent-scans">${recentScanRows}</div></section>
+    <section class="overview-panel"><div class="overview-panel-head"><strong>Zones les plus exposées</strong><button data-command="securityCenter.openFindingsPage">Findings →</button></div><div class="risky-targets">${riskyTargetRows}</div></section>
+  </div>`;
+
+  const enterprise = model.enterprise && typeof model.enterprise === 'object' ? model.enterprise : null;
+  const enterpriseTone = (status) => {
+    const value = String(status || '').toLowerCase();
+    if (['healthy', 'online', 'success'].includes(value)) return 'ok';
+    if (['degraded', 'query-error', 'timeout', 'running', 'unstable'].includes(value)) return 'warn';
+    if (['offline', 'auth-error', 'error', 'failed'].includes(value)) return 'bad';
+    return 'muted';
+  };
+  const delivery = enterprise?.delivery || {};
+  const prometheus = enterprise?.prometheus || {};
+  const runtime = enterprise?.runtime || {};
+  const deliveryState = delivery.state === 'SUCCESS' ? 'success' : delivery.state === 'ERROR' || delivery.state === 'FAILED' ? 'error' : delivery.configured ? 'degraded' : 'not-configured';
+  const COMPANION_STATE_LABELS = { idle: 'En veille', analyzing: 'Analyse en cours', clean: 'Aucun problème', findings: 'Problèmes détectés', degraded: 'Mode réduit', disabled: 'Désactivé', error: 'Erreur' };
+  const companionVisual = model.companionEnabled === false ? null : model.companion;
+  const companionStateLabel = model.companionEnabled === false ? 'Disabled' : model.companion ? (COMPANION_STATE_LABELS[model.companion.state] || String(model.companion.state || 'Active')) : 'Not reporting';
+  const appTone = criticalCount || highCount ? 'bad' : model.total ? 'warn' : 'ok';
+  const appState = criticalCount ? 'At risk' : highCount ? 'Attention' : model.total ? 'Review' : 'Healthy';
+  const deliveryLabel = delivery.configured
+    ? (delivery.build?.number ? `Jenkins build #${delivery.build.number} · ${delivery.state}` : `Jenkins · ${delivery.state || 'Connected'}`)
+    : 'Jenkins not configured';
+  const infrastructureLabel = prometheus.configured
+    ? `Prometheus · CPU ${prometheus.metrics?.cpu?.display || 'Unavailable'} · RAM ${prometheus.metrics?.memory?.display || 'Unavailable'}`
+    : 'Connect observability';
+  const runtimeLabel = runtime.configured
+    ? `${runtime.label || 'SIEM'} · ${runtime.alertSummary?.critical || 0} Critical · ${runtime.alertSummary?.high || 0} High`
+    : 'Connect a SIEM provider';
+  const companionTone = model.companionEnabled === false ? 'muted' : model.companion?.state === 'error' ? 'bad' : model.companion?.state === 'degraded' ? 'warn' : 'ok';
+  const domainCard = ({ title, icon, tone, status, metric, detail, command, action }) => `<article class="domain-card ${escapeHtml(tone)}">
+    <div class="domain-card-head"><span class="domain-icon">${compactIcon(icon)}</span><strong><i class="enterprise-dot ${escapeHtml(tone)}"></i>${escapeHtml(status)}</strong></div>
+    <div class="domain-card-body"><span>${escapeHtml(title)}</span><strong>${escapeHtml(metric)}</strong><p>${escapeHtml(detail)}</p></div>
+    <button class="domain-cta" data-command="${escapeHtml(command)}">${escapeHtml(action)} →</button>
+  </article>`;
+  const enterpriseSummary = `<section class="overview-panel enterprise-summary">
+    <div class="overview-panel-head"><strong>Security Domains</strong><button data-command="securityCenter.configureTeamIntegrations">Manage providers →</button></div>
+    <div class="enterprise-domain-grid">
+      ${domainCard({ title: 'Application Security', icon: 'shield', tone: appTone, status: appState, metric: `${model.activeTotal} active findings`, detail: `${criticalCount} Critical · ${highCount} High`, command: 'securityCenter.openFindingsPage', action: 'View findings' })}
+      ${domainCard({ title: 'Runtime Security', icon: 'pulse', tone: enterpriseTone(runtime.status), status: runtime.configured ? String(runtime.status || 'Configured') : 'Not configured', metric: runtime.configured ? (runtime.label || 'SIEM') : 'SIEM provider', detail: runtimeLabel, command: runtime.configured ? 'securityCenter.openRuntimeSecurity' : 'securityCenter.configureSiem', action: runtime.configured ? 'Open runtime' : 'Configure' })}
+      ${domainCard({ title: 'Delivery Security', icon: 'play', tone: enterpriseTone(deliveryState), status: delivery.configured ? String(delivery.state || 'Connected') : 'Not configured', metric: 'Jenkins', detail: deliveryLabel, command: 'securityCenter.openSecurityDelivery', action: 'View delivery' })}
+      ${domainCard({ title: 'Infrastructure', icon: 'cube', tone: enterpriseTone(prometheus.status), status: prometheus.configured ? String(prometheus.status || 'Configured') : 'Not configured', metric: prometheus.configured ? (prometheus.label || 'Observability') : 'Observability', detail: infrastructureLabel, command: prometheus.configured ? 'securityCenter.openInfrastructure' : 'securityCenter.configureObservability', action: prometheus.configured ? 'Open infrastructure' : 'Configure' })}
+      ${domainCard({ title: 'AI Companion', icon: 'shield', tone: companionTone, status: companionStateLabel, metric: model.companionEnabled === false ? 'Disabled' : 'Active context', detail: companionVisual ? (companionVisual.shortMessage || 'Security context is available') : 'Open Live Security for context', command: 'securityCenter.openLiveSecurityPage', action: 'Open Companion' })}
+    </div>
+  </section>`;
+  const severityHeroMetrics = [
+    ['Critical', criticalCount, 'critical'],
+    ['High', highCount, 'high'],
+    ['Medium', prioritySummary.medium, 'medium'],
+    ['Low', prioritySummary.low, 'low']
+  ].map(([label, value, tone]) => `<div class="overview-kpi hero-metric ${tone}"><span class="hero-metric-label"><i class="hero-metric-dot ${tone}"></i>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
+  const scannerTotal = model.scanners.length;
+  const scannerCoveragePercent = scannerTotal > 0 ? Math.round(model.completedScanners / scannerTotal * 100) : 0;
+  const scannerCoverageLabel = scannerTotal > 0
+    ? `${model.completedScanners} completed${failedTools.length ? ` · ${failedTools.length} failed` : ''}`
+    : 'No scanners configured';
+  const operationsHeroMetrics = `<div class="overview-kpi hero-metric production"><span class="hero-metric-label">${compactIcon('play')}Production</span><strong>${escapeHtml(currentProductionPriority)}</strong><small>priority findings</small></div>
+    <div class="overview-kpi hero-metric scanners"><div class="scanner-coverage-head"><span class="hero-metric-label">${compactIcon('pulse')}Scanner coverage</span><b>${scannerCoveragePercent}%</b></div><strong>${escapeHtml(`${model.completedScanners} / ${scannerTotal}`)}</strong><div class="scanner-coverage-bar" aria-hidden="true"><span style="width: ${scannerCoveragePercent}%"></span></div><small>${escapeHtml(scannerCoverageLabel)}</small></div>`;
+  const heroMetrics = `<div class="hero-metric-panel">
+    <div class="posture-header"><span>Security posture</span><strong>${escapeHtml(model.activeTotal)} active</strong></div>
+    <div class="hero-metric-group hero-severity-grid">${severityHeroMetrics}</div>
+    <div class="hero-metric-group hero-operations-grid">${operationsHeroMetrics}</div>
+  </div>`;
+  const securityCenterHero = `<section class="overview-summary security-center-hero">
+    <div class="security-hero-motif" aria-hidden="true">
+      <span></span><span></span><span></span>
+      <svg viewBox="0 0 420 220" focusable="false"><path d="M18 168 C90 90 126 184 198 94 S328 90 398 34"></path><path d="M42 48 H138 L184 92 H286 L350 154"></path><circle cx="42" cy="48" r="4"></circle><circle cx="184" cy="92" r="4"></circle><circle cx="350" cy="154" r="4"></circle></svg>
+    </div>
+    <div class="hero security-hero-copy ${riskClass}">
+      <div class="security-product-mark">
+        <div class="security-shield">${compactIcon('shield')}</div>
+        <div class="risk-ring"><svg viewBox="0 0 100 100" aria-hidden="true"><circle class="risk-track" cx="50" cy="50" r="42"></circle><circle class="risk-progress" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${displayedRiskScore} 100"></circle></svg><strong>${displayedRiskScore}</strong></div>
+      </div>
+      <div class="risk-copy">
+        <div class="security-product-badge">DevSecOps Security</div>
+        <h2>Security Center</h2>
+        <p class="security-workspace">Vue de sécurité du workspace <strong>${escapeHtml(model.workspace)}</strong></p>
+        <span class="risk-explanation">Surveillez, analysez et corrigez les risques de sécurité en continu.</span>
+        <span class="risk-calculation-note">${riskExplanation}</span>
+        <div class="risk-label"><i class="risk-status-dot"></i>Risque ${escapeHtml(displayedRiskLevel)}</div>
+      </div>
+    </div>
+    <div class="overview-kpis security-hero-metrics">${heroMetrics}</div>
+  </section>`;
+
+  // Le compagnon du rail lit le meme modele visuel partage que la page Live
+  // Security et que la mascotte flottante. Il ne compose aucun message, ne
+  // compte aucun finding et n'apparait pas du tout quand le moteur n'a rien a
+  // dire : une carte d'assistant sans etat serait un assistant invente.
+  const companionLine = companionVisual ? String(companionVisual.shortMessage || companionVisual.message?.headline || '') : '';
+  const companionFile = companionVisual ? String(companionVisual.currentFile || '') : '';
+  const companionSeverity = companionVisual ? String(companionVisual.liveHighestSeverity || '') : '';
+  const companionFacts = companionVisual
+    ? [
+      companionFile ? `<div class="sc-rail-fact"><span>Fichier courant</span><strong title="${escapeHtml(companionFile)}">${escapeHtml(targetLabel(companionFile))}</strong></div>` : '',
+      `<div class="sc-rail-fact"><span>Problèmes Live</span><strong>${Number(companionVisual.liveFindingCount) || 0}</strong></div>`,
+      companionSeverity ? `<div class="sc-rail-fact"><span>Sévérité la plus haute</span><strong class="sc-rail-sev ${severityTone(companionSeverity)}">${escapeHtml(String(companionSeverity).toUpperCase())}</strong></div>` : ''
+    ].filter(Boolean).join('')
+    : '';
+  const companionCard = companionVisual
+    ? `<section class="sc-rail-card sc-rail-live">
+      <div class="sc-rail-head"><strong>Live Security Companion</strong><span class="sc-companion-state ${escapeHtml(String(companionVisual.state || 'idle'))}">${escapeHtml(COMPANION_STATE_LABELS[companionVisual.state] || String(companionVisual.state || 'idle'))}</span></div>
+      ${companionLine ? `<p class="sc-companion-line">${escapeHtml(companionLine)}</p>` : ''}
+      <div class="sc-rail-facts">${companionFacts}</div>
+      <button class="sc-rail-link" data-command="securityCenter.openLiveSecurityPage">Voir les détails →</button>
+    </section>`
+    : '';
+  // Chaque action cite une commande deja enregistree et deja autorisee par la
+  // frontiere de confiance du webview. Aucun raccourci n'execute de logique ici.
+  const quickActionsCard = `<section class="sc-rail-card">
+    <div class="sc-rail-head"><strong>Actions rapides</strong></div>
+    <div class="sc-rail-actions">
+      <button class="sc-rail-action primary" data-command="securityCenter.scanWorkspace" ${scanRunning ? 'disabled' : ''}><span class="sc-rail-action-icon">▷</span><span>${scanRunning ? 'Analyse en cours…' : hasScanned ? 'Relancer l’analyse' : 'Lancer l’analyse'}</span></button>
+      <button class="sc-rail-action" data-command="securityCenter.openFindingsPage"><span class="sc-rail-action-icon">◉</span><span>Examiner les findings</span>${currentActiveFindings.length ? `<small>${currentActiveFindings.length}</small>` : ''}</button>
+      <button class="sc-rail-action" data-command="securityCenter.verifyFindingFix"><span class="sc-rail-action-icon">✓</span><span>Vérifier une correction</span></button>
+      <button class="sc-rail-action" data-command="securityCenter.openSecurityPipeline"><span class="sc-rail-action-icon">↗</span><span>Ouvrir le pipeline</span></button>
+    </div>
+  </section>`;
+
+  // Cycle unifie de verification. Chaque compteur vient d'un statut reellement
+  // porte par un finding : « appliquee », « validee » et « toujours presente »
+  // restent trois faits distincts, jamais additionnes en un seul « corrige ».
+  const validatingCount = dedupedCurrentFindings.filter((finding) => finding.triageStatus === 'validating').length;
+  const verificationTiles = [
+    ['Appliquées', remediation.fixApplied, 'medium'],
+    ['En vérification', validatingCount, 'neutral'],
+    ['Validées', remediation.validated, 'low'],
+    ['Toujours présentes', remediation.stillPresent, 'critical'],
+    ['Non concluantes', remediation.inconclusive, 'high'],
+    ['Réapparues', remediation.regressed, 'critical']
+  ];
+  // Le finding dont la verification est la plus recente : c'est celui sur lequel
+  // le developpeur vient d'agir.
+  const lastVerified = dedupedCurrentFindings
+    .filter((finding) => Number.isFinite(Date.parse(finding.verification?.at || finding.fixedAt || '')))
+    .sort((left, right) => Date.parse(right.verification?.at || right.fixedAt) - Date.parse(left.verification?.at || left.fixedAt))[0] || null;
+  const lastVerifiedState = lastVerified ? String(lastVerified.verification?.state || lastVerified.triageStatus || '') : '';
+  const verifyBody = lastVerified
+    ? `<div class="verify-latest ${severityTone(lastVerified.rawSeverity || lastVerified.severity)}">
+      <span class="verify-state ${escapeHtml(lastVerifiedState)}">${escapeHtml(statusLabels[lastVerifiedState] || lastVerifiedState || 'État inconnu')}</span>
+      <strong>${escapeHtml(lastVerified.title || 'Alerte de sécurité')}</strong>
+      <small>${escapeHtml(lastVerified.file || lastVerified.endpoint || 'Emplacement non fourni')}</small>
+      ${lastVerified.verification?.validator ? `<span class="verify-meta">Vérifié par ${escapeHtml(lastVerified.verification.validator)}${lastVerified.verification.reason ? ` — ${escapeHtml(lastVerified.verification.reason)}` : ''}</span>` : ''}
+    </div>`
+    : '<div class="empty">Aucune correction n’a encore été appliquée ni vérifiée.</div>';
+  const fixVerifyCard = `<section class="overview-panel"><div class="overview-panel-head"><strong>Fix &amp; Verify</strong><button data-command="securityCenter.verifyFindingFix">Vérifier une correction →</button></div>
+    <div class="verify-tiles">${verificationTiles.map(([label, value, tone]) => `<div class="verify-tile ${tone}"><strong>${value}</strong><span>${escapeHtml(label)}</span></div>`).join('')}</div>
+    ${verifyBody}
+  </section>`;
+
+  // Chronologie : uniquement les evenements dates par le modele du finding
+  // ci-dessus. Aucune etape n'est comblee pour faire joli.
+  const timelineEvents = verificationTimeline(lastVerified);
+  const activityTimelineCard = `<section class="overview-panel"><div class="overview-panel-head"><strong>Chronologie de vérification</strong><button data-command="securityCenter.showAuditLog">Journal d'audit →</button></div>
+    ${timelineEvents.length
+      ? `<ol class="verify-timeline">${timelineEvents.map((event) => `<li class="verify-event ${event.tone}"><span class="verify-dot"></span><div><strong>${escapeHtml(event.label)}</strong><time>${escapeHtml(new Date(event.at).toLocaleString('fr-FR'))}</time></div></li>`).join('')}</ol>`
+      : `<div class="empty">${lastVerified ? 'Aucun horodatage de cycle de vie sur cette alerte.' : 'La chronologie apparaîtra dès qu’une correction aura été appliquée.'}</div>`}
+  </section>`;
+  const overviewLowerRow = `<div class="overview-lower">${fixVerifyCard}${activityTimelineCard}</div>`;
+
+  // Le bandeau compact de la page Findings compte exactement la liste qu'elle
+  // affiche — `model.findings` — et rien d'autre. Reutiliser les compteurs de
+  // l'apercu (dedupliques, limites aux scanners termines) aurait donne un total
+  // different de celui du tableau juste en dessous.
+  const findingsSummary = [
+    ['Total', model.findings.length, 'total'],
+    ['Critical', severityCount(model.findings, ['CRITICAL', 'ERROR']), 'critical'],
+    ['High', severityCount(model.findings, ['HIGH']), 'high'],
+    ['Medium', severityCount(model.findings, ['MEDIUM', 'WARNING']), 'medium'],
+    ['Low', severityCount(model.findings, ['LOW', 'INFO', 'INFORMATION']), 'low']
+  ].map(([label, value, tone]) => `<div class="findings-stat ${tone}"><strong>${value}</strong><span>${escapeHtml(label)}</span></div>`).join('');
+  const reachabilityOptions = [...new Set(model.findings.map(reachabilityFor))]
+    .sort()
+    .map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(reachabilityLabel(value))}</option>`)
+    .join('');
+
+  // La carte d'assistant, en tete du rail. Elle ne calcule aucun fait : elle
+  // recoit la liste de findings que cette page affiche deja, l'etat du scan tel
+  // que le modele le porte, et le modele visuel partage du companion. Quand rien
+  // de reel n'est disponible, `buildAssistantCardModel` rend `null` et la carte
+  // n'apparait pas — le rail garde ses cartes existantes, inchangees.
+  const assistantModel = buildAssistantCardModel({
+    surface,
+    companion: companionVisual,
+    findings: currentActiveFindings,
+    scan: { status: model.scanStatus, completed: finishedCount, successful: successfulCount, total: model.scanners.length },
+    scanners: model.scanners,
+    posture: {
+      label: currentExecutionActive ? 'Current run' : 'Workspace posture',
+      findingCount: currentActiveFindings.length,
+      scope: currentExecutionActive ? 'current-run' : 'workspace-posture'
+    }
+  });
+  const assistantOptions = { mascotImageUri: companionImageUri };
+  const assistantCard = renderAssistantCard(assistantModel, assistantOptions);
+  const assistantHeroCard = renderAssistantHeroCard(assistantModel, assistantOptions);
+  const assistantPanelCard = renderAssistantPanelCard(assistantModel);
+  const companionPresence = companionWidgetFor(assistantCard);
+  const fullShellOpen = inShell ? `<div class="sc-app-shell">${renderInternalSidebar(surface)}<main class="sc-main" data-page-kind="${escapeHtml(pageAtmosphereKind(surface))}">${renderSecurityCenterAtmosphere(surface)}` : '';
+  const fullShellClose = inShell ? `</main><aside class="sc-companion-rail" aria-label="Contexte Security Center">
+    ${assistantHeroCard}
+    ${assistantCard ? '' : companionCard}
+    ${quickActionsCard}
+    ${assistantPanelCard}
+    <section class="sc-rail-card sc-context-card"><div class="sc-rail-head"><strong>État de l'analyse</strong><span class="sc-rail-pill ${statusClass}">${escapeHtml(model.scanStatus)}</span></div><span>${escapeHtml(scanStatusLabel)}</span><small>${escapeHtml(finishedCount)}/${escapeHtml(model.scanners.length)} scanners terminés</small></section>
+    <section class="sc-rail-card sc-context-card"><div class="sc-rail-head"><strong>Backend</strong><span class="sc-rail-pill ${backendTone}">${escapeHtml(model.backendStatus)}</span></div><span>${escapeHtml(operationalTitle)}</span></section>
+  </aside></div>` : '';
   return `<!doctype html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style nonce="${nonce}">
     * { box-sizing: border-box; }
-    body { color: var(--vscode-foreground); font-family: var(--vscode-font-family); padding: 16px; margin: 0 auto; max-width: 1200px; background: var(--vscode-sideBar-background); color-scheme: light; }
+    body {
+      --sc-bg: var(--vscode-sideBar-background);
+      --sc-surface: var(--vscode-editor-background);
+      --sc-surface-soft: var(--vscode-editor-inactiveSelectionBackground);
+      --sc-border: var(--vscode-widget-border);
+      --sc-text: var(--vscode-foreground);
+      --sc-muted: var(--vscode-descriptionForeground);
+      --sc-primary: var(--vscode-button-background);
+      --sc-primary-hover: var(--vscode-button-hoverBackground);
+      --sc-primary-soft: color-mix(in srgb, var(--sc-primary) 12%, var(--sc-surface));
+      --sc-critical: var(--vscode-charts-red, #d92d20);
+      --sc-high: var(--vscode-charts-orange, #f97316);
+      --sc-medium: var(--vscode-charts-yellow, #ca8a04);
+      --sc-low: var(--vscode-charts-green, #16a34a);
+      --sc-success: var(--vscode-testing-iconPassed, #16a34a);
+      --sc-warning: var(--vscode-editorWarning-foreground, #ca8a04);
+      --sc-radius-sm: 6px;
+      --sc-radius-md: 8px;
+      --sc-radius-lg: 12px;
+      --sc-shadow-sm: 0 10px 28px var(--vscode-widget-shadow, rgba(15, 23, 42, .10));
+      color: var(--sc-text);
+      font-family: var(--vscode-font-family);
+      padding: 16px;
+      margin: 0 auto;
+      max-width: 1200px;
+      background: var(--sc-bg);
+      color-scheme: light;
+    }
     body.theme-light {
       --vscode-foreground: #424750;
       --vscode-descriptionForeground: #707782;
@@ -1276,21 +1965,51 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       --vscode-list-activeSelectionBackground: #e4ebf8;
       --vscode-list-activeSelectionForeground: #2f3540;
       --vscode-widget-shadow: rgba(35, 42, 52, .18);
+      --sc-bg: #f6f7fb;
+      --sc-surface: #ffffff;
+      --sc-surface-soft: #f1f4fb;
+      --sc-border: #dde3ee;
+      --sc-text: #172033;
+      --sc-muted: #687386;
+      --sc-primary: #5b5fef;
+      --sc-primary-hover: #484bd6;
+      --sc-primary-soft: #eef0ff;
+      --sc-shadow-sm: 0 12px 30px rgba(32, 40, 72, .08);
       color-scheme: light;
     }
-    body.theme-dark { color-scheme: dark; }
+    body.theme-dark {
+      --sc-bg: color-mix(in srgb, var(--vscode-sideBar-background) 82%, #0b1020 18%);
+      --sc-surface: var(--vscode-editor-background);
+      --sc-surface-soft: color-mix(in srgb, var(--vscode-editor-inactiveSelectionBackground) 70%, var(--vscode-editor-background));
+      --sc-border: var(--vscode-widget-border);
+      --sc-text: var(--vscode-foreground);
+      --sc-muted: var(--vscode-descriptionForeground);
+      --sc-primary: var(--vscode-button-background);
+      --sc-primary-hover: var(--vscode-button-hoverBackground);
+      --sc-primary-soft: color-mix(in srgb, var(--vscode-button-background) 18%, var(--vscode-editor-background));
+      color-scheme: dark;
+    }
+    body.surface-full, body.sc-shelled { max-width: none; min-height: 100vh; padding: 0; margin: 0; overflow-x: hidden; }
     h2, h3 { margin: 0; }
     h2 { font-size: 23px; letter-spacing: -.4px; }
     h3 { font-size: 11px; letter-spacing: .8px; text-transform: uppercase; color: var(--vscode-descriptionForeground); margin: 22px 0 10px; }
-    .header { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 16px; padding-bottom: 13px; border-bottom: 2px solid color-mix(in srgb, var(--vscode-button-background) 78%, #ff2da8 22%); }
+    .header { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 16px; padding-bottom: 13px; border-bottom: 2px solid color-mix(in srgb, var(--sc-primary) 78%, #ff2da8 22%); }
+    body.surface-full .header { position: sticky; top: 0; z-index: 6; align-items: center; margin: -24px -24px 18px; padding: 14px 24px; border-bottom: 1px solid var(--sc-border); background: color-mix(in srgb, var(--sc-surface) 94%, transparent); backdrop-filter: blur(12px); }
+    body.surface-full .header h2 { font-size: 18px; letter-spacing: 0; }
     .header-actions { display: flex; align-items: flex-start; gap: 8px; }
-    .theme-toggle { width: auto; padding: 5px 9px; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); font-size: 10px; text-align: center; }
+    .theme-toggle { display: inline-grid; place-items: center; width: 30px; height: 30px; padding: 0; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); font-size: 14px; line-height: 1; text-align: center; }
+    .theme-toggle-icon { display: block; line-height: 1; }
     .header-status { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
     .header-scan { width: auto; min-width: 88px; padding: 5px 10px; text-align: center; color: var(--vscode-button-foreground); background: var(--vscode-button-background); font-size: 10px; }
     .header-scan:hover { background: var(--vscode-button-hoverBackground); }
     .scan-chrono { display: inline-flex; align-items: center; gap: 5px; min-width: 78px; padding: 5px 9px; border: 1px solid var(--vscode-widget-border); border-radius: 999px; color: var(--vscode-foreground); background: var(--vscode-editor-background); font: 600 10px var(--vscode-font-family); }
     .backend { color: var(--vscode-descriptionForeground); font-size: 10px; }
     .workspace { color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; margin-top: 5px; }
+    ${shellLayoutCss()}
+    body.surface-full .sc-main > .operational-banner,
+    body.surface-full .sc-main > .policy-banner,
+    body.surface-full .sc-main > .zap-card,
+    body.surface-full .sc-main > .cards { display: none !important; }
     .status-pill, .status { border-radius: 999px; padding: 4px 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; }
     .status-pill.completed, .status.completed { color: #75d99f; background: rgba(46,160,87,.16); }
     .status-pill.failed, .status.failed { color: #ff7b72; background: rgba(248,81,73,.16); }
@@ -1360,22 +2079,66 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     body.surface-full > .operational-banner, body.surface-full > .policy-banner, body.surface-full > .zap-card, body.surface-full > .cards { display: none !important; }
     .page-navigation { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px; margin: 12px 0; }
     .page-navigation button { text-align: center; }
-    body.surface-dynamic > .operational-banner, body.surface-dynamic > .zap-card { display: none !important; }
+    body.surface-dynamic .sc-main > .operational-banner, body.surface-dynamic .sc-main > .zap-card { display: none !important; }
+    #security-center-modal-root:empty { display: none; }
+    .sc-modal-overlay,
+    .sc-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(20, 24, 45, .34);
+      backdrop-filter: blur(3px);
+      pointer-events: auto;
+    }
+    body.sc-modal-open { overflow: hidden; }
+    .sc-zap-preflight {
+      width: min(600px, calc(100vw - 48px));
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+      display: grid;
+      gap: 16px;
+      padding: 20px;
+      border: 1px solid color-mix(in srgb, var(--sc-primary) 34%, var(--sc-border));
+      border-radius: 18px;
+      color: var(--sc-text);
+      background: color-mix(in srgb, var(--sc-surface) 97%, var(--sc-primary) 3%);
+      box-shadow: 0 24px 70px rgba(15, 23, 42, .28), 0 0 0 1px color-mix(in srgb, var(--sc-primary) 10%, transparent);
+    }
+    .sc-zap-modal-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+    .sc-zap-modal-logo .scanner-logo { width: 44px; height: 44px; border-radius: 14px; }
+    .sc-zap-modal-head span { display: block; margin-bottom: 4px; color: var(--sc-primary); font-size: 10px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; }
+    .sc-zap-modal-head h2 { margin: 0; color: var(--sc-text); font-size: 20px; letter-spacing: 0; }
+    .sc-modal-close { width: 30px; min-width: 30px; height: 30px; padding: 0; border-radius: 999px; color: var(--sc-muted); background: transparent; border-color: transparent; font-size: 18px; line-height: 1; }
+    .sc-modal-close:hover { color: var(--sc-text); background: var(--sc-surface-soft); }
+    .sc-zap-modal-copy { margin: 0; color: var(--sc-muted); font-size: 13px; line-height: 1.55; }
+    .sc-zap-target {
+      display: grid;
+      gap: 7px;
+      padding: 12px 14px;
+      border: 1px solid color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border));
+      border-radius: 12px;
+      background: var(--sc-surface-soft);
+    }
+    .sc-zap-target span { color: var(--sc-muted); font-size: 10px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase; }
+    .sc-zap-target code { color: var(--sc-text); background: transparent; font-size: 12px; overflow-wrap: anywhere; }
+    .sc-zap-warning { display: grid; gap: 3px; padding: 11px 13px; border: 1px solid rgba(255,159,10,.34); border-radius: 12px; background: rgba(255,159,10,.08); }
+    .sc-zap-warning strong { color: var(--sc-warning); font-size: 12px; }
+    .sc-zap-warning span { color: var(--sc-muted); font-size: 12px; line-height: 1.45; }
+    .sc-zap-modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
+    .sc-zap-modal-actions button { width: auto; min-height: 34px; padding-inline: 13px; }
+    .sc-zap-modal-actions .primary { color: #fff; background: var(--sc-primary); border-color: var(--sc-primary); }
+    .sc-zap-modal-actions .primary:hover { background: var(--sc-primary-hover); }
+    .sc-zap-modal-actions .secondary { color: var(--sc-primary); background: var(--sc-surface); border-color: color-mix(in srgb, var(--sc-primary) 36%, var(--sc-border)); }
+    .sc-zap-modal-actions .quiet-action { color: var(--sc-muted); }
+    .sc-zap-modal-actions button:focus-visible, .sc-modal-close:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
     .dynamic-page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin: 6px 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--vscode-widget-border); }
     .dynamic-page-header h1 { margin: 0; font-size: 22px; }
     .dynamic-page-header p { margin: 5px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
     .dynamic-section { margin: 0 0 10px; padding: 12px 14px; border: 1px solid var(--vscode-widget-border); border-radius: 6px; background: var(--vscode-editor-background); }
-    .zap-confirmation-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 18px; background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent); }
-    .zap-confirmation { width: min(520px, 100%); padding: 18px; border: 1px solid var(--vscode-focusBorder); border-radius: 8px; color: var(--vscode-foreground); background: var(--vscode-editor-background); box-shadow: 0 8px 28px var(--vscode-widget-shadow, rgba(0,0,0,.25)); }
-    .zap-confirmation-head { display: flex; gap: 12px; align-items: flex-start; }
-    .zap-confirmation-icon { flex: 0 0 auto; color: var(--vscode-editorWarning-foreground); font-size: 22px; line-height: 1; }
-    .zap-confirmation h2 { margin: 0; font-size: 15px; }
-    .zap-confirmation p { margin: 7px 0 0; color: var(--vscode-descriptionForeground); line-height: 1.5; }
-    .zap-confirmation-target { margin-top: 14px; padding: 9px 11px; border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-left: 3px solid var(--vscode-focusBorder); border-radius: 4px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); }
-    .zap-confirmation-target span, .zap-confirmation-target code { display: block; }
-    .zap-confirmation-target span { margin-bottom: 4px; color: var(--vscode-descriptionForeground); font-size: 10px; }
-    .zap-confirmation-target code { padding: 0; overflow-wrap: anywhere; color: var(--vscode-input-foreground); background: transparent; }
-    .zap-confirmation .dynamic-actions { justify-content: flex-end; margin-top: 18px; }
     .dynamic-section-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
     .dynamic-section-head h2 { font-size: 12px; letter-spacing: .2px; }
     .dynamic-section-head span { color: var(--vscode-descriptionForeground); font-size: 10px; }
@@ -1502,9 +2265,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .compact-icon { width: 17px; height: 17px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
     .overview-scanner { display: grid; grid-template-columns: 30px minmax(120px,1fr) auto auto auto minmax(95px,.8fr) 24px; align-items: center; gap: 9px; padding: 9px 2px; border-bottom: 1px solid var(--vscode-widget-border); font-size: 10px; }
     .overview-scanner:last-child { border-bottom: 0; }
-    .scanner-logo { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--vscode-widget-border); border-radius: 50%; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
-    .scanner-logo.completed { color: var(--vscode-testing-iconPassed); background: color-mix(in srgb, var(--vscode-testing-iconPassed) 10%, var(--vscode-editor-background)); }
-    .scanner-logo.failed { color: var(--vscode-testing-iconFailed); }
+    .scanner-logo { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--vscode-widget-border); border-radius: 8px; color: var(--vscode-button-background); background: var(--vscode-button-foreground); overflow: hidden; }
+    .scanner-logo-img { display: block; width: 28px; height: 28px; object-fit: contain; }
+    .scanner-logo[data-scanner-logo="semgrep"] .scanner-logo-img,
+    .scanner-logo[data-scanner-logo="osv"] .scanner-logo-img { width: 30px; height: 22px; }
+    .scanner-logo[data-scanner-logo="zap"] .scanner-logo-img { width: 29px; height: 29px; }
+    .scanner-logo.completed { border-color: color-mix(in srgb, var(--vscode-testing-iconPassed) 45%, var(--vscode-widget-border)); }
+    .scanner-logo.failed { border-color: color-mix(in srgb, var(--vscode-testing-iconFailed) 45%, var(--vscode-widget-border)); }
     .scanner-logo.disabled, .scanner-index.disabled { opacity: .55; }
     .overview-scanner.disabled, .scanner.disabled { opacity: .78; }
     .status.disabled, .scanner-ready.disabled { color: var(--vscode-descriptionForeground); }
@@ -1754,40 +2521,80 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .burp-request strong, .burp-request small { display: block; overflow-wrap: anywhere; }
     .burp-request small { margin-top: 3px; color: var(--vscode-descriptionForeground); }
     .burp-state { color: #75d99f; font-size: 9px; text-transform: uppercase; font-weight: 700; }
-    .findings-panel { border: 1px solid var(--vscode-widget-border); border-radius: 10px; padding: 12px; background: color-mix(in srgb, var(--vscode-editor-inactiveSelectionBackground) 48%, transparent); }
-    .finding-filters { display: grid; grid-template-columns: 1fr; gap: 7px; margin-bottom: 11px; }
-    .finding-filters input, .finding-filters select { width: 100%; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-radius: 6px; padding: 8px; font-family: inherit; }
-    .finding-list { display: grid; gap: 8px; max-height: 720px; overflow-y: auto; padding-right: 3px; }
-    .finding-layout { display: grid; gap: 10px; }
-    .finding-preview { display: none; position: sticky; top: 12px; align-self: start; border: 1px solid var(--vscode-widget-border); border-radius: 9px; padding: 14px; background: var(--vscode-editor-background); }
-    .finding-preview-label { color: var(--vscode-descriptionForeground); font-size: 9px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase; }
-    .finding-preview h4 { margin: 8px 0; font-size: 15px; line-height: 1.35; }
-    .finding-preview span, .finding-preview small { display: block; overflow-wrap: anywhere; }
-    .finding-preview span { color: var(--vscode-textLink-foreground); font-size: 11px; }
-    .finding-preview small { margin-top: 8px; color: var(--vscode-descriptionForeground); }
-    .finding-card { position: relative; display: grid; grid-template-columns: 4px 1fr; gap: 11px; border: 1px solid var(--vscode-widget-border); border-radius: 8px; padding: 10px 10px 10px 0; background: var(--vscode-editor-background); }
+    .page-findings { position: relative; display: grid; gap: 14px; }
+    .findings-hero { position: relative; overflow: hidden; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 18px; border: 1px solid var(--sc-border); border-radius: 18px; background: linear-gradient(135deg, color-mix(in srgb, var(--sc-primary) 8%, var(--sc-surface)), var(--sc-surface)); box-shadow: var(--sc-shadow-sm); }
+    .findings-watermark { position: absolute; right: 38px; bottom: -12px; display: flex; gap: 18px; opacity: .035; transform: scale(5); color: var(--sc-primary); pointer-events: none; }
+    .findings-eyebrow { color: var(--sc-primary); font-size: 10px; font-weight: 900; letter-spacing: .9px; text-transform: uppercase; }
+    .findings-hero h2 { margin: 4px 0 0; color: var(--sc-text); font-size: 28px; letter-spacing: 0; }
+    .findings-hero p { max-width: 680px; margin: 7px 0 0; color: var(--sc-muted); font-size: 12px; line-height: 1.55; }
+    .findings-panel { border: 1px solid var(--sc-border); border-radius: 18px; padding: 14px; background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); }
+    .finding-filters { display: grid; grid-template-columns: 1fr; gap: 9px; margin-bottom: 11px; }
+    .finding-filters label { display: grid; gap: 5px; min-width: 0; color: var(--sc-muted); font-size: 9px; font-weight: 900; letter-spacing: .6px; text-transform: uppercase; }
+    .finding-filters input, .finding-filters select { width: 100%; min-height: 34px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--sc-border)); border-radius: 10px; padding: 8px 10px; font-family: inherit; text-transform: none; letter-spacing: 0; }
+    .finding-filters .quiet-action { align-self: end; min-height: 34px; border-radius: 10px; }
+    .finding-filter-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+    .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px; }
+    .filter-chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 8px; border: 1px solid color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border)); border-radius: 999px; color: var(--sc-primary); background: var(--sc-primary-soft); font-size: 10px; font-weight: 800; }
+    .filter-chip button { width: 16px; height: 16px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; color: inherit; background: transparent; cursor: pointer; }
+    .finding-list { display: grid; gap: 10px; max-height: 760px; overflow-y: auto; padding-right: 4px; }
+    .finding-layout { display: grid; gap: 14px; }
+    .finding-preview { display: none; position: sticky; top: 12px; align-self: start; border: 1px solid var(--sc-border); border-radius: 16px; padding: 16px; background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); }
+    .finding-preview-label { color: var(--sc-primary); font-size: 10px; font-weight: 900; letter-spacing: .7px; text-transform: uppercase; }
+    .finding-preview h4 { margin: 10px 0; color: var(--sc-text); font-size: 18px; line-height: 1.32; overflow-wrap: anywhere; }
+    .preview-source { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin-top: 10px; }
+    .preview-source span, .preview-source strong { display: inline-flex; align-items: center; border-radius: 999px; font-size: 10px; font-weight: 900; text-transform: uppercase; }
+    .preview-source span { color: var(--sc-muted); }
+    .preview-source strong { padding: 5px 8px; color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 10%, transparent); }
+    .finding-preview dl { display: grid; gap: 8px; margin: 12px 0; }
+    .finding-preview dl div { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; }
+    .finding-preview dt { color: var(--sc-muted); font-size: 9px; font-weight: 900; letter-spacing: .55px; text-transform: uppercase; }
+    .finding-preview dd { margin: 0; overflow-wrap: anywhere; }
+    .finding-preview p { color: var(--sc-muted); font-size: 12px; line-height: 1.5; }
+    .preview-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .finding-card { position: relative; display: grid; grid-template-columns: 4px auto minmax(0,1fr); gap: 12px; align-items: center; border: 1px solid var(--sc-border); border-radius: 14px; padding: 12px 12px 12px 0; background: var(--sc-surface); transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
     .finding-card.hidden { display: none; }
-    .finding-card.selected { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
+    .finding-card:hover, .finding-card:focus-visible { border-color: color-mix(in srgb, var(--sc-primary) 55%, var(--sc-border)); box-shadow: 0 10px 24px color-mix(in srgb, var(--sc-primary) 10%, transparent); transform: translateY(-1px); outline: none; }
+    .finding-card.selected { border-color: var(--sc-primary); box-shadow: 0 0 0 1px color-mix(in srgb, var(--sc-primary) 30%, transparent), 0 12px 28px color-mix(in srgb, var(--sc-primary) 14%, transparent); }
     .finding-accent { border-radius: 0 5px 5px 0; background: #8b949e; }
-    .finding-accent.danger { background: #ff7b72; } .finding-accent.warning { background: #d29922; } .finding-accent.info { background: #58a6ff; }
+    .finding-accent.danger { background: var(--sc-critical); } .finding-accent.warning { background: var(--sc-high); } .finding-accent.info { background: var(--sc-low); }
+    .finding-source { display: grid; justify-items: center; gap: 5px; width: 58px; color: var(--sc-muted); font-size: 9px; font-weight: 900; text-transform: uppercase; }
+    .finding-source .scanner-logo { width: 38px; height: 38px; border-radius: 12px; }
+    .finding-source .scanner-logo-img { width: 26px; height: 26px; }
     .finding-main { min-width: 0; }
     .finding-top { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 7px; }
-    .severity-badge, .tool-badge, .context-badge, .triage-badge { border-radius: 999px; padding: 3px 7px; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+    .severity-badge, .tool-badge, .context-badge, .triage-badge, .fact-badge { border-radius: 999px; padding: 3px 7px; font-size: 9px; font-weight: 800; text-transform: uppercase; }
     .severity-badge { padding: 4px 9px; font-size: 10px; border: 1px solid currentColor; }
     .severity-badge { color: #c9d1d9; background: rgba(139,148,158,.18); }
-    .severity-badge.danger { color: #ff453a; background: rgba(255,59,48,.17); }
-    .severity-badge.warning { color: #e3b341; background: rgba(210,153,34,.16); }
-    .severity-badge.info { color: #79c0ff; background: rgba(56,139,253,.16); }
+    .severity-badge.danger { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 11%, transparent); }
+    .severity-badge.warning { color: var(--sc-high); background: color-mix(in srgb, var(--sc-high) 12%, transparent); }
+    .severity-badge.info { color: var(--sc-low); background: color-mix(in srgb, var(--sc-low) 13%, transparent); }
     .tool-badge { color: #d2a8ff; background: rgba(163,113,247,.15); }
-    .context-badge, .triage-badge { color: var(--vscode-descriptionForeground); background: var(--vscode-editor-inactiveSelectionBackground); }
+    .context-badge, .triage-badge, .fact-badge { color: var(--sc-muted); background: var(--sc-surface-soft); }
     .finding-title, .finding-location, .finding-main small { display: block; overflow-wrap: anywhere; }
-    .finding-title { font-size: 12px; line-height: 1.35; }
-    .finding-location { margin-top: 5px; color: #79c0ff; font-size: 10px; }
-    .finding-main small { margin-top: 4px; color: var(--vscode-descriptionForeground); }
-    .finding-card-actions { grid-column: 2; display: flex; flex-wrap: wrap; gap: 6px; justify-self: start; }
-    .finding-open, .finding-code { width: auto; padding: 5px 8px; background: transparent; border-color: var(--vscode-widget-border); font-size: 10px; }
-    .finding-open { color: var(--vscode-textLink-foreground); }
-    .finding-code { color: #75d99f; }
+    .finding-title { color: var(--sc-text); font-size: 13px; line-height: 1.35; }
+    .finding-location { margin-top: 5px; color: var(--sc-primary); font-size: 11px; }
+    .finding-main small { margin-top: 4px; color: var(--sc-muted); }
+    .finding-state { display: grid; gap: 4px; min-width: 118px; color: var(--sc-text); font-size: 10px; font-weight: 900; text-transform: uppercase; }
+    .finding-state small { color: var(--sc-muted); font-weight: 700; text-transform: none; }
+    .finding-card-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-self: end; }
+    .finding-open, .finding-code { width: auto; padding: 6px 9px; border-radius: 9px; background: transparent; border-color: var(--sc-border); font-size: 10px; font-weight: 900; }
+    .finding-open { color: var(--sc-primary); background: var(--sc-primary-soft); border-color: color-mix(in srgb, var(--sc-primary) 28%, var(--sc-border)); }
+    .finding-code { color: var(--sc-success); }
+    .findings-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; margin: 0; }
+    .findings-stat { padding: 10px 12px; border: 1px solid var(--sc-border); border-left: 3px solid var(--sc-border); border-radius: var(--sc-radius-md); background: var(--sc-surface); }
+    .findings-stat strong, .findings-stat span { display: block; }
+    .findings-stat strong { color: var(--sc-text); font-size: 19px; font-weight: 700; line-height: 1.1; }
+    .findings-stat span { margin-top: 3px; color: var(--sc-muted); font-size: 9.5px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
+    .findings-stat.critical { border-left-color: var(--sc-critical); }
+    .findings-stat.high { border-left-color: var(--sc-high); }
+    .findings-stat.medium { border-left-color: var(--sc-medium); }
+    .findings-stat.low { border-left-color: var(--sc-low); }
+    .findings-stat.total { border-left-color: var(--sc-primary); }
+    body.surface-findings .finding-list { max-height: none; }
+    body.surface-findings .finding-card-actions { flex-wrap: nowrap; }
+    @media (max-width: 980px) { .findings-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 760px) { .finding-card { grid-template-columns: 4px auto minmax(0,1fr); } .finding-state, .finding-card-actions { grid-column: 3; justify-self: start; } .finding-card-actions { flex-wrap: wrap; } }
+    @media (max-width: 680px) { .findings-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finding-preview dl div { grid-template-columns: 1fr; } }
     .findings-count { margin: 0 0 8px; color: var(--vscode-descriptionForeground); font-size: 10px; }
     .pipeline-panel { border: 1px solid var(--vscode-widget-border); border-radius: 10px; padding: 13px; background: color-mix(in srgb, var(--vscode-editor-inactiveSelectionBackground) 62%, transparent); }
     .zap-card { display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: center; margin: 10px 0; padding: 13px; border: 1px solid rgba(163,113,247,.48); border-radius: 10px; background: linear-gradient(135deg, rgba(163,113,247,.12), rgba(56,139,253,.05)); }
@@ -1855,91 +2662,792 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .donut-legend-row span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .donut-swatch { width: 8px; height: 8px; border-radius: 2px; }
 
-    /* Advanced compact dashboard presentation. This layer changes layout only. */
-    body.surface-full {
+    /* La coquille du dashboard complet occupe toute la largeur de l'onglet : le
+       cadrage est fait par .sc-app-shell, qui doit pouvoir placer sa colonne
+       de navigation contre le bord. Un max-width pose sur le body laissait une
+       bande vide a droite du rail et decalait la barre laterale interne.
+       Le padding appartient a .sc-main, pas au body. */
+    body.surface-full, body.sc-shelled {
       width: 100%;
-      max-width: 1280px;
-      padding: 24px clamp(20px, 3vw, 28px) 32px;
-      font-family: var(--vscode-font-family);
+      max-width: none;
+      padding: 0;
+      font-family: var(--vscode-font-family), Inter, "Segoe UI", system-ui, sans-serif;
     }
-    body.surface-full h2 { font-size: 26px; font-weight: 650; line-height: 1.18; letter-spacing: -.45px; }
-    body.surface-full .workspace { margin-top: 4px; font-size: 13px; opacity: .65; }
-    body.surface-full h3,
-    body.surface-full .overview-panel-head strong {
-      font-size: 11px;
-      font-weight: 650;
-      letter-spacing: .6px;
-    }
-    body.surface-full .header { margin-bottom: 16px; padding-bottom: 12px; border-bottom-width: 1px; }
-    body.surface-full .overview-summary {
-      grid-template-columns: minmax(310px, .9fr) minmax(540px, 1.55fr);
-      align-items: stretch;
-      margin: 12px 0 24px;
-      border-radius: 10px;
-      background: var(--vscode-editor-background);
-    }
-    body.surface-full .hero {
-      grid-template-columns: 82px minmax(0, 1fr);
-      gap: 16px;
-      min-height: 126px;
-      padding: 16px 18px;
-      border-right: 1px solid var(--vscode-widget-border);
-      background: var(--vscode-editor-background);
-    }
-    body.surface-full .hero.critical,
-    body.surface-full .hero.high,
-    body.surface-full .hero.medium,
-    body.surface-full .hero.low { background: var(--vscode-editor-background); }
-    body.surface-full .risk-ring { width: 78px; }
-    body.surface-full .risk-ring strong { font-size: 24px; }
-    body.surface-full .risk-track,
-    body.surface-full .risk-progress { stroke-width: 8; }
-    body.surface-full .risk-label { font-size: 12px; font-weight: 700; letter-spacing: .6px; }
-    body.surface-full .risk-explanation { max-width: 390px; font-size: 10.5px; }
-    body.surface-full .overview-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-    body.surface-full .overview-kpi { display: grid; align-content: center; min-width: 0; padding: 16px; background: var(--vscode-editor-background); }
-    body.surface-full .overview-kpi strong { font-size: 25px; }
-    body.surface-full .overview-kpi span { font-size: 10px; }
-    body.surface-full .overview-kpi small { font-size: 10.5px; line-height: 1.35; }
-    body.surface-full .pipeline-panel,
+    /* Aucune regle h2 ici : le dashboard complet n'en affiche plus qu'aux
+       intitules de groupe de la navigation, que .sc-nav-group h2 habille.
+       Une regle body.surface-full h2 les emportait par specificite et rendait
+       « OVERVIEW » ou « ANALYZE » plus gros qu'un titre de carte. */
+    body.sc-shelled .workspace { margin-top: 4px; font-size: 13px; opacity: .65; }
+    /* ================================================= dashboard complet
+       Tout ce bloc est de la presentation. Il repeint les sections que le
+       dashboard rendait deja, en passant par les jetons --sc-* : aucune regle
+       ici ne decide de ce qui est affiche, seulement de son apparence. */
+    body.surface-full, body.sc-shelled { background: var(--sc-bg); }
+
+    /* ------------------------------------------------------------ topbar */
+    .sc-topbar { position: sticky; top: 0; z-index: 5; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; min-width: 0; margin: 0 0 20px; padding: 14px 18px; border: 1px solid color-mix(in srgb, var(--sc-primary) 12%, var(--sc-border)); border-radius: var(--sc-radius-lg); background: color-mix(in srgb, var(--sc-surface) 96%, transparent); box-shadow: 0 10px 26px color-mix(in srgb, var(--sc-primary) 7%, transparent), var(--sc-shadow-sm); backdrop-filter: blur(12px); isolation: isolate; }
+    .sc-topbar-title { min-width: 0; }
+    .sc-topbar-title h1 { margin: 0; color: var(--sc-text); font-size: 19px; font-weight: 700; letter-spacing: 0; overflow-wrap: anywhere; }
+    .sc-topbar-title p { margin: 3px 0 0; color: var(--sc-muted); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+    .sc-topbar-actions, .header-actions { min-width: 0; }
+    .sc-topbar-workspace { color: var(--sc-text); font-weight: 600; }
+    body.surface-full .header-actions { align-items: center; gap: 8px; }
+    body.surface-full .header-status { flex-direction: row; align-items: center; gap: 8px; }
+    body.surface-full .theme-toggle { border: 1px solid var(--sc-border); border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface); font-weight: 700; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 8%, transparent); transition: transform .14s ease, color .12s ease, border-color .12s ease, background-color .12s ease, box-shadow .14s ease; }
+    body.surface-full .theme-toggle:hover { transform: translateY(-1px); color: var(--sc-primary); border-color: color-mix(in srgb, var(--sc-primary) 34%, var(--sc-border)); background: var(--sc-primary-soft); box-shadow: 0 8px 18px color-mix(in srgb, var(--sc-primary) 10%, transparent); }
+    body.surface-full .theme-toggle:active { transform: translateY(0); }
+    body.surface-full .header-scan { min-width: 0; padding: 7px 14px; border: 0; border-radius: 999px; color: var(--vscode-button-foreground); background: var(--sc-primary); font-size: 10.5px; font-weight: 700; }
+    body.surface-full .header-scan:hover:not(:disabled) { background: var(--sc-primary-hover); }
+    body.surface-full .scan-chrono { border-color: var(--sc-border); color: var(--sc-text); background: var(--sc-surface); }
+    body.surface-full .backend { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--sc-border); border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface); font-size: 10px; font-weight: 600; }
+    body.surface-full .backend::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    body.surface-full .backend.online { color: var(--sc-success); border-color: color-mix(in srgb, var(--sc-success) 30%, var(--sc-border)); }
+    body.surface-full .backend.offline { color: var(--sc-critical); border-color: color-mix(in srgb, var(--sc-critical) 30%, var(--sc-border)); }
+    body.surface-full .status-pill { border-radius: 999px; font-size: 9.5px; font-weight: 700; }
+    body.surface-full .status-pill.completed { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, var(--sc-surface)); }
+    body.surface-full .status-pill.failed { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    body.surface-full .status-pill.running { color: var(--sc-primary); background: var(--sc-primary-soft); }
+
+    /* ------------------------------------------------- titres de section */
+    body.surface-full h3 { margin: 22px 0 10px; color: var(--sc-muted); font-size: 10px; font-weight: 800; letter-spacing: .9px; }
+    body.surface-full .quiet-action { color: var(--sc-primary); }
+
+    /* -------------------------------------------- Security Center hero */
+    body.surface-full .security-center-hero { position: relative; display: grid; grid-template-columns: minmax(390px, 1.04fr) minmax(350px, .96fr); gap: 20px; align-items: center; margin: 4px 0 20px; padding: clamp(20px, 2vw, 26px); border: 1px solid color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border)); border-radius: 22px; overflow: hidden; background: radial-gradient(circle at 16% 40%, color-mix(in srgb, var(--sc-primary) 14%, transparent), transparent 25%), radial-gradient(circle at 44% -18%, color-mix(in srgb, var(--sc-low) 7%, transparent), transparent 34%), linear-gradient(135deg, color-mix(in srgb, var(--sc-primary) 7%, var(--sc-surface)), var(--sc-surface) 60%); box-shadow: 0 18px 42px color-mix(in srgb, var(--sc-primary) 10%, transparent), var(--sc-shadow-sm); font-family: var(--vscode-font-family), "Segoe UI", Inter, system-ui, sans-serif; }
+    body.surface-full .security-center-hero::before { content: ''; position: absolute; inset: 12px auto auto 16px; width: 230px; height: 230px; border: 1px solid color-mix(in srgb, var(--sc-primary) 12%, transparent); border-radius: 40px; opacity: .28; transform: rotate(12deg); pointer-events: none; }
+    body.surface-full .security-center-hero::after { content: ''; position: absolute; left: 4%; right: 44%; bottom: 18px; height: 86px; opacity: .12; pointer-events: none; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--sc-primary) 42%, transparent), transparent), repeating-linear-gradient(90deg, color-mix(in srgb, var(--sc-primary) 26%, transparent) 0 1px, transparent 1px 30px); mask-image: linear-gradient(90deg, transparent, rgb(0 0 0) 18%, rgb(0 0 0) 82%, transparent); }
+    .security-hero-motif { position: absolute; inset: 0; pointer-events: none; opacity: .28; overflow: hidden; }
+    .security-hero-motif svg { position: absolute; left: 74px; top: 16px; width: min(39%, 360px); height: auto; color: var(--sc-primary); opacity: .18; }
+    .security-hero-motif path { fill: none; stroke: currentColor; stroke-width: 1.15; stroke-linecap: round; stroke-dasharray: 5 13; }
+    .security-hero-motif circle { fill: currentColor; fill-opacity: .72; }
+    .security-hero-motif span { position: absolute; width: 5px; height: 5px; border-radius: 50%; background: color-mix(in srgb, var(--sc-primary) 52%, transparent); box-shadow: 0 0 0 6px color-mix(in srgb, var(--sc-primary) 8%, transparent); }
+    .security-hero-motif span:nth-child(1) { left: 42px; top: 44px; }
+    .security-hero-motif span:nth-child(2) { left: 34%; bottom: 38px; }
+    .security-hero-motif span:nth-child(3) { left: 28%; top: 26px; }
+    body.surface-full .overview-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0; border: 0; border-radius: 0; overflow: visible; background: transparent; }
+    body.surface-full .security-hero-metrics { display: block; align-self: center; min-width: 0; }
+    body.surface-full .hero-metric-panel { position: relative; display: grid; gap: 13px; min-height: 0; padding: 16px; border: 1px solid color-mix(in srgb, var(--sc-primary) 18%, var(--sc-border)); border-radius: 18px; background: color-mix(in srgb, var(--sc-surface) 92%, transparent); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 7%, transparent), 0 14px 28px color-mix(in srgb, var(--sc-primary) 8%, transparent); backdrop-filter: blur(10px); overflow: hidden; }
+    body.surface-full .hero-metric-panel::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, color-mix(in srgb, var(--sc-primary) 6%, transparent), transparent 38%), radial-gradient(circle at 100% 0, color-mix(in srgb, var(--sc-low) 7%, transparent), transparent 28%); pointer-events: none; }
+    body.surface-full .posture-header { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+    body.surface-full .posture-header span { color: var(--sc-muted); font-size: 11px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; }
+    body.surface-full .posture-header strong { flex: none; padding: 4px 9px; border: 1px solid color-mix(in srgb, var(--sc-primary) 18%, var(--sc-border)); border-radius: 999px; color: var(--sc-text); background: color-mix(in srgb, var(--sc-primary) 7%, var(--sc-surface)); font-size: 11px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase; font-variant-numeric: tabular-nums; }
+    body.surface-full .hero-metric-group { position: relative; z-index: 1; display: grid; min-width: 0; }
+    body.surface-full .hero-severity-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding: 2px 0 14px; border-bottom: 1px solid color-mix(in srgb, var(--sc-border) 72%, transparent); }
+    body.surface-full .hero-operations-grid { grid-template-columns: minmax(128px, .82fr) minmax(190px, 1.18fr); gap: 0; padding-top: 1px; }
+    body.surface-full .overview-kpi { position: relative; display: flex; flex-direction: column; justify-content: flex-start; gap: 7px; min-width: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; overflow: hidden; }
+    body.surface-full .hero-operations-grid .overview-kpi + .overview-kpi { padding-left: 16px; border-left: 1px solid color-mix(in srgb, var(--sc-border) 66%, transparent); }
+    body.surface-full .hero-metric-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin: 0; color: var(--sc-muted); font-size: 11px; font-weight: 800; letter-spacing: .55px; text-transform: uppercase; white-space: nowrap; }
+    body.surface-full .hero-metric-label .compact-icon { flex: none; width: 13px; height: 13px; color: var(--sc-primary); stroke-width: 2; }
+    body.surface-full .hero-metric-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--sc-primary); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sc-primary) 10%, transparent); }
+    body.surface-full .hero-metric-dot.critical { background: var(--sc-critical); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sc-critical) 10%, transparent); }
+    body.surface-full .hero-metric-dot.high { background: var(--sc-high); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sc-high) 12%, transparent); }
+    body.surface-full .hero-metric-dot.medium { background: var(--sc-medium); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sc-medium) 12%, transparent); }
+    body.surface-full .hero-metric-dot.low { background: var(--sc-low); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sc-low) 12%, transparent); }
+    body.surface-full .overview-kpi > strong { margin: 0; color: var(--sc-text); font-size: clamp(26px, 2.1vw, 34px); font-weight: 800; line-height: .98; font-variant-numeric: tabular-nums; }
+    body.surface-full .overview-kpi.critical > strong { color: var(--sc-critical); }
+    body.surface-full .overview-kpi.high > strong { color: var(--sc-high); }
+    body.surface-full .overview-kpi.medium > strong { color: var(--sc-medium); }
+    body.surface-full .overview-kpi.low > strong { color: var(--sc-low); }
+    body.surface-full .overview-kpi > small { margin: 0; color: var(--sc-muted); font-size: 12px; line-height: 1.35; }
+    body.surface-full .scanner-coverage-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+    body.surface-full .scanner-coverage-head b { flex: none; color: var(--sc-text); font-size: 12px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    body.surface-full .scanner-coverage-bar { position: relative; height: 8px; margin-top: 1px; border-radius: 999px; background: color-mix(in srgb, var(--sc-border) 58%, transparent); overflow: hidden; }
+    body.surface-full .scanner-coverage-bar span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--sc-primary), color-mix(in srgb, var(--sc-primary) 70%, var(--sc-low))); }
+
+    body.surface-full .hero { display: grid; grid-template-columns: minmax(126px, 154px) minmax(0, 1fr); gap: clamp(16px, 2vw, 24px); align-items: center; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+    .security-hero-copy, .security-hero-metrics { position: relative; z-index: 1; }
+    .security-product-mark { position: relative; display: grid; place-items: center; width: clamp(124px, 11vw, 150px); aspect-ratio: 1; isolation: isolate; }
+    .security-product-mark::before { content: ''; position: absolute; inset: 6px; border: 1px solid color-mix(in srgb, var(--sc-primary) 14%, transparent); border-radius: 50%; box-shadow: 0 0 0 14px color-mix(in srgb, var(--sc-primary) 4%, transparent), inset 0 0 34px color-mix(in srgb, var(--sc-primary) 8%, transparent); }
+    .security-product-mark::after { content: ''; position: absolute; left: 24%; right: 24%; bottom: 7px; height: 13px; border-radius: 50%; background: color-mix(in srgb, var(--sc-primary) 20%, transparent); filter: blur(10px); opacity: .64; }
+    .security-shield { display: grid; place-items: center; width: clamp(100px, 9vw, 124px); height: clamp(100px, 9vw, 124px); border: 1px solid color-mix(in srgb, var(--sc-primary) 28%, var(--sc-border)); border-radius: 28px; color: var(--sc-primary); background: linear-gradient(145deg, color-mix(in srgb, var(--sc-primary) 14%, var(--sc-surface)), color-mix(in srgb, var(--sc-surface) 94%, var(--sc-primary))); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 10%, transparent), 0 14px 28px color-mix(in srgb, var(--sc-primary) 15%, transparent); z-index: 1; }
+    .security-shield .compact-icon { width: clamp(52px, 4.8vw, 66px); height: clamp(52px, 4.8vw, 66px); stroke-width: 1.55; }
+    body.surface-full .risk-ring { position: absolute; right: 0; bottom: 0; z-index: 2; width: 68px; padding: 5px; border: 1px solid color-mix(in srgb, var(--sc-primary) 24%, var(--sc-border)); border-radius: 50%; background: color-mix(in srgb, var(--sc-surface) 94%, transparent); box-shadow: 0 8px 20px color-mix(in srgb, var(--sc-primary) 12%, transparent); }
+    body.surface-full .risk-ring strong { color: var(--sc-text); font-size: 21px; font-weight: 850; line-height: 1; font-variant-numeric: tabular-nums; }
+    body.surface-full .risk-track, body.surface-full .risk-progress { stroke-width: 8.5; }
+    body.surface-full .risk-track { stroke: color-mix(in srgb, var(--sc-border) 70%, transparent); }
+    body.surface-full .risk-progress { stroke: var(--sc-low); filter: drop-shadow(0 0 5px color-mix(in srgb, var(--sc-low) 34%, transparent)); }
+    body.surface-full .hero.critical .risk-progress { stroke: var(--sc-critical); }
+    body.surface-full .hero.high .risk-progress { stroke: var(--sc-high); }
+    body.surface-full .hero.medium .risk-progress { stroke: var(--sc-medium); }
+    body.surface-full .risk-copy h2 { margin: 6px 0 0; color: var(--sc-text); font-size: clamp(32px, 2.4vw, 42px); font-weight: 800; line-height: 1.04; letter-spacing: 0; }
+    .security-product-badge { display: inline-flex; width: fit-content; padding: 5px 10px; border: 1px solid color-mix(in srgb, var(--sc-primary) 26%, var(--sc-border)); border-radius: 999px; color: var(--sc-primary); background: var(--sc-primary-soft); font-size: 10px; font-weight: 900; letter-spacing: .6px; text-transform: uppercase; }
+    .security-workspace { margin: 9px 0 0; color: var(--sc-muted); font-size: clamp(14px, 1.05vw, 16px); line-height: 1.4; overflow-wrap: anywhere; }
+    .security-workspace strong { color: var(--sc-text); font-weight: 800; }
+    body.surface-full .risk-label { display: inline-flex; align-items: center; gap: 7px; width: fit-content; margin-top: 11px; padding: 5px 9px; border: 1px solid color-mix(in srgb, currentColor 24%, var(--sc-border)); border-radius: 999px; background: color-mix(in srgb, currentColor 8%, var(--sc-surface)); font-size: 12.5px; font-weight: 800; letter-spacing: .3px; text-transform: none; }
+    body.surface-full .risk-status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 12%, transparent); }
+    body.surface-full .hero.critical .risk-label { color: var(--sc-critical); }
+    body.surface-full .hero.high .risk-label { color: var(--sc-high); }
+    body.surface-full .hero.medium .risk-label { color: var(--sc-medium); }
+    body.surface-full .hero.low .risk-label { color: var(--sc-low); }
+    body.surface-full .risk-explanation { display: block; max-width: 500px; margin-top: 8px; color: var(--sc-muted); font-size: clamp(13px, .95vw, 14.5px); line-height: 1.48; }
+    .risk-calculation-note { display: block; max-width: 500px; margin-top: 6px; color: var(--sc-muted); font-size: 10.5px; line-height: 1.42; }
+
+    /* --------------------------------------------------- cartes generiques */
     body.surface-full .overview-panel,
-    body.surface-full .priority-finding {
-      border-radius: 9px;
-      background: var(--vscode-editor-background);
-      box-shadow: none;
-    }
-    body.surface-full .pipeline-panel { padding: 12px 10px 8px; }
-    body.surface-full .pipeline { min-width: 660px; }
-    body.surface-full .pipeline-stage { flex-basis: 84px; }
-    body.surface-full .pipeline-dot { width: 32px; height: 32px; background: var(--vscode-editor-background); }
-    body.surface-full .pipeline-line { min-width: 30px; }
-    body.surface-full .pipeline-line.active { background: var(--vscode-testing-iconPassed, var(--vscode-progressBar-background)); }
-    body.surface-full .overview-split { grid-template-columns: minmax(0, 1.15fr) minmax(310px, .85fr); gap: 16px; margin: 16px 0 24px; }
-    body.surface-full .overview-panel { padding: 14px 16px; }
-    body.surface-full .overview-scanner {
-      grid-template-columns: 30px minmax(145px, 1.5fr) auto 56px 58px minmax(105px, .8fr) 24px;
-      min-height: 54px;
-      padding: 8px 2px;
-      font-size: 10.5px;
-      transition: background-color .12s ease;
-    }
-    body.surface-full .overview-scanner:hover {
-      color: var(--vscode-list-hoverForeground, var(--vscode-foreground));
-      background: var(--vscode-list-hoverBackground, var(--vscode-editor-inactiveSelectionBackground));
-    }
-    body.surface-full .overview-bottom { grid-template-columns: minmax(300px,.85fr) minmax(420px,1.15fr); }
-    body.surface-full .activity-bars { min-height: 124px; }
-    body.surface-full .activity-stat strong { font-size: 22px; }
-    body.surface-full .activity-stat span { font-size: 10px; }
-    body.surface-full .priority-findings { gap: 6px; margin-bottom: 24px; }
-    body.surface-full .priority-finding { min-height: 54px; padding: 9px 11px; }
-    body.surface-full .priority-finding:hover { background: var(--vscode-list-hoverBackground, var(--vscode-editor-inactiveSelectionBackground)); }
+    body.surface-full .pipeline-panel { padding: 18px 20px; border: 1px solid color-mix(in srgb, var(--sc-primary) 12%, var(--sc-border)); border-radius: 16px; background: linear-gradient(145deg, color-mix(in srgb, var(--sc-primary) 2%, transparent), transparent 36%), var(--sc-surface); background-clip: padding-box; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 7%, transparent), 0 12px 30px color-mix(in srgb, var(--sc-primary) 6%, transparent), var(--sc-shadow-sm); backdrop-filter: blur(6px); transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
+    body.surface-full .overview-panel:hover,
+    body.surface-full .pipeline-panel:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--sc-primary) 20%, var(--sc-border)); box-shadow: 0 16px 34px color-mix(in srgb, var(--sc-primary) 8%, transparent), var(--sc-shadow-sm); }
+    body.surface-full .overview-panel-head { position: relative; min-height: 30px; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 0; }
+    body.surface-full .overview-panel-head::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 1px; background: linear-gradient(90deg, color-mix(in srgb, var(--sc-primary) 30%, transparent), color-mix(in srgb, var(--sc-primary) 7%, transparent), transparent 78%); pointer-events: none; }
+    body.surface-full .overview-panel-head strong { color: var(--sc-text); font-size: 12px; font-weight: 800; letter-spacing: 0; text-transform: none; }
+    body.surface-full .overview-panel-head button { width: auto; padding: 4px 9px; border: 0; border-radius: var(--sc-radius-sm); color: var(--sc-primary); background: transparent; font-size: 10px; font-weight: 800; transition: transform .16s ease, background-color .12s ease, color .12s ease; }
+    body.surface-full .overview-panel-head button:hover { transform: translateX(2px); background: var(--sc-primary-soft); }
+    body.surface-full .empty { color: var(--sc-muted); font-size: 10.5px; }
+
+    /* --------------------------------- rangee severite / analyses / zones */
+    body.surface-full .overview-triple { display: grid; grid-template-columns: minmax(260px, .9fr) minmax(280px, 1fr) minmax(320px, 1.1fr); gap: 16px; margin-bottom: 22px; align-items: stretch; }
+    body.surface-full .overview-triple > .overview-panel { display: flex; flex-direction: column; height: 100%; min-height: 246px; min-width: 0; }
+    body.surface-full .overview-triple > .overview-panel > :not(.overview-panel-head) { flex: 1; min-height: 0; }
+
+    .sev-donut { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 16px; align-items: center; }
+    .sev-ring { position: relative; width: 116px; aspect-ratio: 1; display: grid; place-items: center; }
+    .sev-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+    .sev-track, .sev-segment { fill: none; stroke-width: 13; }
+    .sev-track { stroke: color-mix(in srgb, var(--sc-border) 75%, transparent); }
+    .sev-segment { stroke-linecap: butt; }
+    .sev-segment.sev-critical { stroke: var(--sc-critical); }
+    .sev-segment.sev-high { stroke: var(--sc-high); }
+    .sev-segment.sev-medium { stroke: var(--sc-medium); }
+    .sev-segment.sev-low { stroke: var(--sc-low); }
+    .sev-total { position: relative; display: grid; justify-items: center; line-height: 1.1; }
+    .sev-total strong { color: var(--sc-text); font-size: 22px; font-variant-numeric: tabular-nums; }
+    .sev-total span { color: var(--sc-muted); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+    .sev-legend { display: grid; gap: 7px; min-width: 0; }
+    .sev-legend-row { display: grid; grid-template-columns: 9px minmax(0, 1fr) auto auto; align-items: center; gap: 8px; font-size: 10.5px; }
+    .sev-swatch { width: 9px; height: 9px; border-radius: 3px; background: var(--sc-border); }
+    .sev-swatch.sev-critical { background: var(--sc-critical); }
+    .sev-swatch.sev-high { background: var(--sc-high); }
+    .sev-swatch.sev-medium { background: var(--sc-medium); }
+    .sev-swatch.sev-low { background: var(--sc-low); }
+    .sev-legend-row .sev-name { color: var(--sc-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sev-legend-row strong { color: var(--sc-text); font-variant-numeric: tabular-nums; }
+    .sev-legend-row small { min-width: 34px; color: var(--sc-muted); text-align: right; font-variant-numeric: tabular-nums; }
+
+    body.surface-full .recent-scans { display: grid; gap: 0; max-height: 214px; overflow: auto; padding-right: 4px; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--sc-primary) 30%, var(--sc-border)) transparent; }
+    body.surface-full .recent-scans::-webkit-scrollbar,
+    body.surface-full .risky-targets::-webkit-scrollbar,
+    body.surface-full .overview-split > .overview-panel:first-child::-webkit-scrollbar { width: 6px; height: 6px; }
+    body.surface-full .recent-scans::-webkit-scrollbar-track,
+    body.surface-full .risky-targets::-webkit-scrollbar-track,
+    body.surface-full .overview-split > .overview-panel:first-child::-webkit-scrollbar-track { background: transparent; }
+    body.surface-full .recent-scans::-webkit-scrollbar-thumb,
+    body.surface-full .risky-targets::-webkit-scrollbar-thumb,
+    body.surface-full .overview-split > .overview-panel:first-child::-webkit-scrollbar-thumb { border-radius: 999px; background: color-mix(in srgb, var(--sc-primary) 24%, var(--sc-border)); }
+    body.surface-full .recent-scans::-webkit-scrollbar-thumb:hover,
+    body.surface-full .risky-targets::-webkit-scrollbar-thumb:hover,
+    body.surface-full .overview-split > .overview-panel:first-child::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--sc-primary) 38%, var(--sc-border)); }
+    body.surface-full .recent-scan { grid-template-columns: 8px minmax(0, 1fr) auto; grid-template-areas: 'dot name status' 'dot time status'; gap: 3px 12px; padding: 11px 10px; border: 0; border-bottom: 1px solid color-mix(in srgb, var(--sc-border) 54%, transparent); border-radius: 0; font-size: 10.5px; }
+    body.surface-full .recent-scan:last-child { border-bottom: 0; }
+    body.surface-full .recent-scan:hover { background: color-mix(in srgb, var(--sc-primary) 4%, var(--sc-surface)); }
+    body.surface-full .recent-scan .recent-state { grid-area: dot; width: 8px; height: 8px; }
+    body.surface-full .recent-scan strong { grid-area: name; color: var(--sc-text); font-size: 11px; }
+    body.surface-full .recent-scan time { grid-area: time; color: var(--sc-muted); font-size: 9.5px; }
+    body.surface-full .recent-status { grid-area: status; align-self: center; padding: 3px 9px; border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; }
+    body.surface-full .recent-state { background: var(--sc-muted); }
+    body.surface-full .recent-state.info { background: var(--sc-low); }
+    body.surface-full .recent-state.warning { background: var(--sc-medium); }
+    body.surface-full .recent-state.danger { background: var(--sc-critical); }
+
+    .risky-targets { display: grid; gap: 0; max-height: 214px; overflow: auto; padding-right: 4px; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--sc-primary) 30%, var(--sc-border)) transparent; }
+    .risky-target { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto minmax(24px, auto); align-items: center; gap: 12px; padding: 11px 10px; border-bottom: 1px solid color-mix(in srgb, var(--sc-border) 54%, transparent); border-radius: 0; transition: background-color .14s ease; }
+    .risky-target:last-child { border-bottom: 0; }
+    .risky-target:hover { background: color-mix(in srgb, var(--sc-primary) 4%, var(--sc-surface)); }
+    .risky-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sc-muted); }
+    .risky-dot.critical { background: var(--sc-critical); }
+    .risky-dot.high { background: var(--sc-high); }
+    .risky-dot.medium { background: var(--sc-medium); }
+    .risky-dot.low { background: var(--sc-low); }
+    .risky-copy { min-width: 0; }
+    .risky-copy strong, .risky-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .risky-copy strong { color: var(--sc-text); font-size: 11.5px; font-family: var(--vscode-editor-font-family, monospace); }
+    .risky-copy small { margin-top: 3px; color: var(--sc-muted); font-size: 9px; direction: rtl; text-align: left; }
+    .risky-severity { padding: 3px 8px; border-radius: 999px; font-size: 8.5px; font-weight: 800; letter-spacing: .4px; color: var(--sc-muted); background: var(--sc-surface-soft); }
+    .risky-severity.critical { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    .risky-severity.high { color: var(--sc-high); background: color-mix(in srgb, var(--sc-high) 14%, var(--sc-surface)); }
+    .risky-severity.medium { color: var(--sc-medium); background: color-mix(in srgb, var(--sc-medium) 16%, var(--sc-surface)); }
+    .risky-severity.low { color: var(--sc-low); background: color-mix(in srgb, var(--sc-low) 14%, var(--sc-surface)); }
+    .risky-count { min-width: 20px; color: var(--sc-text); font-size: 12px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+
+    /* ------------------------------------------------------------ pipeline */
+    body.surface-full .pipeline-panel { margin-bottom: 22px; padding: 16px 14px 10px; }
+    body.surface-full .pipeline { min-width: 640px; }
+    body.surface-full .pipeline-stage { flex-basis: 82px; min-width: 72px; }
+    body.surface-full .pipeline-stage strong { margin-top: 8px; color: var(--sc-text); font-size: 10.5px; }
+    body.surface-full .pipeline-stage small { color: var(--sc-muted); font-size: 9px; }
+    body.surface-full .pipeline-dot { width: 30px; height: 30px; border: 1.5px solid var(--sc-border); background: var(--sc-surface); font-size: 12px; }
+    body.surface-full .pipeline-dot.completed { color: var(--sc-success); border-color: color-mix(in srgb, var(--sc-success) 45%, var(--sc-border)); background: color-mix(in srgb, var(--sc-success) 10%, var(--sc-surface)); }
+    body.surface-full .pipeline-dot.running, body.surface-full .pipeline-dot.refreshing { color: var(--sc-primary); border-color: color-mix(in srgb, var(--sc-primary) 55%, var(--sc-border)); background: var(--sc-primary-soft); box-shadow: 0 0 0 5px color-mix(in srgb, var(--sc-primary) 9%, transparent); }
+    body.surface-full .pipeline-dot.running::after, body.surface-full .pipeline-dot.refreshing::after { border-color: color-mix(in srgb, var(--sc-primary) 38%, transparent); }
+    body.surface-full .pipeline-dot.failed { color: var(--sc-critical); border-color: color-mix(in srgb, var(--sc-critical) 50%, var(--sc-border)); background: color-mix(in srgb, var(--sc-critical) 10%, var(--sc-surface)); }
+    body.surface-full .pipeline-dot.cancelled { color: var(--sc-medium); border-color: color-mix(in srgb, var(--sc-medium) 50%, var(--sc-border)); background: color-mix(in srgb, var(--sc-medium) 10%, var(--sc-surface)); }
+    body.surface-full .pipeline-line { min-width: 28px; height: 2px; margin-top: 14px; border-radius: 2px; background: color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border)); }
+    body.surface-full .pipeline-line.active { background: color-mix(in srgb, var(--sc-primary) 55%, var(--sc-border)); }
+    body.surface-full .pipeline-popover { border-color: var(--sc-border); border-radius: var(--sc-radius-md); background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); }
+    body.surface-full .pipeline-retry { border-radius: var(--sc-radius-sm); background: var(--sc-primary); }
+
+    /* ------------------------------------------------ scanners + activite */
+    body.surface-full .overview-split { grid-template-columns: minmax(430px, 1.5fr) minmax(320px, .95fr); gap: 18px; margin: 0 0 22px; align-items: start; }
+    body.surface-full .overview-split > .overview-panel { min-width: 0; }
+    body.surface-full .overview-split > .overview-panel:first-child { max-height: 560px; overflow: auto; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--sc-primary) 30%, var(--sc-border)) transparent; }
+    body.surface-full .overview-split > .overview-panel:nth-child(2) { max-height: 560px; overflow: hidden; }
+    body.surface-full .overview-scanner { grid-template-columns: 42px minmax(140px, 1.5fr) auto 54px 56px minmax(96px, .8fr) 22px; min-height: 50px; padding: 7px 6px; border-bottom: 1px solid color-mix(in srgb, var(--sc-border) 65%, transparent); border-radius: var(--sc-radius-md); font-size: 10.5px; transition: background-color .12s ease; }
+    body.surface-full .overview-scanner:hover { color: var(--sc-text); background: var(--sc-surface-soft); }
+    body.surface-full .scanner-logo { width: 38px; height: 38px; border: 1px solid var(--sc-border); color: var(--vscode-button-background); background: var(--vscode-button-foreground); }
+    body.surface-full .scanner-logo.completed { border-color: color-mix(in srgb, var(--sc-success) 35%, var(--sc-border)); }
+    body.surface-full .scanner-logo.failed { border-color: color-mix(in srgb, var(--sc-critical) 35%, var(--sc-border)); }
+    body.surface-full .scanner-identity strong { color: var(--sc-text); font-size: 11px; }
+    body.surface-full .scanner-identity small, body.surface-full .scanner-value small, body.surface-full .overview-scanner time { color: var(--sc-muted); font-size: 9px; }
+    body.surface-full .scanner-ready { padding: 3px 9px; color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 8.5px; font-weight: 800; letter-spacing: .4px; }
+    body.surface-full .scanner-ready.completed { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, var(--sc-surface)); }
+    body.surface-full .scanner-ready.failed { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    body.surface-full .scanner-value strong { color: var(--sc-text); font-variant-numeric: tabular-nums; }
+    body.surface-full .scanner-chevron { color: var(--sc-muted); }
+    body.surface-full .overview-scanner:hover .scanner-chevron { color: var(--sc-primary); }
+
+    body.surface-full .enterprise-summary { margin: 0 0 22px; }
+    body.surface-full .enterprise-domain-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(188px, 1fr)); gap: 14px; margin-top: 14px; align-items: stretch; }
+    body.surface-full .domain-card { position: relative; display: flex; flex-direction: column; gap: 14px; min-height: 178px; padding: 16px; border: 1px solid color-mix(in srgb, var(--sc-primary) 10%, var(--sc-border)); border-radius: 16px; background: linear-gradient(180deg, color-mix(in srgb, var(--sc-primary) 2%, transparent), transparent 42%), var(--sc-surface); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 6%, transparent), var(--sc-shadow-sm); overflow: hidden; transition: transform .14s ease, border-color .14s ease, box-shadow .14s ease; }
+    body.surface-full .domain-card::before { content: ''; position: absolute; inset: 0 0 auto; height: 3px; background: color-mix(in srgb, var(--sc-primary) 52%, var(--sc-border)); box-shadow: 0 5px 14px color-mix(in srgb, var(--sc-primary) 12%, transparent); }
+    body.surface-full .domain-card.ok::before { background: var(--sc-success); box-shadow: 0 5px 14px color-mix(in srgb, var(--sc-success) 13%, transparent); }
+    body.surface-full .domain-card.warn::before { background: var(--sc-medium); box-shadow: 0 5px 14px color-mix(in srgb, var(--sc-medium) 14%, transparent); }
+    body.surface-full .domain-card.bad::before { background: var(--sc-critical); box-shadow: 0 5px 14px color-mix(in srgb, var(--sc-critical) 13%, transparent); }
+    body.surface-full .domain-card.muted::before { background: color-mix(in srgb, var(--sc-muted) 50%, var(--sc-border)); }
+    body.surface-full .domain-card:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--sc-primary) 30%, var(--sc-border)); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 7%, transparent), 0 16px 34px color-mix(in srgb, var(--sc-primary) 10%, transparent); }
+    body.surface-full .domain-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+    body.surface-full .domain-icon { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid color-mix(in srgb, var(--sc-primary) 24%, var(--sc-border)); border-radius: 12px; color: var(--sc-primary); background: var(--sc-primary-soft); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 10%, transparent); }
+    body.surface-full .domain-card.ok .domain-icon { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 10%, var(--sc-surface)); border-color: color-mix(in srgb, var(--sc-success) 28%, var(--sc-border)); }
+    body.surface-full .domain-card.warn .domain-icon { color: var(--sc-medium); background: color-mix(in srgb, var(--sc-medium) 12%, var(--sc-surface)); border-color: color-mix(in srgb, var(--sc-medium) 30%, var(--sc-border)); }
+    body.surface-full .domain-card.bad .domain-icon { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 10%, var(--sc-surface)); border-color: color-mix(in srgb, var(--sc-critical) 30%, var(--sc-border)); }
+    body.surface-full .domain-card.muted .domain-icon { color: var(--sc-muted); background: var(--sc-surface-soft); border-color: var(--sc-border); }
+    body.surface-full .domain-icon .compact-icon { width: 18px; height: 18px; stroke-width: 1.9; }
+    body.surface-full .domain-card-head strong { display: inline-flex; align-items: center; gap: 6px; max-width: 62%; padding: 3px 7px; border: 1px solid color-mix(in srgb, var(--sc-border) 68%, transparent); border-radius: 999px; color: var(--sc-muted); background: color-mix(in srgb, var(--sc-surface-soft) 62%, transparent); font-size: 9px; font-weight: 900; text-transform: uppercase; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    body.surface-full .domain-card-body > span { display: block; color: var(--sc-muted); font-size: 9px; font-weight: 900; letter-spacing: .65px; text-transform: uppercase; }
+    body.surface-full .domain-card-body { min-width: 0; }
+    body.surface-full .domain-card-body strong { display: block; margin-top: 8px; color: var(--sc-text); font-size: 18px; line-height: 1.15; overflow-wrap: anywhere; }
+    body.surface-full .domain-card-body p { margin: 7px 0 0; color: var(--sc-muted); font-size: 11px; line-height: 1.4; }
+    body.surface-full .domain-card button { align-self: flex-start; margin-top: auto; min-height: 32px; padding: 7px 12px; border: 1px solid color-mix(in srgb, var(--sc-primary) 32%, var(--sc-border)); border-radius: 10px; color: var(--sc-primary); background: var(--sc-primary-soft); font-size: 10px; font-weight: 900; cursor: pointer; transition: transform .14s ease, background-color .12s ease, border-color .12s ease; }
+    body.surface-full .domain-card button:active { transform: translateY(1px); }
+    body.surface-full .domain-card:hover .domain-cta { transform: translateX(2px); border-color: color-mix(in srgb, var(--sc-primary) 46%, var(--sc-border)); background: color-mix(in srgb, var(--sc-primary) 17%, var(--sc-surface)); }
+    body.surface-full .enterprise-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sc-muted); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc-muted) 14%, transparent); }
+    body.surface-full .enterprise-dot.ok { background: var(--sc-success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc-success) 16%, transparent); }
+    body.surface-full .enterprise-dot.warn { background: var(--sc-medium); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc-medium) 16%, transparent); }
+    body.surface-full .enterprise-dot.bad { background: var(--sc-critical); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc-critical) 16%, transparent); }
+
+    body.surface-full .activity-summary { gap: 9px; }
+    body.surface-full .activity-summary .activity-stat { min-height: 52px; padding: 9px 4px; border-top: 0; border-radius: var(--sc-radius-md); background: var(--sc-surface-soft); }
+    body.surface-full .activity-stat strong { color: var(--sc-text); font-size: 19px; font-variant-numeric: tabular-nums; }
+    body.surface-full .activity-stat span { color: var(--sc-muted); font-size: 8.5px; font-weight: 700; letter-spacing: .3px; }
+    /* « Corrigee », « validee » et « acceptee » restent trois etats distincts :
+       une couleur commune laisserait croire a un seul resultat. */
+    body.surface-full .activity-summary .activity-stat.resolved strong { color: var(--sc-medium); }
+    body.surface-full .activity-summary .activity-stat.validated strong { color: var(--sc-success); }
+    body.surface-full .activity-summary .activity-stat.accepted strong { color: var(--sc-muted); }
+    body.surface-full .activity-footer { border-top: 1px solid var(--sc-border); }
+    body.surface-full .activity-col-title { color: var(--sc-muted); }
+    body.surface-full .activity-col-val { color: var(--sc-text); }
+
+    /* --------------------------------------------------- alertes prioritaires */
+    body.surface-full .priority-findings { gap: 8px; margin-bottom: 24px; }
+    body.surface-full .priority-finding { min-height: 52px; padding: 11px 13px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-lg); background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); transition: border-color .12s ease, background-color .12s ease; }
+    body.surface-full .priority-finding:hover { border-color: color-mix(in srgb, var(--sc-primary) 30%, var(--sc-border)); background: var(--sc-surface); }
+    body.surface-full .priority-finding strong { color: var(--sc-text); font-size: 11.5px; }
+    body.surface-full .priority-finding span { color: var(--sc-muted); }
+    body.surface-full .priority-severity { display: inline-block; margin-bottom: 4px; padding: 2px 7px; border-radius: 999px; font-size: 8.5px; font-weight: 800; letter-spacing: .4px; }
+    body.surface-full .priority-finding.danger .priority-severity { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    body.surface-full .priority-finding.warning .priority-severity { color: var(--sc-high); background: color-mix(in srgb, var(--sc-high) 14%, var(--sc-surface)); }
+    body.surface-full .priority-finding .finding-open { padding: 6px 11px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); color: var(--sc-primary); background: var(--sc-surface); font-size: 10px; }
+    body.surface-full .priority-finding .finding-open:hover { border-color: color-mix(in srgb, var(--sc-primary) 34%, var(--sc-border)); background: var(--sc-primary-soft); }
+
+    /* -------------------------------------------- fix & verify / chronologie */
+    body.surface-full .overview-lower { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); gap: 14px; margin-bottom: 26px; align-items: start; }
+    .verify-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 13px; }
+    .verify-tile { padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--sc-primary) 7%, var(--sc-border)); border-radius: var(--sc-radius-md); background: linear-gradient(180deg, color-mix(in srgb, var(--sc-surface) 74%, transparent), var(--sc-surface-soft)); }
+    .verify-tile strong, .verify-tile span { display: block; }
+    .verify-tile strong { color: var(--sc-text); font-size: 17px; line-height: 1; font-variant-numeric: tabular-nums; }
+    .verify-tile span { margin-top: 5px; color: var(--sc-muted); font-size: 8.5px; font-weight: 700; letter-spacing: .3px; text-transform: uppercase; }
+    .verify-tile.critical strong { color: var(--sc-critical); }
+    .verify-tile.high strong { color: var(--sc-high); }
+    .verify-tile.medium strong { color: var(--sc-medium); }
+    .verify-tile.low strong { color: var(--sc-low); }
+    .verify-latest { padding: 12px; border: 1px solid var(--sc-border); border-left: 3px solid var(--sc-border); border-radius: var(--sc-radius-md); background: var(--sc-surface); }
+    .verify-latest.critical { border-left-color: var(--sc-critical); }
+    .verify-latest.high { border-left-color: var(--sc-high); }
+    .verify-latest.medium { border-left-color: var(--sc-medium); }
+    .verify-latest.low { border-left-color: var(--sc-low); }
+    .verify-latest strong, .verify-latest small, .verify-meta { display: block; overflow-wrap: anywhere; }
+    .verify-latest strong { margin-top: 7px; color: var(--sc-text); font-size: 11.5px; line-height: 1.35; }
+    .verify-latest small { margin-top: 4px; color: var(--sc-muted); font-size: 10px; font-family: var(--vscode-editor-font-family, monospace); }
+    .verify-meta { margin-top: 7px; color: var(--sc-muted); font-size: 9.5px; }
+    .verify-state { display: inline-block; padding: 3px 9px; border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 8.5px; font-weight: 800; letter-spacing: .3px; text-transform: uppercase; }
+    .verify-state.validated { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, var(--sc-surface)); }
+    .verify-state.fixed, .verify-state.validating { color: var(--sc-medium); background: color-mix(in srgb, var(--sc-medium) 15%, var(--sc-surface)); }
+    .verify-state.still_present, .verify-state.regressed { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    .verify-state.inconclusive, .verify-state.validation_failed { color: var(--sc-high); background: color-mix(in srgb, var(--sc-high) 14%, var(--sc-surface)); }
+    .verify-timeline { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+    .verify-event { position: relative; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: start; gap: 9px; padding: 0 0 14px; }
+    .verify-event:last-child { padding-bottom: 0; }
+    .verify-event::before { content: ''; position: absolute; top: 14px; bottom: 0; left: 5px; width: 1px; background: var(--sc-border); }
+    .verify-event:last-child::before { display: none; }
+    .verify-dot { position: relative; z-index: 1; width: 9px; height: 9px; margin-top: 4px; border-radius: 50%; background: var(--sc-muted); box-shadow: 0 0 0 3px var(--sc-surface); }
+    .verify-event.critical .verify-dot { background: var(--sc-critical); }
+    .verify-event.high .verify-dot { background: var(--sc-high); }
+    .verify-event.medium .verify-dot { background: var(--sc-medium); }
+    .verify-event.low .verify-dot { background: var(--sc-low); }
+    .verify-event strong, .verify-event time { display: block; }
+    .verify-event strong { color: var(--sc-text); font-size: 10.5px; font-weight: 600; line-height: 1.35; }
+    .verify-event time { margin-top: 2px; color: var(--sc-muted); font-size: 9px; }
+
+    /* ------------------------------------------------------- rail droit */
+    .sc-rail-card { padding: 14px; border: 1px solid color-mix(in srgb, var(--sc-primary) 10%, var(--sc-border)); border-radius: var(--sc-radius-lg); background: linear-gradient(145deg, color-mix(in srgb, var(--sc-primary) 2%, transparent), transparent 40%), var(--sc-surface); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 6%, transparent), var(--sc-shadow-sm); }
+    .sc-rail-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 8px; margin-bottom: 10px; }
+    .sc-rail-head strong { color: var(--sc-text); font-size: 11px; font-weight: 700; }
+    .sc-rail-pill, .sc-companion-state { flex: none; max-width: 100%; padding: 3px 8px; border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 8px; font-weight: 700; letter-spacing: .3px; text-transform: uppercase; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sc-rail-pill.completed, .sc-rail-pill.online { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, var(--sc-surface)); }
+    .sc-rail-pill.failed, .sc-rail-pill.offline { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    .sc-rail-pill.running { color: var(--sc-primary); background: var(--sc-primary-soft); }
+    .sc-companion-state.clean { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, var(--sc-surface)); }
+    .sc-companion-state.findings, .sc-companion-state.error { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface)); }
+    .sc-companion-state.analyzing { color: var(--sc-primary); background: var(--sc-primary-soft); }
+    .sc-rail-live { border-color: color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border)); background: radial-gradient(circle at 90% 0, color-mix(in srgb, var(--sc-primary) 13%, transparent), transparent 38%), linear-gradient(180deg, var(--sc-primary-soft), var(--sc-surface) 58%); }
+    .sc-companion-line { margin: 0 0 11px; color: var(--sc-text); font-size: 10.5px; line-height: 1.5; }
+    .sc-rail-facts { display: grid; gap: 7px; }
+    .sc-rail-fact { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 10px; }
+    .sc-rail-fact span { color: var(--sc-muted); }
+    .sc-rail-fact strong { min-width: 0; color: var(--sc-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sc-rail-sev.critical { color: var(--sc-critical); }
+    .sc-rail-sev.high { color: var(--sc-high); }
+    .sc-rail-sev.medium { color: var(--sc-medium); }
+    .sc-rail-sev.low { color: var(--sc-low); }
+    .sc-rail-link { width: 100%; margin-top: 12px; padding: 7px 10px; border: 1px solid color-mix(in srgb, var(--sc-primary) 26%, var(--sc-border)); border-radius: var(--sc-radius-md); color: var(--sc-primary); background: var(--sc-surface); font-size: 10px; font-weight: 700; text-align: center; transition: transform .14s ease, background-color .12s ease, border-color .12s ease; }
+    .sc-rail-link:hover { transform: translateY(-1px); background: var(--sc-primary-soft); }
+    .sc-rail-link:active { transform: translateY(0); }
+    .sc-rail-actions { display: grid; gap: 5px; }
+    .sc-rail-action { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; min-height: 28px; padding: 6px 8px; border: 1px solid transparent; border-radius: var(--sc-radius-sm); color: var(--sc-text); background: var(--sc-surface); font-size: 10.5px; font-weight: 600; text-align: left; transition: transform .14s ease, background-color .12s ease, border-color .12s ease, color .12s ease; }
+    .sc-rail-action span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sc-rail-action-icon { display: grid; place-items: center; width: 16px; height: 16px; color: var(--sc-primary); font-size: 10px; }
+    .sc-rail-action small { justify-self: end; min-width: 18px; padding: 1px 6px; border-radius: 999px; color: var(--sc-primary); background: var(--sc-primary-soft); font-size: 9px; font-weight: 800; text-align: center; }
+    .sc-rail-action:hover:not(:disabled) { transform: translateY(-1px); color: var(--sc-primary); border-color: color-mix(in srgb, var(--sc-primary) 30%, var(--sc-border)); background: var(--sc-primary-soft); }
+    .sc-rail-action:active:not(:disabled) { transform: translateY(0); }
+    .sc-rail-action.primary { color: var(--vscode-button-foreground); border-color: transparent; background: var(--sc-primary); }
+    .sc-rail-action.primary .sc-rail-action-icon { color: currentColor; }
+    .sc-rail-action.primary:hover:not(:disabled) { color: var(--vscode-button-foreground); background: var(--sc-primary-hover); }
+    .sc-companion-rail .sc-context-card { padding: 14px; box-shadow: var(--sc-shadow-sm); }
+    .sc-companion-rail .sc-context-card span { margin-top: 0; color: var(--sc-muted); font-size: 10px; }
+    .sc-companion-rail .sc-context-card small { margin-top: 7px; color: var(--sc-muted); font-weight: 600; }
+
+    /* ------------------------------------------------------------ divers */
+    body.surface-full .policy-banner { border-radius: var(--sc-radius-lg); }
+    body.surface-full .failure-diagnostics { border-radius: var(--sc-radius-lg); }
     body.surface-full button { transition: background-color .12s ease, border-color .12s ease, color .12s ease; }
+    body.surface-full button:focus-visible,
+    body.surface-full [tabindex]:focus-visible { outline: 2px solid var(--sc-primary); outline-offset: 2px; }
     body.surface-full code,
     body.surface-full pre,
     body.surface-full .finding-location,
     body.surface-full .dynamic-source code,
     body.surface-full .traffic-row strong { font-family: var(--vscode-editor-font-family, monospace); }
+    /* ------------------------------------------------------------ scans */
+    body.surface-scans .sc-topbar {
+      background: color-mix(in srgb, var(--sc-surface) 96%, transparent);
+    }
+    body.surface-scans .operational-banner,
+    body.surface-scans .pipeline-panel,
+    body.surface-scans .zap-execution-card,
+    body.surface-scans .page-scans,
+    body.surface-scans .scan-execution-summary {
+      border: 1px solid color-mix(in srgb, var(--sc-primary) 14%, var(--sc-border));
+      border-radius: 17px;
+      background: color-mix(in srgb, var(--sc-surface) 97%, transparent);
+      box-shadow: 0 18px 42px color-mix(in srgb, var(--sc-primary) 9%, transparent), var(--sc-shadow-sm);
+      backdrop-filter: blur(8px);
+    }
+    body.surface-scans .operational-banner { margin-bottom: 14px; }
+    body.surface-scans .scan-execution-summary {
+      display: grid;
+      grid-template-columns: minmax(180px, .62fr) minmax(0, 1.38fr);
+      gap: 14px;
+      align-items: center;
+      margin: 0 0 14px;
+      padding: 14px 16px;
+    }
+    body.surface-scans .scan-summary-copy span,
+    body.surface-scans .scan-summary-stat span,
+    body.surface-scans .scan-section-head span {
+      display: block;
+      color: var(--sc-primary);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: .7px;
+      text-transform: uppercase;
+    }
+    body.surface-scans .scan-summary-copy strong {
+      display: block;
+      margin-top: 5px;
+      color: var(--sc-text);
+      font-size: 15px;
+    }
+    body.surface-scans .scan-summary-metrics {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+    }
+    body.surface-scans .scan-summary-stat {
+      padding: 10px 11px;
+      border: 1px solid var(--sc-border);
+      border-left: 3px solid var(--sc-primary);
+      border-radius: var(--sc-radius-md);
+      background: var(--sc-surface-soft);
+    }
+    body.surface-scans .scan-summary-stat strong {
+      display: block;
+      margin-top: 4px;
+      color: var(--sc-text);
+      font-size: 22px;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    body.surface-scans .scan-summary-stat.success { border-left-color: var(--sc-success); }
+    body.surface-scans .scan-summary-stat.failed { border-left-color: var(--sc-critical); }
+    body.surface-scans .scan-summary-stat.waiting { border-left-color: var(--sc-muted); }
+    body.surface-scans .scan-summary-stat.dynamic { border-left-color: var(--sc-primary); }
+    body.surface-scans .scans-section-title,
+    body.surface-scans .page-scans h3 {
+      margin: 0;
+      color: var(--sc-text);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    body.surface-scans .scans-section-title {
+      margin: 14px 0 8px;
+    }
+    body.surface-scans .pipeline-panel {
+      padding: 16px 14px 12px;
+      margin-bottom: 14px;
+    }
+    body.surface-scans .pipeline-scroll {
+      scrollbar-width: thin;
+      scrollbar-color: color-mix(in srgb, var(--sc-primary) 25%, transparent) transparent;
+    }
+    body.surface-scans .pipeline-scroll::-webkit-scrollbar { height: 7px; }
+    body.surface-scans .pipeline-scroll::-webkit-scrollbar-track { background: transparent; }
+    body.surface-scans .pipeline-scroll::-webkit-scrollbar-thumb {
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--sc-primary) 25%, transparent);
+    }
+    body.surface-scans .pipeline-scroll::-webkit-scrollbar-thumb:hover {
+      background: color-mix(in srgb, var(--sc-primary) 42%, transparent);
+    }
+    body.surface-scans .pipeline {
+      min-width: 0;
+      width: 100%;
+    }
+    body.surface-scans .pipeline-stage { flex: 0 1 92px; }
+    body.surface-scans .pipeline-stage strong { color: var(--sc-text); }
+    body.surface-scans .pipeline-stage small { color: var(--sc-muted); }
+    body.surface-scans .pipeline-line {
+      min-width: 22px;
+      border-radius: 2px;
+      background: color-mix(in srgb, var(--sc-primary) 20%, var(--sc-border));
+    }
+    body.surface-scans .pipeline-line.active {
+      background: color-mix(in srgb, var(--sc-primary) 42%, var(--sc-border));
+    }
+    body.surface-scans .pipeline-dot {
+      border-color: var(--sc-border);
+      background: var(--sc-surface);
+    }
+    body.surface-scans .pipeline-dot.completed {
+      color: var(--sc-success);
+      border-color: color-mix(in srgb, var(--sc-success) 50%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-success) 11%, var(--sc-surface));
+    }
+    body.surface-scans .pipeline-dot.failed {
+      color: var(--sc-critical);
+      border-color: color-mix(in srgb, var(--sc-critical) 58%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-critical) 12%, var(--sc-surface));
+    }
+    body.surface-scans .pipeline-dot.running,
+    body.surface-scans .pipeline-dot.refreshing {
+      color: var(--sc-primary);
+      border-color: color-mix(in srgb, var(--sc-primary) 58%, var(--sc-border));
+      background: var(--sc-primary-soft);
+    }
+    body.surface-scans .pipeline-popover {
+      border-color: color-mix(in srgb, var(--sc-primary) 14%, var(--sc-border));
+      background: var(--sc-surface);
+      box-shadow: var(--sc-shadow-sm);
+    }
+    body.surface-scans .zap-execution-card {
+      grid-template-columns: minmax(170px, .55fr) minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      margin: 14px 0;
+      padding: 15px 16px;
+    }
+    body.surface-scans .zap-execution-card.completed {
+      border-color: color-mix(in srgb, var(--sc-success) 28%, var(--sc-border));
+    }
+    body.surface-scans .zap-execution-card.failed {
+      border-color: color-mix(in srgb, var(--sc-critical) 34%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-critical) 5%, var(--sc-surface));
+    }
+    body.surface-scans .zap-title-row {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin-top: 7px;
+    }
+    body.surface-scans .zap-title-row h4,
+    body.surface-scans .zap-title-row p {
+      margin: 0;
+    }
+    body.surface-scans .zap-title-row h4 {
+      color: var(--sc-text);
+      font-size: 16px;
+    }
+    body.surface-scans .zap-title-row p {
+      margin-top: 2px;
+      color: var(--sc-muted);
+      font-size: 10px;
+    }
+    body.surface-scans .zap-execution-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      min-width: 0;
+    }
+    body.surface-scans .zap-execution-fact {
+      min-width: 0;
+      padding: 9px 10px;
+      border: 1px solid var(--sc-border);
+      border-radius: var(--sc-radius-md);
+      background: var(--sc-surface-soft);
+    }
+    body.surface-scans .zap-execution-fact.target {
+      grid-column: span 2;
+    }
+    body.surface-scans .zap-execution-fact span,
+    body.surface-scans .zap-execution-fact strong,
+    body.surface-scans .zap-execution-fact small {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+    body.surface-scans .zap-execution-fact span {
+      color: var(--sc-muted);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .55px;
+      text-transform: uppercase;
+    }
+    body.surface-scans .zap-execution-fact strong {
+      margin-top: 4px;
+      color: var(--sc-text);
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    body.surface-scans .zap-execution-fact small,
+    body.surface-scans .zap-execution-error {
+      margin-top: 3px;
+      color: var(--sc-muted);
+      font-size: 9px;
+    }
+    body.surface-scans .zap-execution-error {
+      grid-column: 1 / -1;
+      margin: 0;
+      color: var(--sc-critical);
+    }
+    body.surface-scans .zap-meta {
+      justify-items: end;
+      align-self: stretch;
+      align-content: center;
+      gap: 7px;
+    }
+    body.surface-scans .zap-meta button,
+    body.surface-scans .scan-row-actions button {
+      width: auto;
+      min-height: 28px;
+      padding: 6px 9px;
+      border-radius: var(--sc-radius-sm);
+      color: var(--sc-primary);
+      border-color: color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border));
+      background: var(--sc-primary-soft);
+      font-size: 10px;
+      font-weight: 800;
+    }
+    body.surface-scans .page-scans {
+      display: grid;
+      gap: 0;
+      padding: 15px 16px;
+      margin-top: 14px;
+    }
+    body.surface-scans .scan-section-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 11px;
+      padding-bottom: 11px;
+      border-bottom: 1px solid color-mix(in srgb, var(--sc-primary) 12%, var(--sc-border));
+    }
+    body.surface-scans .scan-section-head small {
+      color: var(--sc-muted);
+      font-size: 10px;
+    }
+    body.surface-scans .scan-scanner-list {
+      display: grid;
+      gap: 8px;
+    }
+    body.surface-scans .scan-scanner-row {
+      grid-template-columns: 42px minmax(150px, 1.15fr) minmax(160px, 1fr) 70px 70px minmax(118px, .72fr) auto auto 24px;
+      min-height: 64px;
+      padding: 10px 11px;
+      border: 1px solid color-mix(in srgb, var(--sc-border) 78%, transparent);
+      border-radius: var(--sc-radius-lg);
+      background: var(--sc-surface);
+      box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 5%, transparent);
+      transition: transform .14s ease, border-color .14s ease, background-color .14s ease, box-shadow .14s ease;
+    }
+    body.surface-scans .scan-scanner-row:hover {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--sc-primary) 26%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-primary) 4%, var(--sc-surface));
+      box-shadow: 0 12px 26px color-mix(in srgb, var(--sc-primary) 7%, transparent);
+    }
+    body.surface-scans .scan-scanner-row.disabled:hover {
+      transform: none;
+      border-color: var(--sc-border);
+      box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 5%, transparent);
+    }
+    body.surface-scans .scanner-logo {
+      width: 38px;
+      height: 38px;
+      border-color: var(--sc-border);
+      background: var(--sc-surface-soft);
+    }
+    body.surface-scans .scanner-identity strong {
+      color: var(--sc-text);
+      font-size: 12px;
+    }
+    body.surface-scans .scanner-identity small {
+      color: var(--sc-muted);
+      font-size: 9.5px;
+      line-height: 1.35;
+    }
+    body.surface-scans .scan-row-error {
+      color: var(--sc-critical) !important;
+    }
+    body.surface-scans .scanner-result-summary {
+      color: var(--sc-text);
+      font-size: 11px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    body.surface-scans .scanner-result-summary.failed {
+      color: var(--sc-critical);
+    }
+    body.surface-scans .scanner-value {
+      min-width: 0;
+      text-align: left;
+    }
+    body.surface-scans .scanner-value strong {
+      color: var(--sc-text);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    body.surface-scans .scanner-value small,
+    body.surface-scans .overview-scanner time {
+      color: var(--sc-muted);
+      font-size: 9px;
+    }
+    body.surface-scans .scan-status-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      padding: 4px 9px;
+      border: 1px solid var(--sc-border);
+      border-radius: 999px;
+      color: var(--sc-muted);
+      background: var(--sc-surface-soft);
+      font-size: 8.5px;
+      font-weight: 900;
+      letter-spacing: .45px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    body.surface-scans .scan-status-chip.completed {
+      color: var(--sc-success);
+      border-color: color-mix(in srgb, var(--sc-success) 28%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-success) 11%, var(--sc-surface));
+    }
+    body.surface-scans .scan-status-chip.failed {
+      color: var(--sc-critical);
+      border-color: color-mix(in srgb, var(--sc-critical) 32%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-critical) 11%, var(--sc-surface));
+    }
+    body.surface-scans .scan-status-chip.running,
+    body.surface-scans .scan-status-chip.refreshing {
+      color: var(--sc-primary);
+      border-color: color-mix(in srgb, var(--sc-primary) 34%, var(--sc-border));
+      background: var(--sc-primary-soft);
+    }
+    body.surface-scans .scan-row-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    body.surface-scans .scanner-chevron {
+      color: var(--sc-muted);
+      opacity: .72;
+      transition: color .14s ease, opacity .14s ease, transform .14s ease;
+    }
+    body.surface-scans .scan-scanner-row:hover .scanner-chevron {
+      color: var(--sc-primary);
+      opacity: 1;
+      transform: translateX(1px);
+    }
+    @media (max-width: 1100px) {
+      body.surface-scans .scan-execution-summary,
+      body.surface-scans .zap-execution-card { grid-template-columns: 1fr; }
+      body.surface-scans .scan-summary-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      body.surface-scans .pipeline { min-width: 760px; }
+      body.surface-scans .zap-meta { justify-items: start; }
+      body.surface-scans .scan-scanner-row {
+        grid-template-columns: 42px minmax(150px, 1fr) minmax(140px, 1fr) auto 24px;
+      }
+      body.surface-scans .scan-scanner-row .scanner-value,
+      body.surface-scans .scan-scanner-row time,
+      body.surface-scans .scan-row-actions {
+        grid-column: 2 / -2;
+      }
+      body.surface-scans .scan-row-actions { justify-content: flex-start; }
+    }
+    @media (max-width: 680px) {
+      body.surface-scans .scan-summary-metrics,
+      body.surface-scans .zap-execution-grid { grid-template-columns: 1fr; }
+      body.surface-scans .zap-execution-fact.target { grid-column: auto; }
+      body.surface-scans .scan-scanner-row {
+        grid-template-columns: 38px minmax(0, 1fr) auto;
+        align-items: start;
+      }
+      body.surface-scans .scan-scanner-row .scanner-result-summary,
+      body.surface-scans .scan-scanner-row .scanner-value,
+      body.surface-scans .scan-scanner-row time,
+      body.surface-scans .scan-row-actions {
+        grid-column: 2 / -1;
+      }
+      body.surface-scans .scan-status-chip { grid-column: 3; grid-row: 1; }
+      body.surface-scans .scanner-chevron { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      body.surface-scans .scan-scanner-row,
+      body.surface-scans .scanner-chevron { transition: none; }
+      body.surface-scans .scan-scanner-row:hover,
+      body.surface-scans .scan-scanner-row:hover .scanner-chevron { transform: none; }
+    }
     body.surface-sidebar { padding: 12px; }
     body.surface-sidebar h2 { font-size: 20px; font-weight: 650; }
     body.surface-sidebar .workspace { font-size: 12px; }
@@ -1947,29 +3455,68 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     body.surface-sidebar .action-group-title { margin-bottom: 6px; font-size: 9px; }
     body.surface-sidebar .action-group-buttons { gap: 5px; }
     body.surface-sidebar .action-group-buttons button { padding: 7px 9px; font-size: 11px; }
+    @media (max-width: 1200px) {
+      body.surface-full .security-center-hero { grid-template-columns: 1fr; }
+      body.surface-full .security-hero-copy { grid-template-columns: minmax(126px, 150px) minmax(0, 1fr); }
+      body.surface-full .overview-triple { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      body.surface-full .enterprise-domain-grid { grid-template-columns: repeat(3, minmax(188px, 1fr)); }
+    }
     @media (max-width: 980px) {
-      body.surface-full .overview-summary { grid-template-columns: 1fr; }
-      body.surface-full .hero { border-right: 0; border-bottom: 1px solid var(--vscode-widget-border); }
+      .sc-topbar { padding: 13px 16px; }
+      body.surface-full .hero-metric-panel { min-height: 0; }
+      body.surface-full .hero-severity-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      body.surface-full .hero-operations-grid { grid-template-columns: 1fr; gap: 14px; }
+      body.surface-full .hero-operations-grid .overview-kpi + .overview-kpi { padding: 14px 0 0; border-left: 0; border-top: 1px solid color-mix(in srgb, var(--sc-border) 66%, transparent); }
       body.surface-full .overview-split { grid-template-columns: 1fr; }
-      body.surface-full .overview-bottom { grid-template-columns: 1fr; }
+      body.surface-full .overview-split > .overview-panel:first-child,
+      body.surface-full .overview-split > .overview-panel:nth-child(2) { max-height: none; overflow: visible; }
+      body.surface-full .overview-triple { grid-template-columns: 1fr; }
+      body.surface-full .overview-triple > .overview-panel { min-height: 0; }
+      body.surface-full .overview-lower { grid-template-columns: 1fr; }
+      body.surface-full .enterprise-domain-grid { grid-template-columns: repeat(2, minmax(188px, 1fr)); }
     }
     @media (max-width: 680px) {
-      body.surface-full { padding-inline: 16px; }
-      body.surface-full .header { align-items: stretch; flex-direction: column; }
-      body.surface-full .header-actions { flex-wrap: wrap; }
-      body.surface-full .overview-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      body.surface-full .overview-kpi:nth-child(2) { border-right: 0; }
-      body.surface-full .overview-kpi:nth-child(-n+2) { border-bottom: 1px solid var(--vscode-widget-border); }
-      body.surface-full .hero { grid-template-columns: 72px minmax(0, 1fr); }
-      body.surface-full .risk-ring { width: 68px; }
-      body.surface-full .overview-scanner { grid-template-columns: 30px minmax(110px, 1fr) auto 48px 24px; }
+      .sc-main { padding: 16px; }
+      .sc-topbar { grid-template-columns: 1fr; align-items: stretch; gap: 11px; margin: 0 0 16px; padding: 12px 14px; }
+      .sc-topbar-actions { justify-content: flex-start; }
+      .header-actions { flex-wrap: wrap; }
+      body.surface-full .security-center-hero { padding: 16px; border-radius: 18px; }
+      body.surface-full .hero { grid-template-columns: 1fr; justify-items: start; }
+      .security-product-mark { width: 128px; }
+      .security-shield { width: 104px; height: 104px; border-radius: 28px; }
+      .security-shield .compact-icon { width: 54px; height: 54px; }
+      body.surface-full .risk-ring { width: 62px; }
+      body.surface-full .hero-metric-panel { padding: 14px; }
+      body.surface-full .posture-header { align-items: flex-start; flex-direction: column; gap: 8px; }
+      body.surface-full .hero-severity-grid { grid-template-columns: 1fr; gap: 10px; }
+      body.surface-full .overview-kpi > strong { font-size: 30px; }
+      body.surface-full .enterprise-domain-grid { grid-template-columns: 1fr; }
+      body.surface-full .overview-scanner { grid-template-columns: 28px minmax(110px, 1fr) auto 48px 22px; }
       body.surface-full .overview-scanner .scanner-value:nth-of-type(4), body.surface-full .overview-scanner time { display: none; }
-      .recent-scan { grid-template-columns: 10px 1fr auto; }
-      .recent-status { display: none; }
+      .finding-card-header { grid-template-columns: auto minmax(0, 1fr) auto; }
+      .finding-card-meta, .finding-card-file-line { grid-column: 2 / -1; }
+      .sev-donut { grid-template-columns: 1fr; justify-items: center; }
+      .verify-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      body.surface-full .recent-scan { grid-template-columns: 8px minmax(0, 1fr); grid-template-areas: 'dot name' 'dot time'; }
+      body.surface-full .recent-status { display: none; }
     }
     @media (prefers-reduced-motion: reduce) {
       body.surface-full button,
-      body.surface-full .overview-scanner { transition: none; }
+      body.surface-full .overview-scanner,
+      body.surface-full .overview-panel,
+      body.surface-full .pipeline-panel,
+      body.surface-full .overview-panel-head button,
+      body.surface-full .risky-target,
+      body.surface-full .domain-card,
+      body.surface-full .domain-cta,
+      body.surface-full .scanner-finding-card,
+      body.surface-full .expand-chevron { transition: none; }
+      body.surface-full .overview-panel:hover,
+      body.surface-full .pipeline-panel:hover,
+      body.surface-full .overview-panel-head button:hover,
+      body.surface-full .domain-card:hover,
+      body.surface-full .domain-card:hover .domain-cta,
+      body.surface-full .scanner-finding-card:hover { transform: none; }
     }
     @media (min-width: 760px) {
       body { padding: 28px; }
@@ -1978,92 +3525,158 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       .action-sections { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .action-group-buttons { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .analytics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .finding-filters { grid-template-columns: minmax(240px, 2fr) repeat(3, minmax(130px, 1fr)); }
-      .finding-card { grid-template-columns: 4px 1fr auto; align-items: center; }
-      .finding-card-actions { grid-column: 3; grid-row: 1; justify-self: end; }
-      .finding-layout { grid-template-columns: minmax(0, 1.7fr) minmax(240px, .8fr); align-items: start; }
+      .findings-hero { grid-template-columns: minmax(320px, .9fr) minmax(520px, 1.1fr); align-items: center; }
+      .finding-filters { grid-template-columns: minmax(240px, 2fr) repeat(5, minmax(124px, 1fr)) auto; align-items: end; }
+      .finding-card { grid-template-columns: 4px auto minmax(0, 1fr) auto auto; align-items: center; }
+      .finding-card-actions { grid-column: 5; grid-row: 1; justify-self: end; }
+      .finding-layout { grid-template-columns: minmax(0, 1.55fr) minmax(270px, .75fr); align-items: start; }
       .finding-preview { display: block; }
       .workflow { grid-template-columns: repeat(5, minmax(0, 1fr)); }
       .workflow-step { grid-template-columns: 1fr; min-height: 130px; }
       .workflow-number { margin-bottom: 5px; }
       .overview-kpis { grid-template-columns: repeat(4, minmax(0,1fr)); }
-      .overview-summary { grid-template-columns: minmax(320px, 1.2fr) minmax(560px, 2.8fr); align-items: stretch; }
-      .overview-summary .hero { border-right: 1px solid var(--vscode-widget-border); }
-      .overview-split { grid-template-columns: minmax(0,1.2fr) minmax(280px,.8fr); }
     }
     ${model.dynamicWorkspace ? dynamicSectionsCss() : ''}
     ${companionPresence ? companionWidgetCss() : ''}
+    ${assistantCard ? assistantCardCss() : ''}
     /* Scanner Details UI */
     .page-scanner-details {
-      padding: 16px 24px;
-      color: var(--vscode-foreground);
+      padding: 0;
+      color: var(--sc-text);
+    }
+    .scanner-detail-hero {
+      position: relative;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: minmax(0,1fr) auto;
+      gap: 18px;
+      align-items: center;
+      margin-bottom: 18px;
+      padding: 22px;
+      border: 1px solid var(--sc-border);
+      border-radius: 18px;
+      background: linear-gradient(135deg, color-mix(in srgb, var(--sc-primary) 8%, var(--sc-surface)), var(--sc-surface));
+      box-shadow: var(--sc-shadow-sm);
+    }
+    .scanner-detail-watermark {
+      position: absolute;
+      right: 26px;
+      bottom: -18px;
+      display: flex;
+      gap: 18px;
+      opacity: .035;
+      color: var(--sc-primary);
+      transform: scale(5);
+      pointer-events: none;
     }
     .scanner-header-identity {
       display: flex;
       align-items: center;
       gap: 14px;
+      position: relative;
+      z-index: 1;
     }
-    .scanner-logo-large {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 48px;
-      height: 48px;
-      border-radius: 8px;
-      background: var(--vscode-widget-border);
-      color: var(--vscode-foreground);
+    .scanner-header-identity .scanner-logo {
+      width: 58px;
+      height: 58px;
+      border-radius: 16px;
+      background: var(--sc-surface);
+      box-shadow: var(--sc-shadow-sm);
     }
-    .scanner-logo-large svg {
-      width: 28px;
-      height: 28px;
+    .scanner-header-identity .scanner-logo-img {
+      width: 42px;
+      height: 42px;
+    }
+    .scanner-header-identity .scanner-logo[data-scanner-logo="semgrep"] .scanner-logo-img,
+    .scanner-header-identity .scanner-logo[data-scanner-logo="osv"] .scanner-logo-img {
+      width: 38px;
+      height: 26px;
     }
     .scanner-header-desc {
       margin: 4px 0 0;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-muted);
       font-size: 13px;
+    }
+    .scanner-eyebrow {
+      color: var(--sc-primary);
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: .8px;
+      text-transform: uppercase;
+    }
+    .scanner-header-identity h1 {
+      margin: 3px 0 0;
+      color: var(--sc-text);
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+    .scanner-hero-status {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      justify-items: end;
+      gap: 4px;
+      min-width: 150px;
+      padding: 12px;
+      border: 1px solid var(--sc-border);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--sc-surface) 84%, transparent);
+    }
+    .scanner-hero-status strong {
+      font-size: 28px;
+      line-height: 1;
+    }
+    .scanner-hero-status small {
+      color: var(--sc-muted);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
     }
     .scanner-meta-grid {
       display: grid;
-      grid-template-columns: repeat(6, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
       gap: 12px;
       margin: 20px 0;
     }
     .meta-item {
-      padding: 10px;
-      border: 1px solid var(--vscode-widget-border);
-      border-radius: 6px;
-      background: var(--vscode-editor-background);
-      text-align: center;
+      padding: 12px;
+      border: 1px solid var(--sc-border);
+      border-radius: 12px;
+      background: var(--sc-surface);
+      box-shadow: var(--sc-shadow-sm);
     }
     .meta-item span {
       display: block;
       font-size: 11px;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-muted);
       text-transform: uppercase;
       margin-bottom: 4px;
     }
     .meta-item strong {
       font-size: 14px;
-      color: var(--vscode-foreground);
+      color: var(--sc-text);
     }
     .scan-identity-bar {
       display: flex;
+      flex-wrap: wrap;
       justify-content: space-between;
       gap: 12px;
       margin-bottom: 24px;
-      padding: 8px 12px;
-      background: var(--vscode-textBlockQuote-background, var(--vscode-widget-border));
-      border-left: 3px solid var(--vscode-focusBorder);
-      border-radius: 4px;
+      padding: 10px 12px;
+      background: var(--sc-surface-soft);
+      border: 1px solid var(--sc-border);
+      border-left: 3px solid var(--sc-primary);
+      border-radius: 12px;
       font-size: 12px;
       color: var(--vscode-descriptionForeground);
     }
     .scanner-state-card {
       padding: 24px;
-      border: 1px solid var(--vscode-widget-border);
-      border-radius: 8px;
+      border: 1px solid var(--sc-border);
+      border-radius: 16px;
       text-align: center;
-      background: var(--vscode-editor-background);
+      background: var(--sc-surface);
+      box-shadow: var(--sc-shadow-sm);
       margin: 20px 0;
     }
     .scanner-state-card.failed {
@@ -2088,35 +3701,35 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       color: var(--vscode-testing-iconPassed, #3fb950);
     }
     .scanner-kpi-summary {
-      display: flex;
-      flex-wrap: wrap;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
       gap: 12px;
       margin-bottom: 20px;
     }
     .kpi-card {
-      flex: 1 1 calc(25% - 12px);
       min-width: 120px;
       padding: 12px;
-      border: 1px solid var(--vscode-widget-border);
-      border-radius: 6px;
-      background: var(--vscode-editor-background);
+      border: 1px solid var(--sc-border);
+      border-radius: 12px;
+      background: var(--sc-surface);
+      box-shadow: var(--sc-shadow-sm);
       display: flex;
       flex-direction: column;
       align-items: center;
       border-left: 4px solid var(--vscode-widget-border);
     }
-    .kpi-card.critical { border-left-color: #cf222e; }
-    .kpi-card.high { border-left-color: #d29922; }
-    .kpi-card.medium { border-left-color: #e3b341; }
-    .kpi-card.low { border-left-color: #58a6ff; }
-    .kpi-card.sonar-category { border-left-color: var(--vscode-focusBorder); }
+    .kpi-card.critical { border-left-color: var(--sc-critical); }
+    .kpi-card.high { border-left-color: var(--sc-high); }
+    .kpi-card.medium { border-left-color: var(--sc-medium); }
+    .kpi-card.low { border-left-color: var(--sc-low); }
+    .kpi-card.sonar-category { border-left-color: var(--sc-primary); }
     .kpi-card strong {
       font-size: 20px;
       line-height: 1.2;
     }
     .kpi-card span {
       font-size: 11px;
-      color: var(--vscode-descriptionForeground);
+      color: var(--sc-muted);
       margin-top: 2px;
     }
     .scanner-filter-bar {
@@ -2125,9 +3738,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       gap: 12px;
       margin-bottom: 16px;
       padding: 12px;
-      border: 1px solid var(--vscode-widget-border);
-      border-radius: 6px;
-      background: var(--vscode-editor-background);
+      border: 1px solid var(--sc-border);
+      border-radius: 14px;
+      background: var(--sc-surface);
+      box-shadow: var(--sc-shadow-sm);
     }
     .scanner-filter-bar .filter-group {
       flex: 1 1 200px;
@@ -2143,8 +3757,8 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .scanner-filter-bar input, .scanner-filter-bar select {
       flex: 1 1 auto;
       padding: 6px 10px;
-      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
-      border-radius: 4px;
+      border: 1px solid var(--vscode-input-border, var(--sc-border));
+      border-radius: 10px;
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
     }
@@ -2178,34 +3792,67 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       gap: 10px;
     }
     .scanner-finding-card {
-      border: 1px solid var(--vscode-widget-border);
-      border-radius: 6px;
-      background: var(--vscode-editor-background);
+      border: 1px solid var(--sc-border);
+      border-radius: 12px;
+      background: var(--sc-surface);
       overflow: hidden;
+      transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
     }
     .scanner-finding-card:hover {
-      border-color: var(--vscode-focusBorder);
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--sc-primary) 34%, var(--sc-border));
+      box-shadow: 0 10px 24px color-mix(in srgb, var(--sc-primary) 10%, transparent);
+    }
+    .scanner-finding-card.expanded {
+      border-color: color-mix(in srgb, var(--sc-primary) 42%, var(--sc-border));
     }
     .finding-card-header {
-      display: flex;
+      display: grid;
+      grid-template-columns: auto minmax(180px, 1fr) minmax(120px, .75fr) minmax(130px, .8fr) auto;
       align-items: center;
       padding: 10px 14px;
       cursor: pointer;
       gap: 12px;
       user-select: none;
+      min-width: 0;
+    }
+    .finding-card-header:hover {
+      background: var(--sc-surface-soft);
     }
     .finding-card-title {
-      flex: 1;
+      min-width: 0;
       font-weight: 600;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       font-size: 13px;
     }
+    .finding-card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      min-width: 0;
+    }
+    .finding-card-meta small {
+      max-width: 100%;
+      padding: 3px 7px;
+      border-radius: 999px;
+      color: var(--sc-muted);
+      background: var(--sc-surface-soft);
+      font-size: 9px;
+      font-weight: 700;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .finding-card-file-line {
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
       font-family: var(--vscode-editor-font-family, monospace);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .expand-chevron {
       font-size: 10px;
@@ -2217,18 +3864,29 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     }
     .finding-card-details {
       display: none;
-      padding: 14px;
-      border-top: 1px solid var(--vscode-widget-border);
-      background: rgba(0, 0, 0, 0.05);
+      padding: 0;
+      border-top: 1px solid var(--sc-border);
+      background: linear-gradient(180deg, color-mix(in srgb, var(--sc-primary) 3%, var(--sc-surface)), var(--sc-surface));
     }
     .scanner-finding-card.expanded .finding-card-details {
       display: block;
     }
     .detail-body {
-      margin-bottom: 12px;
+      margin: 0;
+    }
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      padding: 14px;
     }
     .detail-row {
-      margin-bottom: 10px;
+      min-width: 0;
+      margin: 0;
+      padding: 11px 12px;
+      border: 1px solid var(--sc-border);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--sc-surface) 86%, transparent);
     }
     .detail-row span {
       display: block;
@@ -2236,14 +3894,19 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       text-transform: uppercase;
       color: var(--vscode-descriptionForeground);
       margin-bottom: 3px;
+      font-weight: 800;
+      letter-spacing: .45px;
     }
     .detail-row code, .detail-row pre {
       font-family: var(--vscode-editor-font-family, monospace);
-      background: rgba(0,0,0,0.15);
-      border-radius: 4px;
+      background: var(--vscode-textCodeBlock-background, var(--sc-surface-soft));
+      border-radius: 6px;
+      overflow-wrap: anywhere;
     }
     .detail-row code {
-      padding: 2px 6px;
+      display: inline-block;
+      max-width: 100%;
+      padding: 3px 6px;
       font-size: 12px;
     }
     .detail-row pre {
@@ -2254,7 +3917,8 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .detail-row p {
       margin: 4px 0 0;
       font-size: 13px;
-      line-height: 1.4;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
     }
     .detail-row.code-snippet pre {
       border-left: 3px solid var(--vscode-focusBorder);
@@ -2273,16 +3937,31 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .dataflow-steps li {
       margin-bottom: 4px;
     }
-    .finding-card-actions, .zap-actions-row {
+    .scanner-finding-card .finding-card-actions, .zap-actions-row {
       display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
       gap: 8px;
-      margin-top: 12px;
-      border-top: 1px solid var(--vscode-widget-border);
-      padding-top: 12px;
+      margin: 0;
+      border-top: 1px solid var(--sc-border);
+      padding: 12px 14px;
+      background: color-mix(in srgb, var(--sc-surface) 92%, transparent);
+    }
+    .scanner-finding-card .finding-card-actions button, .zap-actions-row button {
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 800;
     }
     .zap-actions-row {
       border-top: none;
-      padding-top: 0;
+      justify-content: flex-start;
+      padding: 0;
       margin-top: 16px;
     }
     .severity-badge {
@@ -2351,56 +4030,77 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     }
   </style>
 </head>
-<body class="surface-${escapeHtml(surface)} theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
-  <div class="header"><div><h2>Security Center</h2><div class="workspace">${escapeHtml(model.workspace)}</div></div><div class="header-actions"><button id="theme-toggle" class="theme-toggle" title="Changer le thème de Security Center">◐ Sombre</button>${scanRunning ? `<span id="scan-chrono" class="scan-chrono" data-started-at="${escapeHtml(model.scanStartedAt)}" data-elapsed="${model.scanDurationMs}">◷ ${escapeHtml(formatDuration(model.scanDurationMs))}</span>` : ''}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend">Backend ${escapeHtml(model.backendStatus)}</span></div></div></div>
+<body class="surface-${escapeHtml(surface)}${inShell ? ' sc-shelled' : ''}${zapPreflightModal ? ' sc-modal-open' : ''} theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
+  ${fullShellOpen}
+  ${headerBar}
   ${surface === 'history' ? '<div class="history-readonly"><strong>Scan historique — lecture seule</strong><br>Cette vue indépendante ne remplace pas le scan actuellement affiché.</div>' : ''}
   <div class="operational-banner ${operationalState}"><span class="operational-icon">${operationalState === 'danger' ? '!' : operationalState === 'success' ? '✓' : 'i'}</span><div class="operational-copy"><strong>${escapeHtml(operationalTitle)}</strong><span>${escapeHtml(operationalDetails)}</span></div></div>
-  ${surface === 'sidebar' ? '<button class="primary sidebar-open" data-command="securityCenter.openDashboard">Ouvrir le dashboard complet</button>' : ''}
-  ${surface === 'sidebar' ? `<div class="page-navigation"><button class="secondary" data-command="securityCenter.openFindingsPage">Findings</button><button class="secondary" data-command="securityCenter.openScansPage">Scans</button><button class="secondary" data-command="securityCenter.openSecurityPipeline">Pipeline</button><button class="secondary" data-command="securityCenter.openAnalyticsPage">Analytics</button></div>` : ''}
   ${failureDiagnostics}
-  ${surface === 'full' ? '<div class="overview-summary">' : ''}<div class="hero ${riskClass}"><div class="risk-ring"><svg viewBox="0 0 100 100" aria-hidden="true"><circle class="risk-track" cx="50" cy="50" r="42"></circle><circle class="risk-progress" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${displayedRiskScore} 100"></circle></svg><strong>${displayedRiskScore}</strong></div><div class="risk-copy"><div class="risk-label">Risque ${escapeHtml(displayedRiskLevel)}</div><span class="risk-explanation">${scanRunning && model.snapshotAvailable ? `Score conservé depuis le snapshot consolidé pendant l’actualisation ${escapeHtml(model.executionType || 'partielle')}.` : scanRunning ? 'Calcul en attente du premier résultat exploitable.' : partialResultsAvailable ? `Score partiel calculé uniquement avec ${completedTools.size} scanner(s) terminé(s). Un outil en échec n’est jamais interprété comme zéro alerte.` : scanResultsTrusted ? 'Score calculé à partir des résultats valides les plus récents de chaque scanner.' : 'Aucun scanner n’a terminé avec des résultats exploitables. Le risque courant ne peut pas être évalué.'}</span></div></div>
-  ${surface === 'full' ? `<div class="overview-kpis"><div class="overview-kpi critical"><strong>${criticalCount}</strong><span>Critical</span><small>Exigent une attention immédiate</small></div><div class="overview-kpi high"><strong>${highCount}</strong><span>High</span><small>Priorité de correction élevée</small></div><div class="overview-kpi"><strong>${currentProductionPriority}</strong><span>Production</span><small>${newCount} nouvelle(s) au total</small></div><div class="overview-kpi"><strong>${model.completedScanners}/${model.scanners.length}</strong><span>Scanners</span><small>${failedTools.length ? `${failedTools.join(', ')} en échec` : 'Tous les scanners ont réussi'}</small></div></div></div>` : ''}
+  ${surface === 'full' ? `${securityCenterHero}${enterpriseSummary}${overviewTripleRow}` : `<div class="hero ${riskClass}"><div class="risk-ring"><svg viewBox="0 0 100 100" aria-hidden="true"><circle class="risk-track" cx="50" cy="50" r="42"></circle><circle class="risk-progress" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${displayedRiskScore} 100"></circle></svg><strong>${displayedRiskScore}</strong></div><div class="risk-copy"><div class="risk-label">Risque ${escapeHtml(displayedRiskLevel)}</div><span class="risk-explanation">${riskExplanation}</span></div></div>`}
   ${policyBanner}
-  <h3 class="sidebar-keep">Pipeline d’analyse</h3>
+  ${scansExecutionSummary}
+  <h3 class="sidebar-keep scans-section-title">Pipeline d’analyse</h3>
   <div class="pipeline-panel">${renderPipeline(model.scanners, model.scanStatus, model.scanDurationMs, model.findings.filter((finding) => !finding.staleFromPreviousScan))}</div>
-  ${surface === 'full' ? `<div class="overview-split"><section class="overview-panel"><div class="overview-panel-head"><strong>Scanners</strong><button data-command="securityCenter.openScansPage">Voir les détails →</button></div>${overviewScannerRows}${overviewDisabledRows}</section><section class="overview-panel"><div class="overview-panel-head"><strong>Activité de sécurité</strong><button data-command="securityCenter.showTrends">Tendances →</button></div><div class="activity-overview"><div class="activity-summary"><div class="activity-stat"><strong>${newCount}</strong><span>Nouvelles</span></div><div class="activity-stat resolved"><strong>${fixAppliedCount}</strong><span>Corrigées</span></div><div class="activity-stat validated"><strong>${validatedCount}</strong><span>Validées</span></div><div class="activity-stat accepted"><strong>${acceptedCount}</strong><span>Acceptées</span></div></div>${historyChart}<div class="activity-footer"><div class="activity-col"><span class="activity-col-title">Tendance globale</span><strong class="activity-col-val">${escapeHtml(trendTop)}</strong><span class="activity-col-sub">${escapeHtml(trendBottom)}</span></div><div class="activity-divider"></div><div class="activity-col"><span class="activity-col-title">Temps moyen de correction</span><strong class="activity-col-val">${escapeHtml(mttrTop)}</strong><span class="activity-col-sub">${escapeHtml(mttrBottom)}</span></div></div></div></section></div><div class="overview-bottom"><section class="overview-panel"><div class="overview-panel-head"><strong>Priority Findings</strong><button data-command="securityCenter.openFindingsPage">Voir tout →</button></div><div class="priority-summary-grid"><div class="priority-summary-item critical"><strong>${prioritySummary.critical}</strong><span>Critical</span></div><div class="priority-summary-item high"><strong>${prioritySummary.high}</strong><span>High</span></div><div class="priority-summary-item medium"><strong>${prioritySummary.medium}</strong><span>Medium</span></div><div class="priority-summary-item low"><strong>${prioritySummary.low}</strong><span>Low</span></div></div></section><section class="overview-panel"><div class="overview-panel-head"><strong>Dernières analyses</strong><button data-command="securityCenter.showScanHistoryPage">Voir tout l'historique →</button></div><div class="recent-scans">${recentScanRows}</div></section></div>` : ''}
+  ${surface === 'full' ? `<div class="overview-split"><section class="overview-panel"><div class="overview-panel-head"><strong>Scanners</strong><button data-command="securityCenter.openScansPage">Voir les détails →</button></div>${overviewScannerRows}${overviewDisabledRows}</section><section class="overview-panel"><div class="overview-panel-head"><strong>Activité de sécurité</strong><button data-command="securityCenter.showTrends">Tendances →</button></div><div class="activity-overview"><div class="activity-summary"><div class="activity-stat"><strong>${newCount}</strong><span>Nouvelles</span></div><div class="activity-stat resolved"><strong>${fixAppliedCount}</strong><span>Corrigées</span></div><div class="activity-stat validated"><strong>${validatedCount}</strong><span>Validées</span></div><div class="activity-stat accepted"><strong>${acceptedCount}</strong><span>Acceptées</span></div></div>${historyChart}<div class="activity-footer"><div class="activity-col"><span class="activity-col-title">Tendance globale</span><strong class="activity-col-val">${escapeHtml(trendTop)}</strong><span class="activity-col-sub">${escapeHtml(trendBottom)}</span></div><div class="activity-divider"></div><div class="activity-col"><span class="activity-col-title">Temps moyen de correction</span><strong class="activity-col-val">${escapeHtml(mttrTop)}</strong><span class="activity-col-sub">${escapeHtml(mttrBottom)}</span></div></div></div></section></div>` : ''}
   ${zapCard}
   <div class="cards">
-    <div class="card"><strong>${currentActiveFindings.length}</strong><span>Alertes actives</span></div>
-    <div class="card"><strong>${currentFindings.length}</strong><span>Résultats du scan</span></div>
+    <div class="card"><strong>${currentActiveFindings.length}</strong><span>${escapeHtml(activeFindingsCardLabel)}</span></div>
+    <div class="card"><strong>${currentFindings.length}</strong><span>${escapeHtml(scanResultsCardLabel)}</span></div>
     <div class="card"><strong>${currentProductionPriority}</strong><span>Priorités production</span></div>
-    <div class="card"><strong>${model.completedScanners}/${model.scanners.length}</strong><span>Scanners terminés</span></div>
+    <div class="card"><strong>${finishedCount}/${model.scanners.length}</strong><span>Scanners terminés</span></div>
     <div class="card"><strong>${resultsAvailable ? currentActiveFindings.filter((finding) => finding.sourceContext === 'runtime').length : 0}</strong><span>Alertes runtime</span></div>
     <div class="card"><strong>${resultsAvailable ? model.correlations.length : 0}</strong><span>Corrélations</span></div>
     <div class="card"><strong>${resultsAvailable ? model.correlationCounts.high || 0 : 0}</strong><span>Confiance élevée</span></div>
   </div>
-  ${surface === 'full' ? `<h3>Priority Findings ${resultsAvailable ? `<button class="quiet-action" data-command="securityCenter.openFindingsPage">Voir les ${priorityFindingCount} priorité${priorityFindingCount > 1 ? 's' : ''} →</button>` : ''}</h3><div class="priority-findings">${priorityFindings}</div>` : ''}
-  ${surface === 'sidebar' ? `<h3 class="sidebar-keep">Actions</h3>
-  <div class="action-sections">
-    <section class="action-group frequent"><div class="action-group-title">Analyse fréquente</div><div class="action-group-buttons">${actionButton('securityCenter.scanWorkspace', 'Relancer l’analyse', 'play', true)}${actionButton('securityCenter.scanIncremental', 'Scan rapide des fichiers modifiés', 'code')}${actionButton('securityCenter.compareScans', 'Comparer les scans', 'compare')}</div></section>
-    <section class="action-group"><div class="action-group-title">Investigation</div><div class="action-group-buttons">${actionButton('securityCenter.openDynamicPage', 'Ouvrir Dynamic Security', 'pulse')}${actionButton('securityCenter.showScanHistoryPage', 'Ouvrir l’historique des scans', 'history')}${actionButton('securityCenter.showAuditLog', 'Ouvrir le journal d’audit', 'report')}${actionButton('securityCenter.showTrends', 'Tendances et MTTR', 'chart')}</div></section>
-    <section class="action-group"><div class="action-group-title">Pipeline</div><div class="action-group-buttons">${actionButton('securityCenter.openSecurityPipeline', 'Ouvrir le pipeline de sécurité', 'shield')}${actionButton('securityCenter.openSecurityDelivery', 'Security Delivery (CI/CD)', 'rocket')}</div></section>
-    <section class="action-group"><div class="action-group-title">Rapports</div><div class="action-group-buttons">${actionButton('securityCenter.generateSbom', 'Exporter le SBOM', 'report')}${actionButton('securityCenter.checkLicenses', 'Contrôler les licences', 'shield')}</div></section>
-    <section class="action-group"><div class="action-group-title">Configuration et protection</div><div class="action-group-buttons">${actionButton('securityCenter.openScannerSetup', 'Scanners locaux', 'settings')}${actionButton('securityCenter.openProjectPolicy', 'Politique projet', 'shield')}${actionButton('securityCenter.configureOllama', 'Ollama local', 'pulse')}${actionButton('securityCenter.rollbackAiFix', 'Rollback IA', 'history')}${actionButton('securityCenter.configureBackendApiKey', 'Clé API backend', 'key')}${actionButton('securityCenter.configureTeamIntegrations', 'Slack / Jira', 'compare')}${actionButton('securityCenter.installPreCommitHook', 'Protection pre-commit', 'shield')}</div></section>
-  </div>` : ''}
-  <section class="page-findings"><header class="dynamic-page-header"><div><h1>Findings</h1><p>Alertes, preuves, triage et corrections.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header><h3>Vulnérabilités détaillées</h3>
-  <section class="findings-panel">
-    <div class="finding-filters">
-      <input id="finding-search" type="search" placeholder="Rechercher une vulnérabilité, un fichier, une CVE/CWE…">
-      <select id="finding-tool"><option value="">Tous les outils</option>${optionTags(model.byTool)}</select>
-      <select id="finding-severity"><option value="">Toutes les sévérités</option>${optionTags(model.bySeverity)}</select>
-      <select id="finding-status"><option value="">Tous les statuts</option>${optionTags(model.byStatus)}</select>
-    </div>
-    <div class="findings-count"><strong id="visible-findings">${model.findings.length}</strong> vulnérabilité(s) affichée(s)</div>
-    <div class="finding-layout"><div class="finding-list">${findingCards}</div><aside class="finding-preview" aria-live="polite"><div class="finding-preview-label">Aperçu de l’alerte</div><h4 id="preview-title">Sélectionnez une vulnérabilité</h4><span id="preview-location">Le fichier ou l’endpoint apparaîtra ici.</span><small id="preview-rule">Utilisez « Voir les détails » pour ouvrir toutes les preuves et recommandations.</small></aside></div>
-  </section></section>
-  <section class="page-scans"><header class="dynamic-page-header"><div><h1>Scans</h1><p>État, résultats et exécution des scanners.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header><h3>Scanners</h3>${scannerRows}${disabledScannerRows}</section>
-  <section class="page-analytics"><header class="dynamic-page-header"><div><h1>Analytics</h1><p>Répartition des alertes et signaux de sécurité.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header><div class="analytics-grid"><section class="analytics-panel"><h3>Répartition par outil</h3>${renderDonutChart(model.byTool, 'Répartition des alertes par outil')}</section><section class="analytics-panel"><h3>Répartition par sévérité</h3>${renderDonutChart(model.bySeverity, 'Répartition des alertes par sévérité')}</section></div>
+  ${surface === 'full' ? `<h3>Priority Findings ${resultsAvailable ? `<button class="quiet-action" data-command="securityCenter.openFindingsPage">Voir les ${priorityFindingCount} priorité${priorityFindingCount > 1 ? 's' : ''} →</button>` : ''}</h3><div class="priority-findings">${priorityFindings}</div>${overviewLowerRow}` : ''}
+  <section class="page-findings">
+    <section class="findings-hero">
+      <div class="findings-watermark" aria-hidden="true">${compactIcon('shield')}${compactIcon('pulse')}</div>
+      <div><span class="findings-eyebrow">Application Security</span><h2>Findings</h2><p>Prioritize, investigate and remediate security issues with the real scanner evidence already collected.</p></div>
+      <div class="findings-summary">${findingsSummary}</div>
+    </section>
+    <section class="findings-panel" aria-label="Findings investigation workspace">
+      <h3>Vulnérabilités détaillées</h3>
+      <div class="finding-filters">
+        <label class="filter-search"><span>Search</span><input id="finding-search" type="search" placeholder="Search findings, files, rules, CWE..."></label>
+        <label><span>Scanner</span><select id="finding-tool"><option value="">Tous les outils</option>${scannerOptionTags(model.byTool)}</select></label>
+        <label><span>Severity</span><select id="finding-severity"><option value="">All severities</option>${optionTags(model.bySeverity)}</select></label>
+        <label><span>Status</span><select id="finding-status"><option value="">All statuses</option>${optionTags(model.byStatus)}</select></label>
+        <label><span>Environment</span><select id="finding-context"><option value="">All contexts</option>${optionTags(model.byContext)}</select></label>
+        <label><span>Reachability</span><select id="finding-reachability"><option value="">All reachability</option>${reachabilityOptions}</select></label>
+        <button id="finding-clear-filters" class="quiet-action" type="button">Clear</button>
+      </div>
+      <div class="finding-filter-meta"><div id="finding-filter-chips" class="filter-chips" aria-live="polite"></div><div class="findings-count"><strong id="visible-findings">${model.findings.length}</strong> / ${model.findings.length} finding(s)</div></div>
+      <div class="finding-layout">
+        <div class="finding-list" role="list">${findingCards}</div>
+        <aside class="finding-preview" aria-live="polite">
+          <div class="finding-preview-label">Investigation Preview</div>
+          <div class="preview-source"><span id="preview-scanner">Select a finding</span><strong id="preview-severity">—</strong></div>
+          <h4 id="preview-title">Select a finding</h4>
+          <dl>
+            <div><dt>File / target</dt><dd id="preview-location">The file or endpoint appears here.</dd></div>
+            <div><dt>Rule</dt><dd id="preview-rule">Rule unavailable</dd></div>
+            <div><dt>Reachability</dt><dd id="preview-reachability">Unknown</dd></div>
+            <div><dt>Confidence</dt><dd id="preview-confidence">Unknown</dd></div>
+            <div><dt>Environment</dt><dd id="preview-context">Unclassified</dd></div>
+            <div><dt>Status</dt><dd id="preview-status">New</dd></div>
+          </dl>
+          <p id="preview-description">Use Investigate to open the full evidence, remediation and verification workspace.</p>
+          <div class="preview-actions">
+            <button id="preview-code" class="finding-code" type="button" hidden>Open code</button>
+            <button id="preview-details" class="finding-open" type="button" disabled>View full details</button>
+            <button class="secondary" data-command="securityCenter.verifyFindingFix" type="button">Fix & Verify</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </section>
+  <section class="page-scans">${surface === 'scans' ? `<div class="scan-section-head"><div><span>Scanner execution</span><h3>Scanners</h3></div><small>${escapeHtml(model.scanners.length + model.disabledScanners.length)} configured source(s)</small></div><div class="scan-scanner-list">${scannerRows}${disabledScannerRows}</div>` : ''}</section>
+  <section class="page-analytics"><div class="analytics-grid"><section class="analytics-panel"><h3>Répartition par outil</h3>${renderDonutChart(model.byTool, 'Répartition des alertes par outil')}</section><section class="analytics-panel"><h3>Répartition par sévérité</h3>${renderDonutChart(model.bySeverity, 'Répartition des alertes par sévérité')}</section></div>
   <h3>Par contexte</h3>${renderMetricRows(model.byContext, 'Aucun résultat')}
   <h3>Suivi de correction</h3>${renderMetricRows(model.byStatus, 'Aucun statut')}
   <h3>Corrélations multi-outils</h3>${correlationRows}</section>
   <section class="page-dynamic">
-    <header class="dynamic-page-header"><div><h1>Dynamic Security</h1><p>Cible, tests dynamiques, findings et trafic HTTP capturé.</p></div><button class="quiet-action" data-command="securityCenter.openDashboard">← Dashboard</button></header>
     <section class="dynamic-section dynamic-target"><div class="dynamic-section-head"><h2>Cible</h2><span class="target-state ${escapeHtml(targetState)}">${escapeHtml(targetStatus)}</span></div><div class="dynamic-status-copy"><strong>${escapeHtml(targetOrigin || 'Aucune cible configurée')}</strong>${targetState === 'unreachable' ? '<span>Démarrez l’application avant de lancer une analyse dynamique.</span>' : targetState === 'unknown' && targetOrigin ? '<span>La cible n’a pas encore été vérifiée.</span>' : targetEvidenceLabel ? `<span>${escapeHtml(targetEvidenceLabel)}</span>` : ''}</div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.checkDynamicTarget" ${targetOrigin ? '' : 'disabled'}>Vérifier</button><button class="secondary" data-command="securityCenter.changeDynamicTarget">Modifier la cible</button></div></section>
     <div class="dynamic-status-grid">
       <section class="dynamic-section"><div class="dynamic-section-head"><h2>ZAP</h2><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span></div><p class="dynamic-purpose">Analyse dynamique automatisée</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Dernière analyse</span><strong>${zapScanner ? escapeHtml(zapState) : 'Jamais exécutée'}</strong></div><div class="dynamic-fact"><span>URL testées</span><strong>${zapTestedUrls || 'Non disponible'}</strong></div><div class="dynamic-fact"><span>Findings</span><strong>${zapFindingCount}</strong></div><div class="dynamic-fact"><span>Durée</span><strong>${zapScanner?.durationMs ? escapeHtml(formatDuration(zapScanner.durationMs)) : 'Non disponible'}</strong></div></div>${zapScanner?.error ? `<div class="dynamic-status-copy" role="alert"><span>${escapeHtml(summarizeScannerError(zapScanner.error))}</span></div>` : ''}<div class="dynamic-actions">${zapAuthenticationFailed ? '<button class="primary" data-command="securityCenter.configureZapCredentials">Configurer le compte ZAP</button><button class="quiet-action" data-command="securityCenter.configureZap">Paramètres ZAP</button>' : zapScanner?.status === 'failed' ? '<button class="primary" data-command="securityCenter.configureZap">Configurer ZAP</button>' : `<button class="primary" data-command="securityCenter.scanZap" ${zapScanner?.status === 'running' ? 'disabled aria-busy="true"' : ''}>${zapScanner?.status === 'running' ? 'Analyse ZAP en cours…' : 'Lancer ZAP'}</button>`}<button class="quiet-action anchor-action" data-target="dynamic-findings">Voir les findings</button></div></section>
@@ -2413,9 +4113,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     </section>
     <section class="dynamic-section"><div class="dynamic-section-head"><h2>Tests dynamiques récents</h2><span>${model.httpScenarios.length} scénario(s)</span></div><div class="dynamic-list">${recentDynamicRows}</div></section>
   </section>
-  ${surface !== 'history' && uiState.zapConfirmationVisible ? `<div class="zap-confirmation-backdrop"><section class="zap-confirmation" role="alertdialog" aria-modal="true" aria-labelledby="zap-confirmation-title" aria-describedby="zap-confirmation-copy"><div class="zap-confirmation-head"><span class="zap-confirmation-icon" aria-hidden="true">!</span><div><h2 id="zap-confirmation-title">Autoriser l'analyse ZAP ${escapeHtml(uiState.zapConfirmation?.mode || 'active')} ?</h2><p id="zap-confirmation-copy">ZAP va envoyer des requêtes de test à la cible locale. Continuez uniquement si vous êtes autorisé à tester cette application.</p></div></div>${uiState.zapConfirmation?.target ? `<div class="zap-confirmation-target"><span>Cible</span><code>${escapeHtml(uiState.zapConfirmation.target)}</code></div>` : ''}<p>Si vous refusez, Security Center utilisera le scan passif baseline.</p><div class="dynamic-actions"><button class="secondary" data-zap-cancel>Utiliser le scan passif</button><button class="primary" data-zap-confirm>Autoriser le scan local</button></div></section></div>` : ''}
   <section class="page-burp-settings">
-    <header class="dynamic-page-header"><div><h1>Paramètres Burp</h1><p>État du connecteur et de la capture sécurisée.</p></div><div><button class="quiet-action" data-command="securityCenter.openDynamicPage">← Sécurité dynamique</button><button class="quiet-action" data-command="securityCenter.openDashboard">Dashboard</button></div></header>
     <section class="dynamic-section"><div class="dynamic-section-head"><h2>Connecteur</h2><span class="burp-connection ${model.burpConnected ? 'connected' : 'disconnected'}">${model.burpConnected ? '● Connecté' : '○ Déconnecté'}</span></div><div class="settings-list">
       <div class="settings-row"><span>État du connecteur</span><strong>${escapeHtml(model.burpStatus.status || (model.burpConnected ? 'ready' : 'unavailable'))}</strong></div>
       <div class="settings-row"><span>Endpoint</span><code>${escapeHtml(model.burpEndpoint || 'Non configuré')}</code></div>
@@ -2429,11 +4127,20 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   </section>
 
   <section class="page-scanner-details">
-    ${renderScannerDetailsPage(model, selectedTheme)}
+    ${renderScannerDetailsPage(model, selectedTheme, assets)}
   </section>
 
+  ${fullShellClose}
+  ${modalRoot}
   <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
+    // acquireVsCodeApi() leve au second appel dans un meme webview. Cette page
+    // n'est pas hebergee par le cadre partage : c'est donc elle qui publie
+    // l'instance sur window.__scShellApi, comme le fait shellNavScript pour les
+    // autres pages. Sans cette publication, le script de la carte d'assistant —
+    // injecte plus bas des qu'un scan a produit un resultat — reacquiert l'API,
+    // leve, et interrompt TOUT le reste du script : le garde-fou ZAP perdait
+    // ainsi ses deux boutons.
+    const vscode = window.__scShellApi || (window.__scShellApi = acquireVsCodeApi());
     const themeToggle = document.getElementById('theme-toggle');
     const scanChrono = document.getElementById('scan-chrono');
     if (scanChrono) {
@@ -2451,18 +4158,64 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       updateChrono();
       window.setInterval(updateChrono, 1000);
     }
-    const updateThemeToggle = () => { themeToggle.textContent = document.body.classList.contains('theme-dark') ? '☀ Clair' : '◐ Sombre'; };
+    const updateThemeToggle = () => {
+      const dark = document.body.classList.contains('theme-dark');
+      themeToggle.textContent = dark ? '☀' : '☾';
+      themeToggle.setAttribute('aria-label', dark ? 'Passer au thème clair' : 'Passer au thème sombre');
+      themeToggle.title = dark ? 'Passer au thème clair' : 'Passer au thème sombre';
+    };
     updateThemeToggle();
     themeToggle.addEventListener('click', () => {
       const dark = !document.body.classList.contains('theme-dark');
       document.body.classList.toggle('theme-dark', dark);
       document.body.classList.toggle('theme-light', !dark);
+      document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
       vscode.postMessage({ type: 'themeChanged', theme: dark ? 'dark' : 'light' });
       updateThemeToggle();
     });
-    document.querySelectorAll('[data-command]').forEach((button) => {
+    // La carte d'assistant apporte son propre relais : l'exclure ici evite que
+    // le meme clic parte deux fois.
+    document.querySelectorAll('[data-command]:not(.sc-assistant [data-command])').forEach((button) => {
       button.addEventListener('click', () => vscode.postMessage({ type: 'command', command: button.dataset.command }));
     });
+    const zapPreflight = document.querySelector('[data-zap-preflight-id]');
+    if (zapPreflight) {
+      const zapReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const resolveZapPreflight = (decision) => {
+        if (zapPreflight.dataset.resolved === 'true') return;
+        zapPreflight.dataset.resolved = 'true';
+        zapPreflight.querySelectorAll('[data-zap-preflight-decision]').forEach((button) => { button.disabled = true; });
+        zapReturnFocus?.focus?.();
+        vscode.postMessage({ type: 'zapPreflightResolved', id: zapPreflight.dataset.zapPreflightId, decision });
+      };
+      zapPreflight.querySelectorAll('[data-zap-preflight-decision]').forEach((button) => {
+        button.addEventListener('click', () => resolveZapPreflight(button.dataset.zapPreflightDecision || 'cancel'));
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          resolveZapPreflight('cancel');
+          return;
+        }
+        if (event.key === 'Tab') {
+          const focusables = [...zapPreflight.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+            .filter((item) => !item.disabled && item.offsetParent !== null);
+          if (!focusables.length) return;
+          const first = focusables[0];
+          const last = focusables[focusables.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+      });
+      const firstDecision = zapPreflight.querySelector('[data-zap-preflight-decision="passive"]');
+      firstDecision?.focus?.();
+    }
+    ${assistantCard ? assistantCardScript() : ''}
     ${model.dynamicWorkspace ? dynamicSectionsScript() : ''}
     document.addEventListener('click', (e) => {
       const companionClick = e.target.closest('.sc-widget-mascot') || e.target.closest('.sc-widget-bubble');
@@ -2470,18 +4223,18 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         vscode.postMessage({ type: 'companion' });
       }
     });
-    document.querySelectorAll('.scanner-chevron[data-scanner]').forEach((button) => {
+    document.querySelectorAll('.scanner-chevron[data-scanner-id]').forEach((button) => {
       button.addEventListener('click', (event) => {
         event.stopPropagation();
-        vscode.postMessage({ type: 'openScannerDetails', scanner: button.dataset.scanner });
+        vscode.postMessage({ type: 'openScannerDetails', scannerId: button.dataset.scannerId, scanner: button.dataset.scanner });
       });
     });
     document.querySelectorAll('.overview-scanner:not(.disabled)').forEach((row) => {
       row.style.cursor = 'pointer';
       row.addEventListener('click', (event) => {
         if (event.target.closest('button')) return;
-        const tool = row.querySelector('.scanner-chevron')?.dataset.scanner;
-        if (tool) vscode.postMessage({ type: 'openScannerDetails', scanner: tool });
+        const button = row.querySelector('.scanner-chevron');
+        if (button?.dataset.scannerId) vscode.postMessage({ type: 'openScannerDetails', scannerId: button.dataset.scannerId, scanner: button.dataset.scanner });
       });
     });
 
@@ -2626,8 +4379,6 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       stage.addEventListener('mouseenter', () => placePipelinePopover(stage));
       stage.addEventListener('focusin', () => placePipelinePopover(stage));
     });
-    document.querySelectorAll('[data-zap-cancel]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'cancelZapScan' })));
-    document.querySelectorAll('[data-zap-confirm]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'confirmZapScan' })));
     document.querySelectorAll('.anchor-action').forEach((button) => button.addEventListener('click', () => {
       document.getElementById(button.dataset.target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }));
@@ -2679,6 +4430,14 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       });
     });
     window.addEventListener('message', (event) => {
+      if (event.data?.command === 'setTheme') {
+        const theme = event.data.theme === 'dark' ? 'dark' : 'light';
+        document.body.classList.toggle('theme-dark', theme === 'dark');
+        document.body.classList.toggle('theme-light', theme !== 'dark');
+        document.documentElement.setAttribute('data-theme', theme);
+        updateThemeToggle();
+        return;
+      }
       if (event.data?.type !== 'httpTrafficDetails') return;
       const detail = event.data.detail || {};
       const preview = document.getElementById('traffic-preview-content');
@@ -2712,15 +4471,37 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     document.querySelectorAll('[data-finding-code-index]').forEach((button) => {
       button.addEventListener('click', () => vscode.postMessage({ type: 'findingCode', index: Number(button.dataset.findingCodeIndex) }));
     });
-    const findingCards = [...document.querySelectorAll('.finding-card')];
+    const findingCards = [...document.querySelectorAll('.page-findings .finding-card')];
     const previewTitle = document.getElementById('preview-title');
     const previewLocation = document.getElementById('preview-location');
     const previewRule = document.getElementById('preview-rule');
+    const previewScanner = document.getElementById('preview-scanner');
+    const previewSeverity = document.getElementById('preview-severity');
+    const previewReachability = document.getElementById('preview-reachability');
+    const previewConfidence = document.getElementById('preview-confidence');
+    const previewContext = document.getElementById('preview-context');
+    const previewStatus = document.getElementById('preview-status');
+    const previewDescription = document.getElementById('preview-description');
+    const previewDetails = document.getElementById('preview-details');
+    const previewCode = document.getElementById('preview-code');
     const selectFinding = (card) => {
       findingCards.forEach((item) => item.classList.toggle('selected', item === card));
-      previewTitle.textContent = card.dataset.title;
-      previewLocation.textContent = card.dataset.location;
-      previewRule.textContent = card.dataset.severity + ' • ' + card.dataset.tool + ' • ' + card.dataset.rule;
+      if (previewScanner) previewScanner.textContent = card.dataset.toolLabel || card.dataset.tool || 'Scanner';
+      if (previewSeverity) previewSeverity.textContent = card.dataset.severity || 'UNKNOWN';
+      if (previewTitle) previewTitle.textContent = card.dataset.title || 'Security finding';
+      if (previewLocation) previewLocation.textContent = card.dataset.location || 'Location unavailable';
+      if (previewRule) previewRule.textContent = card.dataset.rule || 'Rule unavailable';
+      if (previewReachability) previewReachability.textContent = card.dataset.reachabilityLabel || card.dataset.reachability || 'UNKNOWN';
+      if (previewConfidence) previewConfidence.textContent = card.dataset.confidence || 'unknown';
+      if (previewContext) previewContext.textContent = card.dataset.context || 'unclassified';
+      if (previewStatus) previewStatus.textContent = card.dataset.status || 'new';
+      if (previewDescription) previewDescription.textContent = card.dataset.description || 'No short description was provided by the scanner.';
+      if (previewDetails) { previewDetails.disabled = false; previewDetails.dataset.findingIndex = card.querySelector('[data-finding-index]')?.dataset.findingIndex || ''; }
+      if (previewCode) {
+        const codeIndex = card.querySelector('[data-finding-code-index]')?.dataset.findingCodeIndex;
+        previewCode.hidden = codeIndex === undefined;
+        previewCode.dataset.findingCodeIndex = codeIndex || '';
+      }
     };
     findingCards.forEach((card) => {
       card.addEventListener('click', (event) => { if (!event.target.closest('button')) selectFinding(card); });
@@ -2732,21 +4513,69 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     const tool = document.getElementById('finding-tool');
     const severity = document.getElementById('finding-severity');
     const status = document.getElementById('finding-status');
+    const contextFilter = document.getElementById('finding-context');
+    const reachabilityFilter = document.getElementById('finding-reachability');
+    const clearFindingFilters = document.getElementById('finding-clear-filters');
+    const findingFilterChips = document.getElementById('finding-filter-chips');
     const visible = document.getElementById('visible-findings');
+    previewDetails?.addEventListener('click', () => {
+      const index = Number(previewDetails.dataset.findingIndex);
+      if (Number.isInteger(index)) vscode.postMessage({ type: 'finding', index });
+    });
+    previewCode?.addEventListener('click', () => {
+      const index = Number(previewCode.dataset.findingCodeIndex);
+      if (Number.isInteger(index)) vscode.postMessage({ type: 'findingCode', index });
+    });
+    const renderFindingFilterChips = () => {
+      if (!findingFilterChips) return;
+      findingFilterChips.replaceChildren();
+      const chips = [
+        search?.value ? ['search', 'Search: ' + search.value, search] : null,
+        tool?.value ? ['scanner', 'Scanner: ' + (tool.selectedOptions[0]?.textContent || tool.value), tool] : null,
+        severity?.value ? ['severity', 'Severity: ' + severity.value, severity] : null,
+        status?.value ? ['status', 'Status: ' + status.value, status] : null,
+        contextFilter?.value ? ['context', 'Environment: ' + contextFilter.value, contextFilter] : null,
+        reachabilityFilter?.value ? ['reachability', 'Reachability: ' + (reachabilityFilter.selectedOptions[0]?.textContent || reachabilityFilter.value), reachabilityFilter] : null
+      ].filter(Boolean);
+      chips.forEach(([, label, control]) => {
+        const chip = document.createElement('span');
+        chip.className = 'filter-chip';
+        const text = document.createElement('span');
+        text.textContent = label;
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.setAttribute('aria-label', 'Remove ' + label);
+        remove.textContent = '×';
+        remove.addEventListener('click', () => { control.value = ''; filterFindings(); });
+        chip.append(text, remove);
+        findingFilterChips.appendChild(chip);
+      });
+    };
     const filterFindings = () => {
-      const query = search.value.trim().toLowerCase();
+      const query = (search?.value || '').trim().toLowerCase();
       let count = 0;
+      let firstVisible = null;
       for (const card of findingCards) {
         const show = (!query || card.dataset.search.includes(query))
-          && (!tool.value || card.dataset.tool === tool.value)
-          && (!severity.value || card.dataset.severity === severity.value)
-          && (!status.value || card.dataset.status === status.value);
+          && (!tool?.value || card.dataset.toolId === tool.value)
+          && (!severity?.value || card.dataset.severity === severity.value)
+          && (!status?.value || card.dataset.status === status.value)
+          && (!contextFilter?.value || card.dataset.context === contextFilter.value)
+          && (!reachabilityFilter?.value || card.dataset.reachability === reachabilityFilter.value);
         card.classList.toggle('hidden', !show);
-        if (show) count += 1;
+        if (show) { count += 1; if (!firstVisible) firstVisible = card; }
       }
-      visible.textContent = String(count);
+      if (visible) visible.textContent = String(count);
+      renderFindingFilterChips();
+      if (firstVisible && !findingCards.some((card) => card.classList.contains('selected') && !card.classList.contains('hidden'))) selectFinding(firstVisible);
     };
-    [search, tool, severity, status].forEach((control) => control?.addEventListener('input', filterFindings));
+    [search, tool, severity, status, contextFilter, reachabilityFilter].forEach((control) => control?.addEventListener('input', filterFindings));
+    [tool, severity, status, contextFilter, reachabilityFilter].forEach((control) => control?.addEventListener('change', filterFindings));
+    clearFindingFilters?.addEventListener('click', () => {
+      [search, tool, severity, status, contextFilter, reachabilityFilter].forEach((control) => { if (control) control.value = ''; });
+      filterFindings();
+    });
+    filterFindings();
 
     // Handle tooltips and hovers on the security activity chart
     const chartDots = document.querySelectorAll('.chart-dot');
@@ -2834,43 +4663,58 @@ const SCANNER_CATEGORIES = Object.freeze({
   ZAP: "Analyse dynamique automatisée (DAST)"
 });
 
-function renderScannerDetailsPage(model, selectedTheme) {
+function renderScannerDetailsPage(model, selectedTheme, assets = {}) {
   const scannerName = model.activeScanner || '';
   if (!scannerName) {
     return `<div class="empty">Sélectionnez un scanner pour voir les résultats.</div>`;
   }
   const scannerObj = model.scanners.find(s => s.tool === scannerName);
   const isDisabled = model.disabledScanners.includes(scannerName);
-  const [description, icon] = SCANNER_PRESENTATION[scannerName] || ['Scanner de sécurité', 'shield'];
+  const presentation = scannerPresentation(scannerName);
+  const activeScannerId = scannerIdForTool(scannerName);
+  const description = presentation.description;
   const category = SCANNER_CATEGORIES[scannerName] || "Analyse de sécurité";
 
-  const scannerFindings = model.findings.filter(f => f.tool === scannerName);
+  const scannerFindings = scannerObj?.status === 'completed'
+    ? (Array.isArray(scannerObj.currentRun?.findings) ? scannerObj.currentRun.findings : model.findings.filter(f => f.tool === scannerName))
+    : [];
+  const currentResultCount = scannerObj?.status === 'completed'
+    ? Number(scannerObj.currentRun?.resultCount ?? scannerFindings.length)
+    : null;
 
   let state = 'not_run';
   let errorMsg = '';
   if (scannerObj) {
     if (scannerObj.status === 'completed') {
-      state = scannerFindings.length > 0 ? 'has_findings' : 'zero_findings';
+      state = currentResultCount > 0 ? 'has_findings' : 'zero_findings';
     } else if (scannerObj.status === 'failed' || scannerObj.status === 'cancelled') {
       state = 'failed';
       errorMsg = scannerObj.error || scannerObj.details || 'Échec sans détails';
     } else if (scannerObj.status === 'running' || scannerObj.status === 'refreshing') {
       state = 'running';
+    } else if (scannerObj.status === 'pending') {
+      state = 'pending';
     }
   } else if (isDisabled) {
     state = 'not_run';
   }
 
   let html = `
-  <header class="dynamic-page-header">
+  <header class="scanner-detail-hero" data-active-scanner-id="${escapeHtml(activeScannerId)}" data-active-scanner="${escapeHtml(scannerName)}">
+    <div class="scanner-detail-watermark" aria-hidden="true">${compactIcon('shield')}${compactIcon('pulse')}</div>
     <div class="scanner-header-identity">
-      <span class="scanner-logo-large">${compactIcon(icon)}</span>
+      ${renderScannerLogoHtml(scannerName, scannerObj?.status || '', assets)}
       <div>
-        <h1>${escapeHtml(scannerName)}</h1>
-        <p class="scanner-header-desc">${escapeHtml(category)}</p>
+        <span class="scanner-eyebrow">${escapeHtml(presentation.category)}</span>
+        <h1>${escapeHtml(presentation.label)}</h1>
+        <p class="scanner-header-desc">${escapeHtml(description || category)}</p>
       </div>
     </div>
-    <button class="quiet-action" data-command="securityCenter.openDashboard">← Retour au Dashboard</button>
+    <aside class="scanner-hero-status">
+      <span class="state-chip ${escapeHtml(scannerObj?.status || 'not-run')}">${scannerObj ? escapeHtml(scannerObj.status.toUpperCase()) : isDisabled ? 'NOT CONFIGURED' : 'NOT RUN'}</span>
+      <strong>${currentResultCount === null ? '—' : currentResultCount}</strong>
+      <small>current-run findings</small>
+    </aside>
   </header>
   
   <div class="scanner-meta-grid">
@@ -2880,15 +4724,15 @@ function renderScannerDetailsPage(model, selectedTheme) {
     </div>
     <div class="meta-item">
       <span>Dernier scan</span>
-      <strong>${scannerObj && scannerObj.completedAt ? escapeHtml(new Date(scannerObj.completedAt).toLocaleString('fr-FR')) : '—'}</strong>
+      <strong>${scannerObj && scannerObj.status === 'completed' && scannerObj.completedAt ? escapeHtml(new Date(scannerObj.completedAt).toLocaleString('fr-FR')) : '—'}</strong>
     </div>
     <div class="meta-item">
       <span>Durée</span>
-      <strong>${scannerObj && scannerObj.durationMs ? escapeHtml(formatDuration(scannerObj.durationMs)) : '—'}</strong>
+      <strong>${scannerObj && scannerObj.status === 'completed' && scannerObj.durationMs ? escapeHtml(formatDuration(scannerObj.durationMs)) : '—'}</strong>
     </div>
     <div class="meta-item">
       <span>Findings</span>
-      <strong>${scannerFindings.length}</strong>
+      <strong>${currentResultCount === null ? '—' : currentResultCount}</strong>
     </div>
     <div class="meta-item">
       <span>Version</span>
@@ -2923,17 +4767,24 @@ function renderScannerDetailsPage(model, selectedTheme) {
     </div>`;
   }
 
+  if (state === 'pending') {
+    return html + `
+    <div class="scanner-state-card not-run">
+      <p>No current result is available for this scanner yet.</p>
+    </div>`;
+  }
+
   if (state === 'running') {
     return html + `
     <div class="scanner-state-card running">
-      <p>Analyse en cours…</p>
+      <p>Analysis in progress</p>
     </div>`;
   }
 
   if (state === 'zero_findings') {
     return html + `
     <div class="scanner-state-card success">
-      <p>✓ No findings detected by ${escapeHtml(scannerName)} in the last scan.</p>
+      <p>✓ No findings detected by ${escapeHtml(scannerName)} in the current scanner run.</p>
     </div>`;
   }
 
@@ -3012,7 +4863,7 @@ function renderScannerDetailsPage(model, selectedTheme) {
     </div>
   </div>
   <div class="findings-count">
-    <strong id="scanner-visible-count">${scannerFindings.length}</strong> vulnérabilité(s) affichée(s)
+    <strong id="scanner-visible-count">${currentResultCount}</strong> vulnérabilité(s) affichée(s)
   </div>
   `;
 
@@ -3039,6 +4890,14 @@ function renderScannerDetailsPage(model, selectedTheme) {
   scannerFindings.forEach((finding, index) => {
     const overallIndex = model.findings.findIndex(f => f.id === finding.id);
     const isContainer = finding.target && (finding.target.includes(':') || !finding.target.includes('.') || finding.target.includes('image'));
+    const lineLabel = Number.isFinite(Number(finding.startLine)) ? `:${Number(finding.startLine) + 1}` : '';
+    const locationLabel = finding.file ? `${finding.file}${lineLabel}` : finding.endpoint || finding.target || 'Unavailable';
+    const metaBits = [
+      finding.ruleId ? `Rule ${finding.ruleId}` : '',
+      finding.cwe ? finding.cwe : '',
+      finding.packageName ? `Package ${finding.packageName}` : '',
+      finding.triageStatus ? `Status ${finding.triageStatus}` : ''
+    ].filter(Boolean);
 
     html += `
     <div class="finding-card scanner-finding-card"
@@ -3054,19 +4913,20 @@ function renderScannerDetailsPage(model, selectedTheme) {
       
       <div class="finding-card-header">
         <span class="severity-badge ${escapeHtml(finding.severity)}">${escapeHtml(finding.rawSeverity || finding.severity)}</span>
-        <span class="finding-card-title">${escapeHtml(finding.title)}</span>
-        <span class="finding-card-file-line">${escapeHtml(finding.file || '')}${finding.startLine ? `:${finding.startLine + 1}` : ''}</span>
-        <span class="expand-chevron">▼</span>
+        <span class="finding-card-title" title="${escapeHtml(finding.title || 'Security finding')}">${escapeHtml(finding.title || 'Security finding')}</span>
+        <span class="finding-card-meta">${metaBits.slice(0, 2).map((item) => `<small title="${escapeHtml(item)}">${escapeHtml(item)}</small>`).join('')}</span>
+        <span class="finding-card-file-line" title="${escapeHtml(locationLabel)}">${escapeHtml(locationLabel)}</span>
+        <span class="expand-chevron" aria-hidden="true">⌄</span>
       </div>
       
       <div class="finding-card-details">
-        <div class="detail-body">
+        <div class="detail-body evidence-grid">
           ${renderScannerSpecificDetails(finding, scannerName, model)}
         </div>
         <div class="finding-card-actions">
-          <button class="secondary action-open-details" data-finding-index="${overallIndex}">Détails</button>
-          <button class="secondary action-open-file" data-finding-index="${overallIndex}">Ouvrir Fichier</button>
-          ${finding.autofix ? `<button class="primary action-apply-fix" data-finding-index="${overallIndex}">Corriger</button>` : ''}
+          <button class="secondary action-open-file" data-finding-index="${overallIndex}">Open code</button>
+          <button class="secondary action-open-details" data-finding-index="${overallIndex}">View details →</button>
+          ${finding.autofix ? `<button class="primary action-apply-fix" data-finding-index="${overallIndex}">Fix &amp; Verify</button>` : ''}
         </div>
       </div>
     </div>

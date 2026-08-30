@@ -204,6 +204,19 @@ function pageModel(overrides = {}) {
   };
 }
 
+const pipelineAssets = Object.freeze({
+  cspSource: 'https://*.vscode-cdn.net',
+  scannerLogoUris: {
+    Gitleaks: 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/gitleaks.svg',
+    Semgrep: 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/semgrep.svg',
+    Trivy: 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/trivy.svg',
+    'OSV-Scanner': 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/osv-scanner.svg',
+    SonarQube: 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/sonarqube.svg',
+    Snyk: 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/snyk.svg',
+    ZAP: 'https://file+.vscode-resource.vscode-cdn.net/media/scanners/zap.png'
+  }
+});
+
 test('la page Security Pipeline expose ses onglets', () => {
   const html = renderPipelinePageHtml(pageModel(), 'nonce', 'light');
   assert.match(html, /<h1>Security Pipeline<\/h1>/);
@@ -216,6 +229,32 @@ test('les étapes affichent leur état réel', () => {
   assert.match(html, /data-stage="policy"/);
   assert.ok(html.includes(STATE_LABELS.blocked));
   assert.match(html, /BLOCK/);
+});
+
+test('la page pipeline rend les icones scanner locales sans figer la grille d analyse', () => {
+  const html = renderPipelinePageHtml(pageModel({
+    stages: describeStages({
+      scanners: [
+        { tool: 'Gitleaks', status: 'completed' },
+        { tool: 'Semgrep', status: 'completed' },
+        { tool: 'Trivy', status: 'completed' },
+        { tool: 'OSV-Scanner', status: 'completed' },
+        { tool: 'SonarQube', status: 'completed' },
+        { tool: 'Snyk', status: 'completed' },
+        { tool: 'ZAP', status: 'completed' }
+      ],
+      findings: RAW_FINDINGS,
+      policy: validatePolicy(parsePolicyYaml('gate:\n  block_secrets: true\n'))
+    })
+  }), 'nonce', 'light', pipelineAssets);
+  for (const id of ['secrets', 'sast', 'sca', 'iac', 'container', 'dast', 'license']) {
+    assert.match(html, new RegExp(`data-stage="${id}"`), `analysis stage ${id} missing`);
+  }
+  assert.match(html, /class="tool-logo-img" src="https:\/\/file\+\.vscode-resource\.vscode-cdn\.net\/media\/scanners\/gitleaks\.svg"/);
+  assert.match(html, /class="micro-scanner-logo" src="https:\/\/file\+\.vscode-resource\.vscode-cdn\.net\/media\/scanners\/zap\.png"/);
+  assert.match(html, /\.pipeline-grid \{[\s\S]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 178px\), 1fr\)\)/);
+  assert.doesNotMatch(html, /grid-template-columns:\s*repeat\(4,\s*1fr\)/);
+  assert.doesNotMatch(html, /<img[^>]+src="https?:\/\/(?!file\+\.vscode-resource\.vscode-cdn\.net)/);
 });
 
 test('la page ne fabrique aucune progression', () => {
@@ -320,7 +359,7 @@ test('Security Pipeline light theme classes and variable scoping', () => {
   const html = renderPipelinePageHtml(pageModel({ tab: 'pipeline' }), 'nonce', 'light');
 
   // Assert that body has correct light class
-  assert.match(html, /body class="theme-light"/);
+  assert.match(html, /body class="theme-light[^"]*"/);
 
   // Assert themeOverridesCss stylesheet is injected
   assert.match(html, /body\.theme-light\s*\{/);
@@ -337,7 +376,7 @@ test('Security Pipeline dark theme classes and variable scoping', () => {
   const html = renderPipelinePageHtml(pageModel({ tab: 'pipeline' }), 'nonce', 'dark');
 
   // Assert that body has correct dark class
-  assert.match(html, /body class="theme-dark"/);
+  assert.match(html, /body class="theme-dark[^"]*"/);
 
   // Assert themeOverridesCss stylesheet is injected
   assert.match(html, /body\.theme-dark\s*\{/);

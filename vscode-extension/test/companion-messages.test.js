@@ -194,7 +194,7 @@ test('le rendu affiche le message composé et sa mascotte', () => {
   assert.match(html, /code dynamique est évalué/);
   assert.match(html, /routes\/login\.ts/);
   // La mascotte réagit à la sévérité réelle du finding le plus grave.
-  assert.match(html, /<svg class="mascot mascot-warning /);
+  assert.match(html, /<img class="mascot mascot-warning /);
   assert.match(html, /aria-live="polite"/);
 });
 

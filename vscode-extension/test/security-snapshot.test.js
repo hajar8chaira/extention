@@ -156,7 +156,7 @@ test('successful retry replaces findings without duplicating the old result set'
   assert.deepEqual(zapFindings.map((item) => item.id), ['new']);
 });
 
-test('completed projection retains prior provenance and last retry failure details', () => {
+test('completed projection keeps prior provenance but exposes retry failure as current state', () => {
   const before = fullSnapshot();
   const retry = createExecution({ executionId: 'zap-2', requestedTools: ['ZAP'], allTools: tools });
   const after = completeExecution(
@@ -166,8 +166,10 @@ test('completed projection retains prior provenance and last retry failure detai
     [{ tool: 'ZAP', status: 'failed', error: 'target unavailable' }]
   );
   const zap = projectSnapshot(after).scanners.find((item) => item.tool === 'ZAP');
-  assert.equal(zap.status, 'completed');
-  assert.equal(zap.sourceExecutionId, 'full-1');
+  assert.equal(zap.status, 'failed');
+  assert.equal(zap.sourceExecutionId, 'zap-2');
+  assert.equal(zap.currentRun.resultCount, null);
+  assert.equal(zap.lastCompletedRun.sourceExecutionId, 'full-1');
   assert.equal(zap.lastRefreshStatus, 'failed');
   assert.equal(zap.lastRefreshError, 'target unavailable');
   assert.equal(zap.lastRefreshExecutionId, 'zap-2');

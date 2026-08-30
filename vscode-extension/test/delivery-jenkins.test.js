@@ -170,6 +170,22 @@ test('la page de livraison ne contient jamais de jeton', () => {
   assert.ok(!JSON.stringify(status).toLowerCase().includes('token'));
 });
 
+test('la page de livraison affiche le logo Jenkins local dans les zones d identite', () => {
+  const status = deliveryStatusFrom({
+    configured: true, job: 'projet', baseUrl: 'http://ci.local', workspaceCommit: SHA, fetchedAt: new Date().toISOString(),
+    build: buildStatusFrom({ number: 184, result: 'SUCCESS', actions: [{ lastBuiltRevision: { SHA1: SHA } }] })
+  });
+  const html = renderDeliveryPageHtml(status, 'nonce', 'light', {
+    cspSource: 'https://*.vscode-cdn.net',
+    jenkinsLogoUri: 'https://file+.vscode-resource.vscode-cdn.net/media/providers/jenkins.svg'
+  });
+  assert.equal((html.match(/class="jenkins-logo"/g) || []).length, 3);
+  assert.match(html, /class="provider-title"[\s\S]*État de la livraison/);
+  assert.match(html, /class="provider-title"[\s\S]*Connexion Jenkins/);
+  assert.match(html, /img-src https:\/\/\*\.vscode-cdn\.net/);
+  assert.doesNotMatch(html, /<img[^>]+src="https?:\/\/(?!file\+\.vscode-resource\.vscode-cdn\.net)/);
+});
+
 test('le jeton Jenkins n’est jamais un réglage', () => {
   const properties = Object.keys(manifest.contributes.configuration.properties);
   const jenkins = properties.filter((key) => key.includes('jenkins'));
@@ -192,7 +208,11 @@ test('la page rend chaque état et garde une navigation parente', () => {
   ]) {
     const html = renderDeliveryPageHtml(status, 'n', 'light');
     assert.match(html, /Security Delivery/);
-    assert.match(html, /data-command="securityCenter\.openDashboard"[^>]*>← Dashboard/, 'navigation parente obligatoire');
+    // La navigation parente est celle du cadre applicatif partagé : la page ne
+    // porte plus son propre lien de retour.
+    assert.match(html, /class="sc-internal-nav"/, 'navigation parente obligatoire');
+    assert.match(html, /data-command="securityCenter\.openDashboard"/);
+    assert.match(html, /<button class="sc-nav-item active"[^>]*data-command="securityCenter\.openSecurityDelivery"/);
     assert.match(html, /Content-Security-Policy/);
     assert.ok(!html.includes('unsafe-eval'));
   }

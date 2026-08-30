@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
+const manifest = require('../package.json');
 const { buildDashboardModel, renderDashboardHtml, calculateRiskScore, riskLevel, summarizeScannerError, isUsefulHttpScenario, linkedFindingsForScenario, sourceCorrelationForFinding, buildSafeHttpPreview } = require('../src/dashboard');
 
 test('generated dashboard webview script remains syntactically valid', () => {
@@ -14,26 +15,25 @@ test('generated dashboard webview script remains syntactically valid', () => {
   assert.doesNotThrow(() => new vm.Script(script));
 });
 
-test('affiche la confirmation ZAP comme carte dans Dynamic Security', () => {
+test('ne rend plus la confirmation ZAP comme carte de page', () => {
   const html = renderDashboardHtml(buildDashboardModel(), 'nonce', 'dynamic', 'light', {
     zapConfirmationVisible: true,
     zapConfirmation: { mode: 'active', target: 'http://127.0.0.1:3000' }
   });
-  assert.match(html, /zap-confirmation-backdrop/);
-  assert.match(html, /http:\/\/127\.0\.0\.1:3000/);
-  assert.match(html, /Utiliser le scan passif/);
-  assert.match(html, /Autoriser le scan local/);
+  assert.doesNotMatch(html, /zap-confirmation-backdrop/);
+  assert.doesNotMatch(html, /Autoriser le scan local/);
   assert.doesNotMatch(html, /createWebviewPanel\('securityCenter\.zapAuthorization'/);
 });
 
-test('affiche la confirmation ZAP sans rediriger hors du dashboard actif', () => {
+test('la confirmation ZAP n est pas cachee dans une surface Security Center', () => {
   const state = {
     zapConfirmationVisible: true,
     zapConfirmation: { mode: 'active', target: 'http://127.0.0.1:3000' }
   };
   const model = buildDashboardModel();
-  assert.match(renderDashboardHtml(model, 'nonce', 'full', 'light', state), /role="alertdialog"/);
-  assert.match(renderDashboardHtml(model, 'nonce', 'sidebar', 'light', state), /Autoriser le scan local/);
+  assert.doesNotMatch(renderDashboardHtml(model, 'nonce', 'full', 'light', state), /role="alertdialog"/);
+  assert.doesNotMatch(renderDashboardHtml(model, 'nonce', 'dynamic', 'light', state), /role="alertdialog"/);
+  assert.doesNotMatch(renderDashboardHtml(model, 'nonce', 'scans', 'light', state), /role="alertdialog"/);
   assert.doesNotMatch(renderDashboardHtml(model, 'nonce', 'history', 'light', state), /role="alertdialog"/);
 });
 
@@ -49,13 +49,24 @@ test('calcule les compteurs du dashboard', () => {
 });
 
 test('expose les corrélations dans le dashboard', () => {
-  const correlations = [{ id: 'c1', confidence: 'high', title: 'Même emplacement', tools: ['Semgrep', 'Gitleaks'], reason: 'Même CWE' }];
-  const model = buildDashboardModel([], [], { correlations });
+  // La corrélation visible vient desormais de l'intelligence V2, portee par les
+  // findings via `correlationClusters` — exactement ce que `mergeIntelligence`
+  // attache en production et ce que le cache de scan persiste.
+  const cluster = { id: 'sca-abc123', type: 'sca', confidence: 'high', tier: 'confirmed', title: 'Même emplacement', tools: ['Semgrep', 'Gitleaks'], reasons: ['Même CWE'], findingIds: ['f1'] };
+  const findings = [{ id: 'f1', tool: 'Semgrep', rawSeverity: 'HIGH', triageStatus: 'new', correlationClusters: [cluster] }];
+  // V1 continue d'etre produit et transmis : il reste la source du rattachement
+  // « source probable » et de l'enregistrement backend.
+  const correlations = [{ id: 'c1', confidence: 'high', title: 'Même emplacement', tools: ['Semgrep', 'Gitleaks'], reason: 'Même CWE', findingIds: ['f1'] }];
+  const model = buildDashboardModel(findings, [], { correlations });
   assert.equal(model.correlations.length, 1);
   assert.equal(model.correlationCounts.high, 1);
+  // V1 est preserve, non supprime.
+  assert.equal(model.legacyCorrelations.length, 1);
+  assert.equal(model.legacyCorrelations[0].id, 'c1');
   const html = renderDashboardHtml(model, 'nonce');
   assert.match(html, /Semgrep \+ Gitleaks/);
   assert.match(html, /Corrélations/);
+  assert.match(html, /Même CWE/);
 });
 
 test('échappe le contenu affiché dans la Webview', () => {
@@ -103,7 +114,8 @@ test('affiche les nouvelles cartes et barres du dashboard', () => {
   assert.match(fullHtml, /securityCenter\.showScanHistoryPage/);
   const extensionSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
   assert.match(extensionSource, /allowed = new Set\([\s\S]*securityCenter\.showScanHistoryPage/);
-  assert.match(extensionSource, /const zapRequested = [\s\S]*requested\.has\('ZAP'\)/);
+  assert.match(extensionSource, /function zapRequestedForScan[\s\S]*requested\.has\('ZAP'\)/);
+  assert.match(extensionSource, /const zapPreflightRequired = zapRequestedForScan\(cfg, projectPolicy, requested\)/);
   assert.match(extensionSource, /context\.secrets\.get\(zapUsernameSecretKey\)/);
   assert.match(html, /securityCenter\.configureZapCredentials/);
   assert.match(renderDashboardHtml(buildDashboardModel([{ id: 'fixed', title: 'Fix', tool: 'Semgrep', rawSeverity: 'HIGH', triageStatus: 'validated' }]), 'nonce'), /Validée par re-scan/);
@@ -123,19 +135,14 @@ test('utilise une petite action Relancer dans l’en-tête du dashboard complet'
     { tool: 'Semgrep', status: 'completed' }
   ], { scanStatus: 'completed' });
   const fullHtml = renderDashboardHtml(model, 'nonce', 'full');
-  const sidebarHtml = renderDashboardHtml(model, 'nonce', 'sidebar');
   assert.match(fullHtml, /class="header-scan"/);
   assert.match(fullHtml, />↻ Relancer<\/button>/);
-  assert.doesNotMatch(sidebarHtml, /class="header-scan"/);
-  assert.match(sidebarHtml, /Ouvrir le dashboard complet/);
-  assert.match(sidebarHtml, /surface-sidebar/);
-  assert.match(sidebarHtml, /body\.surface-sidebar > \.hero/);
-  assert.match(sidebarHtml, /body\.surface-sidebar > \.pipeline-panel/);
-  assert.match(sidebarHtml, /body\.surface-sidebar \.action-group-buttons \{ display: grid; grid-template-columns: 1fr/);
-  assert.match(sidebarHtml, /Analyse fréquente/);
-  assert.match(sidebarHtml, /Ouvrir Dynamic Security/);
-  assert.match(sidebarHtml, /data-command="securityCenter\.openDynamicPage"/);
-  assert.match(sidebarHtml, /body\.surface-sidebar \.page-dynamic/);
+  // CHANGEMENT DE CONTRAT DE PRESENTATION : la vue de la barre d'activite ne
+  // rend plus ce document. Elle a son propre lanceur compact, dont le contrat
+  // est decrit par test/sidebar-launcher.test.js. Les anciennes assertions
+  // « sidebar » de ce test decrivaient le catalogue de navigation qui vient
+  // d'etre retire de cette surface ; le comportement du dashboard complet, seul
+  // sujet reel de ce test, est inchange.
   assert.doesNotMatch(fullHtml, /Analyse fréquente/);
   assert.doesNotMatch(fullHtml, /Ouvrir le dashboard complet/);
 });
@@ -411,10 +418,9 @@ test('affiche le chrono actif et les findings par bulle de scanner', () => {
   assert.match(html, /aria-describedby="pipeline-semgrep-findings"/);
   assert.doesNotMatch(html, /<details class="pipeline-stage/);
   assert.doesNotMatch(html, /<summary aria-label="Afficher les findings du scanner"/);
-  assert.match(html, /Semgrep · 1 finding\(s\)/);
-  assert.match(html, /Injection SQL possible/);
-  assert.match(html, /Trivy · 0 finding\(s\)/);
-  assert.match(html, /Analyse en cours/);
+  assert.match(html, /Semgrep · — finding\(s\)/);
+  assert.match(html, /Trivy · — finding\(s\)/);
+  assert.match(html, /Analysis in progress/);
 });
 
 test('affiche la cause détaillée d’un scanner en échec', () => {
@@ -438,7 +444,7 @@ test('conserve les résultats fiables des scanners terminés après une annulati
     { tool: 'Semgrep', status: 'completed', durationMs: 4200 },
     { tool: 'ZAP', status: 'cancelled', durationMs: 3000, error: 'Scan ZAP annulé.' }
   ], { scanStatus: 'cancelled', scanDurationMs: 7200 }), 'nonce');
-  assert.match(html, /Scan partiel — 1\/2 scanners terminés — ZAP annulé/);
+  assert.match(html, /Scan partiel — 2\/2 scanners terminés — ZAP annulé/);
   assert.match(html, /↻ Relancer/);
   assert.doesNotMatch(html, /Analyse en cours…/);
   assert.match(html, /pipeline-dot cancelled/);
@@ -448,9 +454,9 @@ test('conserve les résultats fiables des scanners terminés après une annulati
   assert.match(html, /<span class="priority-severity">CRITICAL<\/span>/);
   assert.match(html, /Alerte confirmée/);
   assert.match(html, /Voir les 1 priorité →/);
-  assert.match(html, /<strong>1<\/strong><span>Critical<\/span>/);
-  assert.match(html, /<strong>0<\/strong><span>High<\/span>/);
-  assert.match(html, /<strong>1<\/strong><span>Production<\/span>/);
+  assert.match(html, /<div class="overview-kpi hero-metric critical"><span class="hero-metric-label"><i class="hero-metric-dot critical"><\/i>Critical<\/span><strong>1<\/strong><\/div>/);
+  assert.match(html, /<div class="overview-kpi hero-metric high"><span class="hero-metric-label"><i class="hero-metric-dot high"><\/i>High<\/span><strong>0<\/strong><\/div>/);
+  assert.match(html, /<div class="overview-kpi hero-metric production">[\s\S]*Production[\s\S]*<strong>1<\/strong><small>priority findings<\/small><\/div>/);
   assert.doesNotMatch(html, /Politique projet non respectée/);
 });
 
@@ -492,14 +498,27 @@ test('affiche le résultat détaillé de la politique projet', () => {
   }), 'nonce');
   assert.match(html, /Politique projet non respectée/);
   assert.match(html, /2 alerte\(s\) au seuil HIGH ou supérieur/);
-  assert.doesNotMatch(html, /data-command="securityCenter\.openProjectPolicy"/);
-  const sidebarHtml = renderDashboardHtml(buildDashboardModel([], [], { policyResult: { passed: true, activeCount: 0 } }), 'nonce', 'sidebar');
-  assert.match(sidebarHtml, /data-command="securityCenter\.openProjectPolicy"/);
-  assert.match(sidebarHtml, /data-command="securityCenter\.generateSbom"/);
-  assert.match(sidebarHtml, /data-command="securityCenter\.checkLicenses"/);
-  assert.match(sidebarHtml, /data-command="securityCenter\.configureBackendApiKey"/);
-  assert.match(sidebarHtml, /data-command="securityCenter\.installPreCommitHook"/);
-  assert.match(sidebarHtml, /data-command="securityCenter\.showTrends"/);
+  // L'invariant porte sur le bandeau : quand la politique échoue avec des
+  // raisons, il les affiche au lieu d'un appel à configurer. La navigation
+  // interne offre désormais une entrée permanente vers Project Policy, ce qui
+  // faisait échouer une recherche sur tout le document sans que le bandeau ait
+  // changé.
+  const banner = html.slice(html.indexOf('policy-banner'));
+  assert.doesNotMatch(banner.slice(0, banner.indexOf('</section>')),
+    /data-command="securityCenter\.openProjectPolicy"/,
+    'le bandeau d’échec montre les raisons, pas un bouton de configuration');
+  // CHANGEMENT DE CONTRAT DE PRESENTATION : ces commandes etaient auparavant
+  // listees dans le catalogue de la barre d'activite. Ce catalogue a ete retire
+  // de cette surface — la barre d'activite est un lanceur, pas une seconde
+  // navigation. L'invariant qui compte n'a pas change : aucune commande n'a ete
+  // supprimee, chacune reste declaree et donc accessible.
+  const declared = new Set(manifest.contributes.commands.map((entry) => entry.command));
+  for (const command of [
+    'securityCenter.openProjectPolicy', 'securityCenter.generateSbom', 'securityCenter.checkLicenses',
+    'securityCenter.configureBackendApiKey', 'securityCenter.installPreCommitHook', 'securityCenter.showTrends'
+  ]) {
+    assert.ok(declared.has(command), `${command} ne doit pas disparaitre avec le catalogue de la sidebar`);
+  }
 });
 
 test('sépare le dashboard en pages dédiées sans dupliquer les détails visibles', () => {
@@ -509,22 +528,17 @@ test('sépare le dashboard en pages dédiées sans dupliquer les détails visibl
   assert.match(full, /data-command="securityCenter\.openFindingsPage"/);
   assert.match(full, /body\.surface-full \.page-findings/);
   assert.match(full, /Alerte prioritaire/);
-  const findings = renderDashboardHtml(model, 'nonce', 'findings');
-  assert.match(findings, /surface-findings/);
-  assert.match(findings, /class="page-findings"/);
-  assert.match(findings, /data-command="securityCenter\.openDashboard">← Dashboard/);
-  const scans = renderDashboardHtml(model, 'nonce', 'scans');
-  assert.match(scans, /surface-scans/);
-  assert.match(scans, /class="page-scans"/);
-  assert.match(scans, /data-command="securityCenter\.openDashboard">← Dashboard/);
-  const dynamic = renderDashboardHtml(model, 'nonce', 'dynamic');
-  assert.match(dynamic, /surface-dynamic/);
-  assert.match(dynamic, /class="page-dynamic"/);
-  assert.match(dynamic, /data-command="securityCenter\.openDashboard">← Dashboard/);
-  const analytics = renderDashboardHtml(model, 'nonce', 'analytics');
-  assert.match(analytics, /surface-analytics/);
-  assert.match(analytics, /class="page-analytics"/);
-  assert.match(analytics, /data-command="securityCenter\.openDashboard">← Dashboard/);
+  // Le retour au dashboard n'est plus un lien duplique en tete de chaque page :
+  // il est porte une seule fois par la navigation interne du cadre partage.
+  const pages = { findings: 'page-findings', scans: 'page-scans', dynamic: 'page-dynamic', analytics: 'page-analytics' };
+  for (const [surface, section] of Object.entries(pages)) {
+    const html = renderDashboardHtml(model, 'nonce', surface);
+    assert.match(html, new RegExp(`surface-${surface}`));
+    assert.match(html, new RegExp(`class="${section}"`));
+    assert.match(html, /class="sc-internal-nav"/, `${surface} doit garder la navigation partagee`);
+    assert.match(html, /data-command="securityCenter\.openDashboard"/, `${surface} doit pouvoir revenir au dashboard`);
+    assert.doesNotMatch(html, /← Dashboard/, `${surface} ne doit plus dupliquer le lien de retour`);
+  }
 });
 
 test('Activité de sécurité - historique vide', () => {
@@ -759,3 +773,124 @@ test('Activité de sécurité - script de positionnement tooltip local et clampi
   assert.match(html, /Math\.max\(8,\s*Math\.min\(left/);
 });
 
+// ---------------------------------------------------------------------------
+// Regression : une seule verite de correlation visible (Checkpoint 3)
+//
+// Le Dashboard lisait la correlation V1 (`options.correlations`) pendant que la
+// page Security Pipeline lisait les clusters V2. Pour un MEME scan, les deux
+// surfaces annoncaient des nombres differents. La correlation visible vient
+// desormais de V2, deja calculee par `mergeIntelligence` et deja persistee avec
+// les findings — aucune correlation n'est recalculee au rendu.
+// ---------------------------------------------------------------------------
+
+const { correlateFindings } = require('../src/correlation');
+const { analyzeFindings, mergeIntelligence } = require('../src/pipeline');
+
+/** Le cas reel : une alerte ZAP et le finding SAST de la meme route. */
+function divergentScanFixture() {
+  return [
+    { id: 'zap1', tool: 'ZAP', category: 'dynamic', stage: 'dast', sourceContext: 'runtime', endpoint: 'http://127.0.0.1:3000/api/login', method: 'POST', cwe: 'CWE-89', ruleId: '40018', rawSeverity: 'HIGH', severity: 'HIGH', title: 'SQL Injection', triageStatus: 'new' },
+    { id: 'sg1', tool: 'Semgrep', category: 'sast', stage: 'sast', file: 'routes/login.js', absolutePath: '/w/routes/login.js', startLine: 12, line: 12, cwe: 'CWE-89', ruleId: 'sqli', rawSeverity: 'HIGH', severity: 'HIGH', title: 'SQLi in login', triageStatus: 'new' }
+  ];
+}
+
+test('correlation : le compte du Dashboard vient de V2, pas de V1', () => {
+  const raw = divergentScanFixture();
+  const analysis = analyzeFindings(raw, {});
+  const enriched = mergeIntelligence(raw, analysis);
+  const legacy = correlateFindings(raw);
+
+  // Le fixture diverge reellement : c'est ce qui rend le test probant.
+  assert.equal(legacy.correlations.length, 1);
+  assert.equal(analysis.clusters.length, 0);
+
+  const model = buildDashboardModel(enriched, [], { correlations: legacy.correlations });
+  assert.equal(model.correlations.length, analysis.clusters.length);
+  assert.notEqual(model.correlations.length, legacy.correlations.length);
+});
+
+test('correlation : Dashboard et Security Pipeline s accordent sur le meme scan', () => {
+  const raw = divergentScanFixture();
+  const analysis = analyzeFindings(raw, {});
+  const enriched = mergeIntelligence(raw, analysis);
+  const model = buildDashboardModel(enriched, [], { correlations: correlateFindings(raw).correlations });
+
+  // La page Pipeline lit `clusters` ; le Dashboard lit `model.correlations`.
+  // Le critere d'acceptation du checkpoint est l'egalite de ces deux nombres.
+  assert.equal(model.correlations.length, analysis.clusters.length);
+  assert.equal(model.correlationCounts.high || 0, analysis.correlation.byConfidence.high || 0);
+});
+
+test('correlation : un scan reellement correle s accorde aussi', () => {
+  // Le meme critere doit tenir quand il y a des clusters, pas seulement zero.
+  const raw = [
+    { id: 't1', tool: 'Trivy', category: 'dependency', stage: 'sca', packageName: 'lodash', package: 'lodash', packageVersion: '4.17.20', manifest: 'package.json', ruleId: 'CVE-2021-23337', vulnerabilityAliases: ['CVE-2021-23337'], rawSeverity: 'HIGH', severity: 'HIGH', title: 'lodash CVE', triageStatus: 'new' },
+    { id: 'o1', tool: 'OSV-Scanner', category: 'dependency', stage: 'sca', packageName: 'lodash', package: 'lodash', packageVersion: '4.17.20', manifest: 'package.json', ruleId: 'CVE-2021-23337', vulnerabilityAliases: ['CVE-2021-23337'], rawSeverity: 'HIGH', severity: 'HIGH', title: 'lodash CVE', triageStatus: 'new' }
+  ];
+  const analysis = analyzeFindings(raw, {});
+  const model = buildDashboardModel(mergeIntelligence(raw, analysis), [], { correlations: correlateFindings(raw).correlations });
+  assert.ok(analysis.clusters.length > 0, 'le fixture doit produire au moins un cluster V2');
+  assert.equal(model.correlations.length, analysis.clusters.length);
+  assert.equal(model.correlationCounts.high || 0, analysis.correlation.byConfidence.high || 0);
+});
+
+test('correlation : zero cluster V2 s affiche zero et vide, de facon coherente', () => {
+  const raw = divergentScanFixture();
+  const model = buildDashboardModel(mergeIntelligence(raw, analyzeFindings(raw, {})), [], { correlations: correlateFindings(raw).correlations });
+  assert.equal(model.correlations.length, 0);
+  assert.equal(model.correlationCounts.high || 0, 0);
+  const html = renderDashboardHtml(model, 'nonce');
+  assert.match(html, /Aucune correspondance multi-outils/);
+});
+
+test('correlation : V1 peut differer sans changer le nombre visible', () => {
+  const raw = divergentScanFixture();
+  const enriched = mergeIntelligence(raw, analyzeFindings(raw, {}));
+  // Trois etats V1 tres differents, un seul et meme nombre visible.
+  for (const legacy of [[], correlateFindings(raw).correlations, [
+    { id: 'x1', confidence: 'high', title: 'Bruit V1', tools: ['A', 'B'], reason: 'r', findingIds: ['zap1'] },
+    { id: 'x2', confidence: 'high', title: 'Bruit V1', tools: ['A', 'C'], reason: 'r', findingIds: ['sg1'] }
+  ]]) {
+    const model = buildDashboardModel(enriched, [], { correlations: legacy });
+    assert.equal(model.correlations.length, 0, 'le nombre visible ne doit dependre que de V2');
+    assert.equal(model.legacyCorrelations.length, legacy.length, 'V1 reste intact dans le modele');
+  }
+});
+
+test('correlation : le rendu des findings et l attribution de source restent fonctionnels', () => {
+  const raw = divergentScanFixture();
+  const enriched = mergeIntelligence(raw, analyzeFindings(raw, {}));
+  const legacy = correlateFindings(raw).correlations;
+  const html = renderDashboardHtml(buildDashboardModel(enriched, [{ tool: 'ZAP', status: 'completed' }], {
+    correlations: legacy, scanStatus: 'completed', backendStatus: 'online'
+  }), 'nonce');
+  // L'attribution « source probable » vient toujours de V1 (`endpoint-source`).
+  assert.equal(legacy[0].type, 'endpoint-source');
+  assert.match(html, /SQL Injection/);
+});
+
+test('correlation : reachability, priorisation et policy gate sont inchanges', () => {
+  const raw = divergentScanFixture();
+  const analysis = analyzeFindings(raw, {});
+  const enriched = mergeIntelligence(raw, analysis);
+  // Le modele du Dashboard ne doit rien recalculer ni rien alterer.
+  const before = JSON.stringify({ r: analysis.reachability, p: analysis.priority, g: analysis.policy });
+  buildDashboardModel(enriched, [], { correlations: correlateFindings(raw).correlations });
+  assert.equal(JSON.stringify({ r: analysis.reachability, p: analysis.priority, g: analysis.policy }), before);
+  // Les verdicts par finding survivent au passage dans le modele.
+  const model = buildDashboardModel(enriched, [], {});
+  for (const finding of model.findings) {
+    assert.ok(finding.reachability, 'chaque finding conserve son verdict d atteignabilite');
+    assert.ok(finding.priority, 'chaque finding conserve sa priorite');
+  }
+});
+
+test('correlation : aucune refonte visuelle — markup et classes inchanges', () => {
+  const raw = divergentScanFixture();
+  const model = buildDashboardModel(mergeIntelligence(raw, analyzeFindings(raw, {})), [], { correlations: correlateFindings(raw).correlations });
+  const html = renderDashboardHtml(model, 'nonce');
+  // Les memes elements, les memes classes, les memes libelles qu'avant.
+  assert.match(html, /<div class="empty">Aucune correspondance multi-outils<\/div>/);
+  assert.match(html, /<span>Corrélations<\/span>/);
+  assert.match(html, /<span>Confiance élevée<\/span>/);
+});

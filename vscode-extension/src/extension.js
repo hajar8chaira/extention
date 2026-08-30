@@ -22,6 +22,19 @@ const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpS
 const { CACHE_KEY: LOCAL_SCAN_CACHE_KEY, createLocalScanCache, restoreLocalScanCache } = require('./local-scan-cache');
 const { fetchDeliveryStatus, normalizeJenkinsUrl, jobUrl: jenkinsJobUrl, deliveryStatusFrom, testJenkinsConnection, artifactUrl: jenkinsArtifactUrl } = require('./jenkins');
 const { renderDeliveryPageHtml } = require('./delivery-page');
+const {
+  fetchPrometheusStatus, buildPrometheusStatus, normalizePrometheusUrl,
+  DEFAULT_OBSERVABILITY_PROVIDER, isSupportedObservabilityProvider, observabilityProvider, observabilityAdapter
+} = require('./integrations/observability');
+const {
+  fetchWazuhStatus, buildRuntimeSecurityStatus, normalizeWazuhUrl,
+  DEFAULT_SIEM_PROVIDER, isSupportedSiemProvider, siemProvider, siemAdapter
+} = require('./integrations/siem');
+const { createSiemConfigurationService } = require('./integrations/siem-configuration');
+const { createProviderConfigurationService } = require('./integrations/provider-configuration');
+const { alertSummary: summarizeRuntimeAlerts } = require('./integrations/siem-contract');
+const { renderIntegrationPageHtml } = require('./integrations-page');
+const { renderRuntimeSecurityPageHtml, renderInfrastructurePageHtml } = require('./enterprise-domain-pages');
 const { buildDynamicWorkspace, dynamicWorkspaceState, restoreDynamicWorkspaceState, endpointKeyOf } = require('./dynamic-workspace');
 const { normalizeAuthProfile, publicProfile, maskSecret, secretKeyFor, interpretValidation, authHeadersFor, AUTH_KIND, AUTH_STATUS } = require('./dynamic-auth');
 const { createRetestRecord, advanceRetest, retestVerdict, RETEST_STATE } = require('./dynamic-retest');
@@ -32,11 +45,20 @@ const {
   toTransaction: dynamicTransaction, restoreCampaign: restoreDynamicCampaign,
   legacyBucket: dynamicLegacyBucket, captureSessionFrom
 } = require('./dynamic-campaign');
-const { createExecution, snapshotFromLegacy, normalizeSnapshot, beginRefresh, updateRefresh, completeExecution, projectSnapshot } = require('./security-snapshot');
-const { HISTORY_KEY: LOCAL_SCAN_HISTORY_KEY, appendLocalHistory, renderScanHistoryHtml } = require('./scan-history-page');
+const {
+  createExecution, snapshotFromLegacy, normalizeSnapshot, beginRefresh, updateRefresh,
+  completeExecution, projectSnapshot, aggregateRunStatus, finishedScannerCount, successfulScannerCount
+} = require('./security-snapshot');
+const { HISTORY_KEY: LOCAL_SCAN_HISTORY_KEY, appendLocalHistory, renderScanHistoryHtml, comparableLocalScans } = require('./scan-history-page');
 const { buildDashboardModel, renderDashboardHtml, buildSafeHttpPreview, linkedFindingsForScenario, summarizeScannerError } = require('./dashboard');
 const { normalizeTargetUrl, checkTargetReachability } = require('./dynamic-target');
 const { renderFindingDetailsHtml } = require('./finding-details');
+const {
+  CHAT_STATE, ROLE: CHAT_ROLE, buildAssistantContext, contextIndicator, quickQuestionsFor,
+  detectFixRequest, buildAssistantMessages, chatMessage, fixRoutingReply
+} = require('./companion-chat');
+const { renderCompanionChatHtml } = require('./companion-chat-page');
+const { generateAssistantReply } = require('./ai/ollama-provider');
 const { correlateFindings } = require('./correlation');
 const { findingKey, applyFindingStatuses, isActiveFinding, validatedAfterScan, retainValidatedFindings } = require('./triage');
 const {
@@ -44,13 +66,16 @@ const {
   FIX_SOURCE, VERIFIER, verifyFindingFix, markFixApplied, markValidating, applyVerification,
   detectRegressions, verificationRecord, restoreVerification, restoreVerificationOnFindings, verificationIdentity
 } = require('./fix-verification');
-const { normalizeHar, replayScenario } = require('./http-scenarios');
+const { normalizeHar, replayScenario, CONTROLLED_WRITE_METHODS } = require('./http-scenarios');
 const { renderHttpReplayHtml, renderSafeHttpRequestHtml } = require('./http-details');
 const { compareScans, renderScanComparisonHtml } = require('./scan-comparison');
 const { modifiedGitFiles, createIncrementalWorkspace, retainUnchangedFindings } = require('./incremental');
 const { renderAuditLogHtml } = require('./audit');
+const { navCommands } = require('./security-center-shell');
+const { renderSidebarLauncherHtml } = require('./sidebar-launcher');
+const { scannerToolFromId } = require('./scanner-presentation');
 const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
-const { evaluatePolicyGate, policyGateError, STATUS: GATE_STATUS } = require('./intelligence/policy-gate');
+const { evaluatePolicyGate, policyGateError, policyResultFromGate, STATUS: GATE_STATUS } = require('./intelligence/policy-gate');
 const { readPolicyGateConfig, savePolicyGate, createStarterPolicy, policyGateHash, policyFilePath } = require('./policy-config');
 const { analyzeLicenses, renderLicenseReportHtml } = require('./license-compliance');
 const { installPreCommitHook } = require('./precommit');
@@ -85,7 +110,7 @@ const { SecurityStatusBar } = require('./securityStatusBar');
 const { SentinelEditorPresence } = require('./live/sentinelEditorPresence');
 const { LiveSecurityPageProvider } = require('./live/livePage');
 const { ThemeController } = require('./theme-controller');
-const { ScannerToolManager, TOOLS: MANAGED_SCANNER_TOOLS } = require('./scanner-tool-manager');
+const { ScannerToolManager, TOOLS: MANAGED_SCANNER_TOOLS, INSTALL_PHASE, INSTALL_ERROR } = require('./scanner-tool-manager');
 const { renderScannerSetupHtml, sonarDiagnosis, snykDiagnosis } = require('./scanner-setup-page');
 const { analyzeWorkspace, mergeIntelligence, buildPipelineResult, describeStages, runSupplyChainStages, restorePipelineResult, pipelineStateFor, dataAvailability } = require('./pipeline');
 const { renderPipelinePageHtml } = require('./pipeline-page');
@@ -98,6 +123,8 @@ const COSIGN_PASSWORD_SECRET_KEY = 'securityCenter.cosign.keyPassword';
 // The Jenkins API token lives here and nowhere else: never in settings.json,
 // never in a URL, never in a log line, never in the delivery page HTML.
 const JENKINS_TOKEN_SECRET_KEY = 'securityCenter.jenkins.apiToken';
+const PROMETHEUS_BEARER_SECRET_KEY = 'securityCenter.prometheus.bearerToken';
+const WAZUH_PASSWORD_SECRET_KEY = 'securityCenter.wazuh.password';
 /** Verification metadata, stored beside the triage statuses it explains. */
 const VERIFICATION_STATE_KEY = 'securityCenter.fixVerification';
 const PIPELINE_STATE_KEY = 'securityCenter.pipelineState';
@@ -114,6 +141,50 @@ const OPTIONAL_SCANNERS = Object.freeze([
   ['Snyk', 'snyk.enabled', false],
   ['ZAP', 'zap.enabled', true]
 ]);
+
+const PROVIDER_LOGO_FILES = Object.freeze({
+  wazuh: 'wazuh.svg',
+  splunk: 'splunk.svg',
+  sentinel: 'sentinel.svg',
+  elastic: 'elastic.svg',
+  qradar: 'qradar.svg',
+  chronicle: 'chronicle.svg',
+  graylog: 'graylog.svg',
+  arcsight: 'arcsight.svg',
+  sumologic: 'sumologic.svg',
+  prometheus: 'prometheus.svg',
+  zabbix: 'zabbix.svg',
+  datadog: 'datadog.svg',
+  newrelic: 'newrelic.svg',
+  influxdb: 'influxdb.svg',
+  opentelemetry: 'opentelemetry.svg',
+  jenkins: 'jenkins.svg'
+});
+
+/**
+ * La frontiere de confiance de la navigation partagee.
+ *
+ * Un webview demande, l'extension decide. Chaque page hebergee par le cadre
+ * envoie `{ type: 'command', command }` quand l'utilisateur clique un item du
+ * rail ; seules les commandes que le rail affiche reellement sont executees, et
+ * chacune existe deja avec son propre handler. Aucune commande n'est creee ici.
+ *
+ * Renvoie `true` si le message a ete consomme, pour que le handler propre a la
+ * page puisse continuer son propre traitement sinon.
+ */
+const SHELL_NAV_COMMANDS = new Set(navCommands());
+
+async function handleShellNavMessage(message) {
+  // La carte Companion existe sur plusieurs surfaces : l'ouverture de la
+  // conversation est routee ici pour qu'aucune page n'ait a la declarer.
+  if (message?.type === 'openCompanionChat') {
+    await vscode.commands.executeCommand('securityCenter.openCompanionChat');
+    return true;
+  }
+  if (message?.type !== 'command' || !SHELL_NAV_COMMANDS.has(message.command)) return false;
+  await vscode.commands.executeCommand(message.command);
+  return true;
+}
 
 function configuredDisabledScanners() {
   try {
@@ -151,8 +222,35 @@ async function javaAvailable() {
   try { await execFileAsync('java', ['-version'], { windowsHide: true, timeout: 10000 }); return true; } catch { return false; }
 }
 
+function zapRequestedForScan(cfg, projectPolicy, requested) {
+  return cfg.get('zap.enabled', true)
+    && (!requested || requested.has('ZAP'))
+    && projectPolicy?.scanners?.ZAP !== false;
+}
+
+function zapModeFromPolicy(projectPolicy) {
+  return projectPolicy?.zapOpenapi ? 'openapi' : projectPolicy?.zapActive ? 'active' : 'baseline';
+}
+
+async function resolveZapActiveScanConsent({ window, dashboardProvider, mode = 'active', target = 'http://127.0.0.1:3000' }) {
+  const styledDecision = await dashboardProvider?.requestZapPreflight?.({ mode, target });
+  if (styledDecision) return styledDecision;
+  const passive = 'Use passive scan';
+  const active = 'Authorize active scan';
+  const cancel = 'Cancel analysis';
+  const selected = await window.showWarningMessage(
+    `Security Center — ZAP ${mode} scan\n\nTarget:\n${target}\n\nZAP will send active security test requests to this target.`,
+    passive,
+    active,
+    cancel
+  );
+  if (selected === active) return { mode, authorized: true };
+  if (selected === passive) return { mode: 'baseline', passiveFallback: true };
+  return { cancelled: true };
+}
+
 class DashboardProvider {
-  constructor(onCommand, themeController, getLocalHistory = () => []) {
+  constructor(onCommand, themeController, getLocalHistory = () => [], extensionUri = null) {
     this.view = undefined;
     this.fullPanel = undefined;
     this.pagePanels = new Map();
@@ -160,10 +258,12 @@ class DashboardProvider {
     this.requestPanelIndex = -1;
     this.themeController = themeController;
     this.getLocalHistory = getLocalHistory;
+    this.extensionUri = extensionUri;
     this.selectedTheme = themeController?.getTheme() || 'light';
-    this.zapConfirmationVisible = false;
-    this.zapConfirmation = undefined;
-    this.resolveZapConfirmation = undefined;
+    this.zapPreflight = undefined;
+    this.zapPreflightHost = undefined;
+    this.zapPreflightSurface = undefined;
+    this.resolveZapPreflight = undefined;
     this.model = buildDashboardModel();
     this.onCommand = onCommand;
     this.themeSubscription = themeController?.onDidChange((theme) => {
@@ -171,6 +271,57 @@ class DashboardProvider {
       this.render();
       if (this.requestPanelIndex >= 0) this.openFullHttpRequest(this.requestPanelIndex);
     });
+  }
+  companionAssetRoot() {
+    return this.extensionUri ? vscode.Uri.joinPath(this.extensionUri, 'media', 'live') : null;
+  }
+  scannerAssetRoot() {
+    return this.extensionUri ? vscode.Uri.joinPath(this.extensionUri, 'media', 'scanners') : null;
+  }
+  providerAssetRoot() {
+    return this.extensionUri ? vscode.Uri.joinPath(this.extensionUri, 'media', 'providers') : null;
+  }
+  companionAssetOptions(webview) {
+    const root = this.companionAssetRoot();
+    const scannerRoot = this.scannerAssetRoot();
+    const providerRoot = this.providerAssetRoot();
+    if (!root || !webview?.asWebviewUri) return {};
+    const scannerLogoUris = {};
+    for (const [tool, file] of [
+      ['Semgrep', 'semgrep.svg'],
+      ['Gitleaks', 'gitleaks.svg'],
+      ['Trivy', 'trivy.svg'],
+      ['OSV-Scanner', 'osv-scanner.svg'],
+      ['SonarQube', 'sonarqube.svg'],
+      ['Snyk', 'snyk.svg'],
+      ['ZAP', 'zap.png']
+    ]) {
+      if (scannerRoot) scannerLogoUris[tool] = webview.asWebviewUri(vscode.Uri.joinPath(scannerRoot, file)).toString();
+    }
+    const providerLogoUris = {};
+    for (const [provider, file] of Object.entries(PROVIDER_LOGO_FILES)) {
+      if (providerRoot) providerLogoUris[provider] = webview.asWebviewUri(vscode.Uri.joinPath(providerRoot, file)).toString();
+    }
+    return {
+      companionImageUri: webview.asWebviewUri(vscode.Uri.joinPath(root, 'security-companion.png')).toString(),
+      scannerLogoUris,
+      providerLogoUris,
+      jenkinsLogoUri: providerLogoUris.jenkins || '',
+      cspSource: webview.cspSource || ''
+    };
+  }
+  companionWebviewOptions(options = {}) {
+    const roots = [this.companionAssetRoot(), this.scannerAssetRoot(), this.providerAssetRoot()].filter(Boolean);
+    return roots.length ? { ...options, localResourceRoots: roots } : { ...options };
+  }
+  configureCompanionAssets(webview, options = {}) {
+    const roots = [this.companionAssetRoot(), this.scannerAssetRoot(), this.providerAssetRoot()].filter(Boolean);
+    if (!roots.length || !webview) return;
+    webview.options = {
+      enableScripts: options.enableScripts !== false,
+      retainContextWhenHidden: Boolean(options.retainContextWhenHidden),
+      localResourceRoots: roots
+    };
   }
   registerMessages(webview) {
     webview.onDidReceiveMessage((message) => {
@@ -189,14 +340,20 @@ class DashboardProvider {
         }
         return;
       }
+      // Le lanceur compact de la barre d'activite. Il ne cite pas la commande
+      // lui-meme : l'extension decide, et l'enchainement — ouvrir/reveler PUIS
+      // replier la barre laterale — vit ici, en un seul endroit.
+      if (message?.type === 'openSecurityCenter') {
+        this.openSecurityCenterFromSidebar();
+        return;
+      }
       if (message?.type === 'themeChanged' && ['light', 'dark'].includes(message.theme)) {
         if (this.themeController) this.themeController.setTheme(message.theme);
         else this.selectedTheme = message.theme;
         return;
       }
-      if (message?.type === 'requestZapScan') {
-        this.zapConfirmationVisible = true;
-        this.render();
+      if (message?.type === 'zapPreflightResolved') {
+        this.resolveZapPreflightDecision(message);
         return;
       }
       // A click on an inventory row. The webview sends an index into the
@@ -206,25 +363,6 @@ class DashboardProvider {
         const inventory = this.model?.dynamicWorkspace?.inventory || [];
         const endpoint = Number.isInteger(message.index) ? inventory[message.index] : null;
         if (endpoint) this.onCommand('securityCenter.showDynamicEndpoint', endpoint);
-        return;
-      }
-      if (message?.type === 'cancelZapScan') {
-        this.zapConfirmationVisible = false;
-        this.zapConfirmation = undefined;
-        const resolve = this.resolveZapConfirmation;
-        this.resolveZapConfirmation = undefined;
-        this.render();
-        resolve?.(false);
-        return;
-      }
-      if (message?.type === 'confirmZapScan') {
-        this.zapConfirmationVisible = false;
-        this.zapConfirmation = undefined;
-        const resolve = this.resolveZapConfirmation;
-        this.resolveZapConfirmation = undefined;
-        this.render();
-        if (resolve) resolve(true);
-        else this.onCommand('securityCenter.scanWorkspace', { tools: ['ZAP'], zapAuthorized: true });
         return;
       }
       const allowed = new Set([
@@ -258,30 +396,40 @@ class DashboardProvider {
         'securityCenter.installPreCommitHook',
         'securityCenter.showTrends',
         'securityCenter.configureTeamIntegrations',
+        'securityCenter.configureSiem',
+        'securityCenter.configurePrometheus',
+        'securityCenter.configureObservability',
+        'securityCenter.openPrometheusMetrics',
+        'securityCenter.configureWazuh',
+        'securityCenter.openRuntimeSecurity',
+        'securityCenter.openInfrastructure',
         'securityCenter.configureOllama',
-        'securityCenter.rollbackAiFix'
+        'securityCenter.rollbackAiFix',
+        // Surfaces reachable from the internal navigation. Each already has its
+        // own registered command and handler; the allowlist is what lets the
+        // dashboard webview ask for them. Nothing new is executed.
+        'securityCenter.openScannerSetup',
+        'securityCenter.openLiveSecurityPage',
+        'securityCenter.openSecurityPipeline',
+        'securityCenter.openSecurityDelivery',
+        'securityCenter.verifyFindingFix'
         ,'securityCenter.openScannerSetup'
         ,'securityCenter.openSecurityPipeline'
         ,'securityCenter.openSecurityDelivery'
       ]);
-      if (message?.type === 'command' && message.command === 'securityCenter.scanZap') {
-        this.zapConfirmationVisible = true;
-        this.zapConfirmation = {
-          mode: 'active',
-          target: this.model.dynamicTargetUrl || 'http://127.0.0.1:3000'
-        };
-        this.openPage('dynamic');
-        this.render();
-        return;
-      }
       if (message?.type === 'openScannerDetails') {
-        this.activeScanner = message.scanner;
-        this.openPage('scanner-details');
+        this.openScannerDetails(message.scannerId || message.scanner);
         return;
       }
       if (message?.type === 'applyFindingFix' && Number.isInteger(message.index)) {
         const finding = this.model.findings[message.index];
         if (finding) this.onCommand('securityCenter.applyFindingFix', finding);
+        return;
+      }
+      // La carte Companion est aussi hebergee ici : l'ouverture de la
+      // conversation doit etre routee comme sur les autres surfaces.
+      if (message?.type === 'openCompanionChat') {
+        this.onCommand('securityCenter.openCompanionChat');
         return;
       }
       if (message?.type === 'command' && allowed.has(message.command)) this.onCommand(message.command);
@@ -335,9 +483,26 @@ class DashboardProvider {
   }
   resolveWebviewView(view) {
     this.view = view;
-    view.webview.options = { enableScripts: true };
+    this.configureCompanionAssets(view.webview);
     this.registerMessages(view.webview);
     this.render();
+  }
+  /**
+   * Le geste du lanceur : ouvrir Security Center, puis rendre sa place.
+   *
+   * La commande `securityCenter.openDashboard` existe deja et porte toute la
+   * logique d'ouverture — y compris le singleton : un dashboard deja ouvert est
+   * revele, jamais duplique. Rien n'est reimplemente ici.
+   *
+   * Le repliement vient APRES, et seulement si l'ouverture n'a pas echoue : une
+   * barre laterale fermee sans application ouverte laisserait l'utilisateur
+   * devant un ecran vide. `workbench.action.closeSidebar` masque le conteneur,
+   * il ne detruit ni la WebviewView ni son fournisseur : un clic sur l'icone du
+   * bouclier la reaffiche telle quelle.
+   */
+  async openSecurityCenterFromSidebar() {
+    await this.onCommand('securityCenter.openDashboard');
+    await vscode.commands.executeCommand('workbench.action.closeSidebar');
   }
   openFullDashboard() {
     if (this.fullPanel) {
@@ -348,39 +513,81 @@ class DashboardProvider {
       'securityCenter.fullDashboard',
       'Security Center — Dashboard',
       vscode.ViewColumn.Active,
-      { enableScripts: true, retainContextWhenHidden: true }
+      this.companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true })
     );
     this.fullPanel = panel;
     this.registerMessages(panel.webview);
-    panel.onDidDispose(() => { this.fullPanel = undefined; });
+    panel.onDidDispose(() => {
+      this.cancelZapPreflightForWebview(panel.webview);
+      this.fullPanel = undefined;
+    });
     this.renderWebview(panel.webview);
   }
   openPage(page) {
     const titles = { findings: 'Security Center — Findings', scans: 'Security Center — Scans', dynamic: 'Security Center — Dynamic Security', analytics: 'Security Center — Analytics', 'burp-settings': 'Security Center — Burp Settings', 'scanner-details': 'Security Center — Scanner Details' };
     const existing = this.pagePanels.get(page);
     if (existing) return existing.reveal(vscode.ViewColumn.Active);
-    const panel = vscode.window.createWebviewPanel(`securityCenter.${page}`, titles[page] || 'Security Center', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
+    const panel = vscode.window.createWebviewPanel(`securityCenter.${page}`, titles[page] || 'Security Center', vscode.ViewColumn.Active, this.companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
     this.pagePanels.set(page, panel);
     this.registerMessages(panel.webview);
     panel.onDidDispose(() => {
+      this.cancelZapPreflightForWebview(panel.webview);
       this.pagePanels.delete(page);
     });
     this.renderWebview(panel.webview, page);
   }
-  openScannerDetails(scannerName) {
-    this.activeScanner = scannerName;
+  openScannerDetails(scannerIdOrName) {
+    this.activeScanner = scannerToolFromId(scannerIdOrName);
+    const existing = this.pagePanels.get('scanner-details');
+    if (existing) {
+      existing.reveal(vscode.ViewColumn.Active);
+      this.renderWebview(existing.webview, 'scanner-details');
+      return;
+    }
     this.openPage('scanner-details');
   }
-  requestZapAuthorization({ mode, target }) {
-    if (this.resolveZapConfirmation) this.resolveZapConfirmation(false);
-    this.zapConfirmation = { mode, target };
-    this.zapConfirmationVisible = true;
-    const decision = new Promise((resolve) => { this.resolveZapConfirmation = resolve; });
-    // Keep the user on the surface from which the full scan was started.
-    // The confirmation card is rendered by the existing dashboard/sidebar
-    // instead of navigating to Dynamic Security mid-execution.
-    this.render();
-    return decision;
+  zapPreflightHosts() {
+    const hosts = [];
+    if (this.fullPanel) hosts.push({ surface: 'full', panel: this.fullPanel, webview: this.fullPanel.webview });
+    for (const [surface, panel] of this.pagePanels) hosts.push({ surface, panel, webview: panel.webview });
+    return hosts;
+  }
+  selectZapPreflightHost() {
+    const hosts = this.zapPreflightHosts().filter((host) => host.webview);
+    return hosts.find((host) => host.panel?.active) || hosts.find((host) => host.panel?.visible) || null;
+  }
+  requestZapPreflight({ mode = 'active', target = 'http://127.0.0.1:3000' } = {}) {
+    const host = this.selectZapPreflightHost();
+    if (!host) return Promise.resolve(null);
+    if (this.resolveZapPreflight) this.resolveZapPreflightDecision({ id: this.zapPreflight?.id, decision: 'cancel' });
+    const id = crypto.randomBytes(8).toString('hex');
+    this.zapPreflight = { id, mode, target };
+    this.zapPreflightHost = host.webview;
+    this.zapPreflightSurface = host.surface;
+    return new Promise((resolve) => {
+      this.resolveZapPreflight = resolve;
+      this.renderWebview(host.webview, host.surface);
+    });
+  }
+  resolveZapPreflightDecision(message = {}) {
+    if (!this.zapPreflight || message.id !== this.zapPreflight.id) return;
+    const decision = message.decision === 'active'
+      ? { mode: this.zapPreflight.mode, authorized: true }
+      : message.decision === 'passive'
+        ? { mode: 'baseline', passiveFallback: true }
+        : { cancelled: true };
+    const resolve = this.resolveZapPreflight;
+    const host = this.zapPreflightHost;
+    const surface = this.zapPreflightSurface;
+    this.zapPreflight = undefined;
+    this.zapPreflightHost = undefined;
+    this.zapPreflightSurface = undefined;
+    this.resolveZapPreflight = undefined;
+    if (host) this.renderWebview(host, surface || 'full');
+    resolve?.(decision);
+  }
+  cancelZapPreflightForWebview(webview) {
+    if (webview && this.zapPreflightHost === webview) this.resolveZapPreflightDecision({ id: this.zapPreflight?.id, decision: 'cancel' });
   }
   setData(findings, scanners, options) {
     this.model = buildDashboardModel(findings, scanners, {
@@ -408,7 +615,13 @@ class DashboardProvider {
       companionEnabled: vscode.workspace.getConfiguration('securityCenter').get('live.companion.enabled', true) !== false,
       activeScanner: this.activeScanner || null
     };
-    webview.html = renderDashboardHtml(model, nonce, surface, this.selectedTheme, { zapConfirmationVisible: this.zapConfirmationVisible, zapConfirmation: this.zapConfirmation });
+    // La barre d'activite est un lanceur, pas une seconde navigation : elle a
+    // son propre rendu compact. Toutes les autres surfaces gardent le document
+    // du dashboard, inchange.
+    const uiState = webview === this.zapPreflightHost ? { zapPreflight: this.zapPreflight } : {};
+    webview.html = surface === 'sidebar'
+      ? renderSidebarLauncherHtml(model, nonce, this.selectedTheme, {}, this.companionAssetOptions(webview))
+      : renderDashboardHtml(model, nonce, surface, this.selectedTheme, uiState, this.companionAssetOptions(webview));
   }
   dispose() { this.themeSubscription?.dispose(); }
 }
@@ -522,8 +735,42 @@ async function activate(context) {
   const dashboardProvider = new DashboardProvider(
     (command, ...args) => vscode.commands.executeCommand(command, ...args),
     themeController,
-    () => context.workspaceState.get(LOCAL_SCAN_HISTORY_KEY, [])
+    () => context.workspaceState.get(LOCAL_SCAN_HISTORY_KEY, []),
+    context.extensionUri
   );
+  const companionAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'live');
+  const scannerAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'scanners');
+  const providerAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'providers');
+  const scannerLogoFiles = Object.freeze({
+    Semgrep: 'semgrep.svg',
+    Gitleaks: 'gitleaks.svg',
+    Trivy: 'trivy.svg',
+    'OSV-Scanner': 'osv-scanner.svg',
+    SonarQube: 'sonarqube.svg',
+    Snyk: 'snyk.svg',
+    ZAP: 'zap.png'
+  });
+  const companionAssetOptions = (webview) => {
+    const scannerLogoUris = {};
+    for (const [tool, file] of Object.entries(scannerLogoFiles)) {
+      scannerLogoUris[tool] = webview.asWebviewUri(vscode.Uri.joinPath(scannerAssetRoot, file)).toString();
+    }
+    const providerLogoUris = {};
+    for (const [provider, file] of Object.entries(PROVIDER_LOGO_FILES)) {
+      providerLogoUris[provider] = webview.asWebviewUri(vscode.Uri.joinPath(providerAssetRoot, file)).toString();
+    }
+    return {
+      companionImageUri: webview.asWebviewUri(vscode.Uri.joinPath(companionAssetRoot, 'security-companion.png')).toString(),
+      scannerLogoUris,
+      providerLogoUris,
+      jenkinsLogoUri: providerLogoUris.jenkins || '',
+      cspSource: webview.cspSource || ''
+    };
+  };
+  const companionWebviewOptions = (extra = {}) => ({
+    ...extra,
+    localResourceRoots: [companionAssetRoot, scannerAssetRoot, providerAssetRoot]
+  });
   let currentFindings = [];
   let currentScanStatuses = [];
   let currentDashboardOptions = {};
@@ -553,7 +800,7 @@ async function activate(context) {
       scannerHealth.push({ tool: failedScanner.tool, enabled: true, reason: summarizeScannerError(failedScanner.error || failedScanner.details || '') });
     }
     return {
-      scanStatus: currentScanRunning ? 'running' : (currentPipelineResult ? 'completed' : ''),
+      scanStatus: currentScanRunning ? 'running' : (currentDashboardOptions.scanStatus || (currentPipelineResult ? 'completed' : '')),
       scanFindingCount: currentPipelineResult ? currentFindings.length : undefined,
       scanPriorityCount: currentPipelineResult?.prioritySummary?.distribution
         ? (currentPipelineResult.prioritySummary.distribution.P0 || 0) + (currentPipelineResult.prioritySummary.distribution.P1 || 0)
@@ -567,7 +814,8 @@ async function activate(context) {
       // the companion counts them rather than pretending they are sequential.
       scanProgress: currentScanRunning ? {
         running: currentScanStatuses.filter((scanner) => scanner.status === 'running').map((scanner) => scanner.tool),
-        completed: currentScanStatuses.filter((scanner) => scanner.status === 'completed').length,
+        completed: finishedScannerCount(currentScanStatuses),
+        successful: successfulScannerCount(currentScanStatuses),
         total: currentScanStatuses.length
       } : null,
       // How the last scan ended, from the status the dashboard already holds.
@@ -596,6 +844,27 @@ async function activate(context) {
   let currentScanId = null;
   let findingDetailsPanel;
   let findingDetailsFinding;
+  let findingDetailsContext = {};
+  /**
+   * Draws the Finding Details panel from the finding passed in.
+   *
+   * Extracted so the panel can be redrawn when the finding changes underneath
+   * it. The page used to be rendered once, at open time, from a snapshot
+   * captured then: after a verification the toast reported the new verdict
+   * while the open page still showed the state it had been opened with.
+   */
+  function renderFindingDetailsPanel(finding, navigationContext = findingDetailsContext) {
+    if (!findingDetailsPanel || !finding) return;
+    findingDetailsFinding = finding;
+    findingDetailsContext = navigationContext || {};
+    findingDetailsPanel.title = `Security Center — ${finding.tool}: ${finding.title}`;
+    const nonce = crypto.randomBytes(16).toString('base64');
+    const relatedTraffic = (currentDashboardOptions.httpScenarios || []).map((scenario, index) => ({ scenario, index })).filter(({ scenario }) => linkedFindingsForScenario(scenario, [finding]).length > 0).map(({ scenario, index }) => ({ index, method: scenario.request?.method || 'HTTP', path: (() => { try { return new URL(scenario.request?.url).pathname || '/'; } catch { return scenario.request?.url || '/'; } })(), status: scenario.response?.statusCode || scenario.response?.status || '—', source: scenario.source || 'capture' }));
+    // `findings` : la liste courante, telle quelle. Elle sert uniquement a la
+    // carte d'assistant du rail, qui y compte les findings partageant la meme
+    // regle ou le meme fichier. Aucun autre calcul ne la traverse.
+    findingDetailsPanel.webview.html = renderFindingDetailsHtml(finding, nonce, { relatedTraffic, backTrafficIndex: Number.isInteger(findingDetailsContext.trafficIndex) ? findingDetailsContext.trafficIndex : null, theme: dashboardProvider.selectedTheme, findings: currentFindings, ...companionAssetOptions(findingDetailsPanel.webview) });
+  }
   let scanInProgress = false;
   let httpWriteReplayAuthorized = false;
   let lastAiRollback;
@@ -1078,30 +1347,7 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureTeamIntegrations', async () => {
-    const choice = await vscode.window.showQuickPick(['Slack', 'Jira'], { title: 'Configurer les intégrations d’équipe' });
-    if (!choice) return;
-    const cfg = vscode.workspace.getConfiguration('securityCenter');
-    if (choice === 'Slack') {
-      const webhook = await vscode.window.showInputBox({ title: 'Webhook entrant Slack', password: true, prompt: 'URL HTTPS fournie par Slack. Elle sera stockée dans SecretStorage.' });
-      if (!webhook) return;
-      await context.secrets.store('securityCenter.slackWebhook', webhook.trim());
-      await cfg.update('notifications.slack.enabled', true, vscode.ConfigurationTarget.Workspace);
-      return vscode.window.showInformationMessage('Security Center : notifications Slack activées pour ce workspace.');
-    }
-    const baseUrl = await vscode.window.showInputBox({ title: 'URL Jira Cloud', prompt: 'Exemple : https://entreprise.atlassian.net' });
-    if (!baseUrl) return;
-    const email = await vscode.window.showInputBox({ title: 'Adresse du compte Jira' });
-    if (!email) return;
-    const projectKey = await vscode.window.showInputBox({ title: 'Clé du projet Jira', prompt: 'Exemple : SEC' });
-    if (!projectKey) return;
-    const token = await vscode.window.showInputBox({ title: 'Jeton API Jira', password: true, prompt: 'Stocké uniquement dans SecretStorage.' });
-    if (!token) return;
-    await context.secrets.store('securityCenter.jiraToken', token.trim());
-    await cfg.update('notifications.jira.baseUrl', baseUrl.trim(), vscode.ConfigurationTarget.Workspace);
-    await cfg.update('notifications.jira.email', email.trim(), vscode.ConfigurationTarget.Workspace);
-    await cfg.update('notifications.jira.projectKey', projectKey.trim(), vscode.ConfigurationTarget.Workspace);
-    await cfg.update('notifications.jira.enabled', true, vscode.ConfigurationTarget.Workspace);
-    vscode.window.showInformationMessage('Security Center : création de tickets Jira activée pour ce workspace.');
+    await openIntegrationsPage();
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showFindingDetails', (finding, navigationContext = {}) => {
@@ -1111,11 +1357,15 @@ async function activate(context) {
         'securityCenter.findingDetails',
         'Security Center — Détails',
         vscode.ViewColumn.Active,
-        { enableScripts: true, retainContextWhenHidden: true }
+        companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true })
       );
       findingDetailsPanel.webview.onDidReceiveMessage(async (message) => {
+        if (await handleShellNavMessage(message)) return;
         if (message?.type === 'openHttpRequest' && Number.isInteger(message.index)) return dashboardProvider.openFullHttpRequest(message.index);
         if (message?.type === 'backToHttpRequest' && Number.isInteger(message.index)) return dashboardProvider.openFullHttpRequest(message.index);
+        if (message?.type === 'openFindingCode' && findingDetailsFinding) {
+          return void await vscode.commands.executeCommand('securityCenter.openFindingCode', findingDetailsFinding);
+        }
         if (message?.type === 'verifyFix' && findingDetailsFinding) {
           return void await vscode.commands.executeCommand('securityCenter.verifyFindingFix', findingDetailsFinding);
         }
@@ -1136,10 +1386,7 @@ async function activate(context) {
     } else {
       findingDetailsPanel.reveal(vscode.ViewColumn.Active);
     }
-    findingDetailsPanel.title = `Security Center — ${finding.tool}: ${finding.title}`;
-    const nonce = crypto.randomBytes(16).toString('base64');
-    const relatedTraffic = (currentDashboardOptions.httpScenarios || []).map((scenario, index) => ({ scenario, index })).filter(({ scenario }) => linkedFindingsForScenario(scenario, [finding]).length > 0).map(({ scenario, index }) => ({ index, method: scenario.request?.method || 'HTTP', path: (() => { try { return new URL(scenario.request?.url).pathname || '/'; } catch { return scenario.request?.url || '/'; } })(), status: scenario.response?.statusCode || scenario.response?.status || '—', source: scenario.source || 'capture' }));
-    findingDetailsPanel.webview.html = renderFindingDetailsHtml(finding, nonce, { relatedTraffic, backTrafficIndex: Number.isInteger(navigationContext.trafficIndex) ? navigationContext.trafficIndex : null, theme: dashboardProvider.selectedTheme });
+    renderFindingDetailsPanel(finding, navigationContext);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openFindingCode', async (finding) => {
@@ -1546,6 +1793,9 @@ async function activate(context) {
   let scannerSetupPanel;
   let scannerSetupConfirmation;
   let scannerInstallationRunning = false;
+  // One live controller per tool: a second click on the same tool finds a
+  // controller already in flight and does nothing, so no duplicate download.
+  const scannerInstallControllers = new Map();
   const scannerSetupOperations = {};
   // ------------------------------------------------------ Security Pipeline
   let pipelinePanel;
@@ -1665,7 +1915,7 @@ async function activate(context) {
     if (!pipelinePanel) return;
     const model = await buildPipelineModel();
     if (!pipelinePanel) return;
-    pipelinePanel.webview.html = renderPipelinePageHtml(model, crypto.randomBytes(16).toString('base64'), themeController.getTheme());
+    pipelinePanel.webview.html = renderPipelinePageHtml(model, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(pipelinePanel.webview));
   }
 
   /** Audit trail for a policy edit. The rules travel, never the file's secrets. */
@@ -1728,6 +1978,11 @@ async function activate(context) {
         policyHash: policyGateHash(policy)
       }
     }).catch(() => {});
+    // A re-evaluation that changed the Pipeline verdict must change the banner
+    // too, otherwise the two surfaces disagree again the moment the policy is
+    // edited — which is precisely when a developer looks at both.
+    currentDashboardOptions = { ...currentDashboardOptions, policyResult: policyResultFromGate(gate, policy) };
+    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
     liveCompanionProvider.render();
     vscode.window.showInformationMessage(`Security Center : Policy Gate ${gate.status} — ${gate.summary}`);
     return renderPipelinePage();
@@ -1891,10 +2146,13 @@ async function activate(context) {
     snyk.installing = scannerSetupOperations.snyk;
     const statuses = await withScannerDiagnostics(rawStatuses.filter((item) => !['sonarscanner', 'snyk'].includes(item.id)));
     if (!scannerSetupPanel) return;
-    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar, snyk);
+    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar, snyk, companionAssetOptions(scannerSetupPanel.webview));
   }
   async function installManagedScanners(ids) {
-    const tools = ids.filter((id) => MANAGED_SCANNER_TOOLS[id]);
+    // Never two runs for the same tool: a second click finds a controller
+    // already in flight and is ignored, so no competing download starts over
+    // the same temporary artefact.
+    const tools = ids.filter((id) => MANAGED_SCANNER_TOOLS[id] && !scannerInstallControllers.has(id));
     if (!tools.length || scannerInstallationRunning) return;
     scannerInstallationRunning = true;
     scannerSetupConfirmation = undefined;
@@ -1904,22 +2162,41 @@ async function activate(context) {
         scannerSetupOperations[id] = { state: 'installing', title: `Installation de ${label}`, message: 'Préparation…' };
         await renderScannerSetup();
         try {
-          await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Security Center : installation de ${label}`, cancellable: false }, async (progress) => {
+          // One controller per run. A cancelled run is never resumed and never
+          // reused: « Réessayer » builds a fresh one below.
+          const installController = new AbortController();
+          scannerInstallControllers.set(id, installController);
+          await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Security Center : installation de ${label}`, cancellable: true }, async (progress, token) => {
+            token.onCancellationRequested(() => installController.abort());
             let previousPercent = 0;
             await scannerToolManager.install(id, (event) => {
-              const percent = event.total ? Math.min(100, Math.round(event.received / event.total * 100)) : undefined;
-              scannerSetupOperations[id] = { state: 'installing', title: `Installation de ${label}`, message: event.message || (event.phase === 'download' ? `Téléchargement ${percent ?? ''}%` : event.phase), percent };
+              // A percentage is only shown when the server actually declared a
+              // size. Without Content-Length the state is indeterminate and says
+              // so, instead of a fabricated number that never moves.
+              const percent = event.total > 0
+                ? Math.min(100, Math.round(event.received / event.total * 100))
+                : undefined;
+              const message = event.message || (event.phase === INSTALL_PHASE.DOWNLOADING
+                ? (Number.isFinite(percent) ? `Téléchargement ${percent}%` : 'Téléchargement en cours…')
+                : event.phase);
+              scannerSetupOperations[id] = { state: 'installing', title: `Installation de ${label}`, message, percent, cancellable: true };
               if (Number.isFinite(percent)) { progress.report({ increment: Math.max(0, percent - previousPercent), message: `${percent}%` }); previousPercent = percent; }
               renderScannerSetup().catch(() => {});
-            });
+            }, { signal: installController.signal });
           });
           scannerSetupOperations[id] = { state: 'ready', title: `${label} est prêt`, message: 'Installation vérifiée. Le prochain scan utilisera automatiquement cette version locale.' };
           // Snyk names its execution mode `snyk.mode`, not `snyk.command`.
           await vscode.workspace.getConfiguration('securityCenter').update(id === 'snyk' ? 'snyk.mode' : `${id}.command`, 'auto', vscode.ConfigurationTarget.Global).catch(() => {});
         } catch (error) {
-          scannerSetupOperations[id] = { state: 'failed', title: `${label} n’a pas été installé`, message: error.message };
-          scanLog.appendLine(`Installation ${label} — ÉCHEC : ${error.stack || error.message}`);
-        }
+          // A user who cancels has not suffered a failure: the two states are
+          // kept apart so the card offers « Réessayer » without claiming
+          // something went wrong.
+          const cancelled = error?.cancelled === true || error?.code === INSTALL_ERROR.CANCELLED;
+          scannerSetupOperations[id] = cancelled
+            ? { state: 'cancelled', title: `Installation de ${label} annulée`, message: 'Aucune version installée n’a été modifiée. Vous pouvez relancer l’installation.', retryable: true }
+            : { state: 'failed', title: `${label} n’a pas été installé`, message: summarizeScannerError(error.message), errorCode: error?.code || '', retryable: true };
+          scanLog.appendLine(`Installation ${label} — ${cancelled ? 'ANNULÉE' : 'ÉCHEC'} : ${error.stack || error.message}`);
+        } finally { scannerInstallControllers.delete(id); }
         await renderScannerSetup();
       }
     } finally {
@@ -1927,10 +2204,142 @@ async function activate(context) {
       await renderScannerSetup();
     }
   }
+  // -------------------------------------------------- Security Companion chat
+  //
+  // Session-local only: no store, no profile, no account. The conversation dies
+  // with the window, which is the right lifetime for prompts that may quote code.
+  let companionChatPanel;
+  let companionChatMessages = [];
+  let companionChatState = CHAT_STATE.IDLE;
+  let companionChatError = '';
+  let companionChatRoute = null;
+  let companionChatController = null;
+
+  /** The surface the user is actually looking at, for the context indicator. */
+  function companionChatSurface() {
+    if (findingDetailsPanel?.active && findingDetailsFinding) return 'finding';
+    if (runtimeSecurityPanel?.active) return 'runtime';
+    if (infrastructurePanel?.active) return 'infrastructure';
+    if (pipelinePanel?.active) return 'pipeline';
+    if (scannerSetupPanel?.active) return 'scanner-setup';
+    return findingDetailsFinding ? 'finding' : 'dashboard';
+  }
+
+  /** Everything the assistant may see. Built fresh on every turn, never cached. */
+  function companionChatContext() {
+    const surface = companionChatSurface();
+    const finding = surface === 'finding' ? findingDetailsFinding : null;
+    const similar = finding
+      ? currentFindings.filter((candidate) => candidate.ruleId && candidate.ruleId === finding.ruleId).length
+      : null;
+    return buildAssistantContext({
+      surface,
+      finding,
+      findings: currentFindings,
+      scanners: currentScanStatuses,
+      scan: { status: currentDashboardOptions.scanStatus || '' },
+      pipeline: currentPipelineResult,
+      runtime: runtimeSecurityStatus,
+      infrastructure: prometheusStatus,
+      similarFindingCount: similar
+    });
+  }
+
+  function renderCompanionChat() {
+    if (!companionChatPanel) return;
+    const context = companionChatContext();
+    companionChatPanel.webview.html = renderCompanionChatHtml({
+      messages: companionChatMessages,
+      state: companionChatState,
+      error: companionChatError,
+      route: companionChatRoute,
+      cancellable: Boolean(companionChatController),
+      indicator: contextIndicator(context),
+      quickQuestions: quickQuestionsFor(context),
+      mascotUri: companionAssetOptions(companionChatPanel.webview).companionImageUri
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme());
+  }
+
+  /**
+   * One conversational turn.
+   *
+   * A repair request never reaches the model: it is answered deterministically
+   * and routed to the existing Fix flow, so the assistant cannot be talked into
+   * producing code that would bypass patch validation and confirmation.
+   */
+  async function askCompanion(question) {
+    if (companionChatState === CHAT_STATE.THINKING) return;
+    const text = String(question || '').trim();
+    if (!text) return;
+    companionChatMessages = [...companionChatMessages, chatMessage(CHAT_ROLE.USER, text)];
+    companionChatError = '';
+    companionChatRoute = null;
+
+    if (detectFixRequest(text)) {
+      companionChatMessages = [...companionChatMessages, chatMessage(CHAT_ROLE.ASSISTANT, fixRoutingReply())];
+      companionChatState = CHAT_STATE.ANSWERED;
+      if (findingDetailsFinding) companionChatRoute = { action: 'generateFix', label: 'Proposer une correction' };
+      return renderCompanionChat();
+    }
+
+    companionChatState = CHAT_STATE.THINKING;
+    renderCompanionChat();
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const roles = readModelRoleConfiguration(cfg);
+    companionChatController = new AbortController();
+    try {
+      const reply = await generateAssistantReply({
+        baseUrl: cfg.get('ai.ollama.baseUrl', 'http://127.0.0.1:11434'),
+        // The assistant reuses the configured fast model. The remediation model
+        // strategy is untouched: this is a different task, not a different engine.
+        model: roles.models.fast || cfg.get('ai.ollama.model', ''),
+        messages: buildAssistantMessages({ context: companionChatContext(), history: companionChatMessages.slice(0, -1), question: text }),
+        signal: companionChatController.signal
+      });
+      companionChatMessages = [...companionChatMessages, chatMessage(CHAT_ROLE.ASSISTANT, reply.content, { model: reply.model })];
+      companionChatState = CHAT_STATE.ANSWERED;
+    } catch (error) {
+      const cancelled = companionChatController?.signal.aborted;
+      companionChatState = cancelled ? CHAT_STATE.CANCELLED : CHAT_STATE.ERROR;
+      // A missing local model degrades the assistant and nothing else.
+      companionChatError = cancelled ? '' : 'Assistant IA local indisponible. Vérifiez Ollama depuis « Diagnostiquer Ollama ».';
+      scanLog.appendLine(`Security Companion — ${cancelled ? 'annulé' : `indisponible : ${error.message}`}`);
+    } finally {
+      companionChatController = null;
+      renderCompanionChat();
+    }
+  }
+
+  async function openCompanionChat() {
+    if (!companionChatPanel) {
+      companionChatPanel = vscode.window.createWebviewPanel('securityCenter.companionChat', 'Security Center — Security Companion', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
+      companionChatPanel.onDidDispose(() => { companionChatPanel = undefined; });
+      companionChatPanel.webview.onDidReceiveMessage(async (message) => {
+        if (await handleShellNavMessage(message)) return;
+        if (message?.type !== 'companionChat') return;
+        if (message.action === 'ask') return void await askCompanion(message.question);
+        if (message.action === 'cancel') { companionChatController?.abort(); return; }
+        if (message.action === 'clear') { companionChatMessages = []; companionChatState = CHAT_STATE.IDLE; companionChatRoute = null; return renderCompanionChat(); }
+        // Routed actions always go through the existing commands.
+        if (message.action === 'generateFix' && findingDetailsFinding) {
+          return void await vscode.commands.executeCommand('securityCenter.generateAiFix', findingDetailsFinding);
+        }
+      });
+      context.subscriptions.push(themeController.onDidChange(() => renderCompanionChat()));
+    } else companionChatPanel.reveal(vscode.ViewColumn.Active);
+    renderCompanionChat();
+  }
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openCompanionChat', async (question) => {
+    await openCompanionChat();
+    if (typeof question === 'string' && question.trim()) await askCompanion(question);
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openScannerSetup', async () => {
     if (!scannerSetupPanel) {
       scannerSetupPanel = vscode.window.createWebviewPanel('securityCenter.scannerSetup', 'Security Center — Configuration des scanners', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
       scannerSetupPanel.webview.onDidReceiveMessage(async (message) => {
+        if (await handleShellNavMessage(message)) return;
         if (message?.type === 'refresh') await renderScannerSetup();
         if (message?.type === 'requestInstall' && MANAGED_SCANNER_TOOLS[message.tool] && !scannerInstallationRunning) {
           scannerSetupConfirmation = { ids: [message.tool], labels: [MANAGED_SCANNER_TOOLS[message.tool].label], destination: scannerToolManager.root };
@@ -1960,6 +2369,21 @@ async function activate(context) {
             scannerSetupConfirmation = { ids: missing, labels: missing.map((id) => MANAGED_SCANNER_TOOLS[id].label), destination: scannerToolManager.root };
             await renderScannerSetup();
           } else vscode.window.showInformationMessage('Security Center : tous les scanners gérés sont déjà disponibles.');
+        }
+        // Cancelling a RUNNING installation. Distinct from `cancelInstall`,
+        // which dismisses the confirmation before anything has started.
+        if (message?.type === 'abortInstall' && message.tool) {
+          // Aborts only the run owning this tool: no other installation, no
+          // scanner process, no VS Code operation is affected.
+          scannerInstallControllers.get(message.tool)?.abort();
+          return;
+        }
+        if (message?.type === 'retryInstall' && message.tool) {
+          // A retry is a brand-new run: fresh controller, fresh timeout, fresh
+          // temporary file. The terminal state is cleared so none of it leaks.
+          delete scannerSetupOperations[message.tool];
+          await renderScannerSetup();
+          return void await installManagedScanners([message.tool]);
         }
         if (message?.type === 'cancelInstall') { scannerSetupConfirmation = undefined; await renderScannerSetup(); }
         if (message?.type === 'approveInstall' && scannerSetupConfirmation && !scannerInstallationRunning) {
@@ -2157,7 +2581,7 @@ async function activate(context) {
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openSecurityPipeline', async (tab) => {
     if (typeof tab === 'string') pipelineTab = tab;
     if (!pipelinePanel) {
-      pipelinePanel = vscode.window.createWebviewPanel('securityCenter.pipeline', 'Security Center — Security Pipeline', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
+      pipelinePanel = vscode.window.createWebviewPanel('securityCenter.pipeline', 'Security Center — Security Pipeline', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
       pipelinePanel.onDidDispose(() => { pipelinePanel = undefined; });
       pipelinePanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'tab') { pipelineTab = message.tab; return renderPipelinePage(); }
@@ -2177,6 +2601,8 @@ async function activate(context) {
           return;
         }
         if (message?.type === 'command') {
+          // Les items du rail partage d'abord, puis les cibles propres a la page.
+          if (await handleShellNavMessage(message)) return;
           const allowed = new Set(['securityCenter.scanWorkspace', 'securityCenter.openDashboard', 'securityCenter.openProjectPolicy']);
           if (allowed.has(message.command)) await vscode.commands.executeCommand(message.command);
           return;
@@ -2194,6 +2620,15 @@ async function activate(context) {
           };
           if (destinations[message.stage]) return destinations[message.stage]();
           return vscode.commands.executeCommand('securityCenter.openScansPage');
+        }
+        // Corrections appliquées : l'index designe la liste rendue par l'onglet.
+        // Chaque action reutilise une commande existante — aucun bouton mort.
+        if (message?.type === 'remediation' && Number.isInteger(message.index)) {
+          const finding = (currentPipelineResult?.findings || [])[message.index] || currentFindings[message.index];
+          if (!finding) return;
+          if (message.action === 'code') return void await vscode.commands.executeCommand('securityCenter.openFindingCode', finding);
+          if (message.action === 'verify') return void await vscode.commands.executeCommand('securityCenter.verifyFindingFix', finding);
+          return void await vscode.commands.executeCommand('securityCenter.showFindingDetails', finding);
         }
         if (message?.type === 'finding' && Number.isInteger(message.index)) {
           const ranked = [...(currentPipelineResult?.findings || [])]
@@ -2418,6 +2853,9 @@ async function activate(context) {
 
   context.subscriptions.push(themeController.onDidChange(() => renderScannerSetup().catch(() => {})));
   context.subscriptions.push(themeController.onDidChange(() => renderPipelinePage().catch(() => {})));
+  // Security Delivery est desormais rendue dans le meme cadre : elle doit suivre
+  // le meme theme que les autres pages, sans message de theme supplementaire.
+  context.subscriptions.push(themeController.onDidChange(() => renderDeliveryPage()));
   for (const page of ['findings', 'scans', 'dynamic', 'analytics']) {
     const command = `securityCenter.open${page[0].toUpperCase()}${page.slice(1)}Page`;
     context.subscriptions.push(vscode.commands.registerCommand(command, () => {
@@ -2463,6 +2901,12 @@ async function activate(context) {
     publishDiagnostics(diagnostics, currentFindings);
     provider.setFindings(currentFindings, currentScanStatuses);
     dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+    // The open details page is a surface like any other: if it is showing this
+    // finding it must show the new state, without the developer closing and
+    // reopening it to discover that the verification actually succeeded.
+    if (findingDetailsPanel && findingDetailsFinding && findingKey(findingDetailsFinding) === key) {
+      renderFindingDetailsPanel(updated);
+    }
   }
 
   /** Persists verification metadata alongside the triage statuses already stored. */
@@ -2522,13 +2966,44 @@ async function activate(context) {
   }
 
   /** Runs the existing targeted Dynamic Security retest for a DAST finding. */
+  /**
+   * The write-replay consent gate, for the verification path.
+   *
+   * Verifying a fix must not be a way to acquire a permission the developer never
+   * granted. This reuses the session authorization the manual replay already
+   * owns — the same `httpWriteReplayAuthorized` flag, the same wording — and the
+   * same method classification as the replay engine itself, so the two can never
+   * disagree about what counts as a write. Nothing new is authorised here: a
+   * method outside the controlled set stays rejected by `replayScenario`.
+   *
+   * Returns `false` on refusal. The caller must then send nothing at all.
+   */
+  async function authorizeVerificationWriteReplay(method) {
+    if (!CONTROLLED_WRITE_METHODS.has(String(method).toUpperCase())) return true;
+    if (httpWriteReplayAuthorized) return true;
+    const confirmation = await vscode.window.showWarningMessage(
+      'Les replays POST/PUT/PATCH peuvent modifier les données locales. Autoriser ces méthodes pour cette session VS Code ? DELETE restera interdit.',
+      { modal: true },
+      'Autoriser pour cette session'
+    );
+    if (confirmation !== 'Autoriser pour cette session') return false;
+    httpWriteReplayAuthorized = true;
+    return true;
+  }
+
   async function verifyDynamicFinding(finding, token) {
     if (token?.isCancellationRequested) throw new Error('Vérification annulée.');
     const scenario = (currentDashboardOptions.httpScenarios || [])
       .find((candidate) => candidate.request?.url === finding.endpoint)
       || { name: finding.title, request: { url: finding.endpoint, method: finding.method && finding.method !== 'HTTP' ? finding.method : 'GET', headers: {} }, response: {} };
     const method = String(scenario.request.method).toUpperCase();
-    const replay = await replayScenario(scenario, { allowWrite: ['POST', 'PUT', 'PATCH'].includes(method), timeoutMs: 30000 });
+    // Consent is resolved BEFORE anything is sent. A refusal aborts the
+    // verification instead of degrading it: `verifyFindingFix` turns this into
+    // VALIDATION_FAILED / cancelled, so a refused write can never read as a
+    // validated fix — including on the automatic path that follows an AI patch.
+    const writeAuthorized = await authorizeVerificationWriteReplay(method);
+    if (!writeAuthorized) throw new Error('Vérification annulée : replay en écriture non autorisé.');
+    const replay = await replayScenario(scenario, { allowWrite: CONTROLLED_WRITE_METHODS.has(method), timeoutMs: 30000 });
     return {
       findingId: finding.id,
       verdict: retestVerdict({
@@ -2608,17 +3083,19 @@ async function activate(context) {
   function renderDeliveryPage() {
     if (!deliveryPanel) return;
     deliveryPanel.webview.html = renderDeliveryPageHtml(
-      deliveryStatus, crypto.randomBytes(16).toString('base64'), themeController.getTheme()
+      deliveryStatus, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview)
     );
   }
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openSecurityDelivery', async () => {
     if (!deliveryPanel) {
-      deliveryPanel = vscode.window.createWebviewPanel('securityCenter.delivery', 'Security Center — Security Delivery', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
+      deliveryPanel = vscode.window.createWebviewPanel('securityCenter.delivery', 'Security Center — Security Delivery', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
       deliveryPanel.onDidDispose(() => { deliveryPanel = undefined; });
       deliveryPanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'command') {
-          // A webview message is untrusted input: only this page's own targets.
+          // A webview message is untrusted input: only this page's own targets,
+          // plus the shared navigation the shell renders around it.
+          if (await handleShellNavMessage(message)) return;
           const ALLOWED = new Set(['securityCenter.openDashboard']);
           if (ALLOWED.has(message.command)) await vscode.commands.executeCommand(message.command);
           return;
@@ -2716,6 +3193,746 @@ async function activate(context) {
       vscode.window.showWarningMessage('Security Center : modèle Jenkinsfile introuvable dans l’extension.');
     }
   }));
+
+  // -------------------------------------------------------- Enterprise layer
+  //
+  // These connectors are optional context, not scanners. They read normalized
+  // provider models and publish presentation state to the Integrations page and
+  // the dashboard summary. No external service is installed or managed here.
+  let integrationsPanel;
+  let runtimeSecurityPanel;
+  let infrastructurePanel;
+  let integrationsView = 'overview';
+  let integrationsOpenConfig = '';
+  let runtimeOpenConfig = false;
+  // The provider being CONFIGURED, which may differ from the active one while
+  // the user is choosing. Never confused with `getActiveProviderId()`.
+  let runtimeSelectedProvider = '';
+  // The Runtime Security section on screen. The renderer falls back to the
+  // overview when a section stops being offered, so nothing has to reset it.
+  let runtimeTab = 'overview';
+  // Recherche, filtres, page et alerte ouverte. Le rendu normalise et borne
+  // cette requete, donc une valeur perimee ne peut pas vider l'ecran.
+  let runtimeAlertsQuery = {};
+  // Vulnerability state lives behind a different service than the provider's
+  // main API, so it gets its own query, its own result and its own evidence —
+  // and, below, its own failure boundary.
+  let runtimeVulnerabilitiesQuery = {};
+  let runtimeVulnerabilities = null;
+  let runtimeAlertsState = null;
+  let runtimeCapabilityEvidence = {};
+
+  /**
+   * Records what ONE fetcher proved, about the capabilities IT backs.
+   *
+   * Merging per capability is the whole point: refreshing vulnerabilities used
+   * to replace this object wholesale and silently erase the alert and MITRE
+   * evidence gathered moments earlier, which made both sections vanish after
+   * every refresh. A capability's state may only be written by the fetcher that
+   * backs it, and which capabilities a fetcher backs is the adapter's statement.
+   */
+  function recordCapabilityEvidence(adapter, fetcherName, state) {
+    const backed = adapter?.capabilityFetchers?.[fetcherName];
+    const capabilities = Array.isArray(backed) && backed.length ? backed : [];
+    const next = { ...runtimeCapabilityEvidence };
+    for (const capability of capabilities) {
+      if (state) next[capability] = { state };
+      else delete next[capability];
+    }
+    runtimeCapabilityEvidence = next;
+  }
+  let infrastructureOpenConfig = false;
+  // Which monitored host the Infrastructure page is reading. Empty means « not
+  // chosen », which is a real state when several hosts exist: nothing picks one.
+  let infrastructureHost = '';
+  let runtimeActionState = null;
+  let infrastructureActionState = null;
+  let prometheusStatus = buildPrometheusStatus({ configured: false });
+  let runtimeSecurityStatus = buildRuntimeSecurityStatus({ configured: false });
+  // One provider-neutral persistence surface for every SIEM adapter: active
+  // provider, namespaced per-provider config, namespaced secrets. The VS Code
+  // APIs are injected so the switching contract stays testable.
+  const siemConfiguration = createSiemConfigurationService({
+    configuration: {
+      get: (key, fallback) => vscode.workspace.getConfiguration('securityCenter').get(key, fallback),
+      update: (key, value) => vscode.workspace.getConfiguration('securityCenter')
+        .update(key, value, vscode.ConfigurationTarget.Workspace)
+    },
+    secrets: context.secrets,
+    resolveAdapter: siemAdapter
+  });
+
+  /**
+   * Infrastructure configuration, on the same provider-neutral mechanism as
+   * Runtime Security. The legacy block keeps an existing Prometheus setup
+   * working untouched: `securityCenter.prometheus.url` and the old bearer
+   * secret are read when no namespaced value exists, and never rewritten.
+   */
+  const observabilityConfiguration = createProviderConfigurationService({
+    configuration: {
+      get: (key, fallback) => vscode.workspace.getConfiguration('securityCenter').get(key, fallback),
+      update: (key, value) => vscode.workspace.getConfiguration('securityCenter')
+        .update(key, value, vscode.ConfigurationTarget.Workspace)
+    },
+    secrets: context.secrets,
+    resolveAdapter: observabilityAdapter,
+    domainLabel: 'observabilite',
+    keys: {
+      activeProvider: 'infrastructure.provider',
+      providersConfig: 'infrastructure.providers',
+      secretPrefix: 'securityCenter.observability'
+    },
+    legacy: {
+      provider: 'prometheus',
+      fields: { url: 'prometheus.url' },
+      secrets: { bearerToken: PROMETHEUS_BEARER_SECRET_KEY }
+    }
+  });
+
+  /** The provider being configured, which may differ from the active one. */
+  let observabilitySelectedProvider = '';
+  const observabilityFormProvider = () => observabilitySelectedProvider
+    || observabilityConfiguration.getActiveProviderId()
+    || DEFAULT_OBSERVABILITY_PROVIDER;
+
+  let observabilitySecretsConfigured = {};
+  async function refreshObservabilitySecretState() {
+    observabilitySecretsConfigured = await observabilityConfiguration.describeProviderSecrets(observabilityFormProvider());
+  }
+
+  function teamIntegrationStatus() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    return {
+      slackEnabled: Boolean(cfg.get('notifications.slack.enabled', false)),
+      jiraEnabled: Boolean(cfg.get('notifications.jira.enabled', false))
+    };
+  }
+
+  function publishEnterpriseContext() {
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      enterprise: {
+        delivery: deliveryStatus,
+        prometheus: prometheusStatus,
+        runtime: runtimeSecurityStatus
+      }
+    };
+    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+  }
+
+  function renderIntegrationsPage() {
+    if (!integrationsPanel) return;
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    integrationsPanel.webview.html = renderIntegrationPageHtml({
+      view: integrationsView,
+      openConfig: integrationsOpenConfig,
+      delivery: deliveryStatus,
+      prometheus: prometheusStatus,
+      runtime: {
+        ...runtimeSecurityStatus,
+        // Non-secret values for the form, read through the provider-neutral
+        // service so a legacy Wazuh workspace still resolves untouched. Secrets
+        // are described as booleans only — never their values.
+        values: siemConfiguration.getProviderConfig(runtimeFormProvider()),
+        secretsConfigured: runtimeSecretsConfigured,
+        // Which adapter the form should show. The provider being configured
+        // wins while choosing; otherwise the explicit active provider.
+        provider: runtimeFormProvider()
+      },
+      team: teamIntegrationStatus()
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme());
+    integrationsOpenConfig = '';
+  }
+
+  /** The provider the form is showing: the one being chosen, else the active one. */
+  function runtimeFormProvider() {
+    return runtimeSelectedProvider || siemConfiguration.getActiveProviderId() || DEFAULT_SIEM_PROVIDER;
+  }
+
+  // Which secrets exist for the provider on screen. Booleans only — refreshed
+  // when the page renders, never carried into the webview as values.
+  let runtimeSecretsConfigured = {};
+  async function refreshRuntimeSecretState() {
+    runtimeSecretsConfigured = await siemConfiguration.describeProviderSecrets(runtimeFormProvider());
+  }
+
+  function renderRuntimeSecurityPage() {
+    if (!runtimeSecurityPanel) return;
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    runtimeSecurityPanel.webview.html = renderRuntimeSecurityPageHtml({
+      runtime: {
+        ...runtimeSecurityStatus,
+        // Non-secret values for the form, read through the provider-neutral
+        // service so a legacy Wazuh workspace still resolves untouched. Secrets
+        // are described as booleans only — never their values.
+        values: siemConfiguration.getProviderConfig(runtimeFormProvider()),
+        secretsConfigured: runtimeSecretsConfigured,
+        // Which adapter the form should show. The provider being configured
+        // wins while choosing; otherwise the explicit active provider.
+        provider: runtimeFormProvider()
+      },
+      openConfig: runtimeOpenConfig,
+      actionState: runtimeActionState,
+      tab: runtimeTab,
+      alertsQuery: runtimeAlertsQuery,
+      vulnerabilities: runtimeVulnerabilities,
+      vulnerabilitiesQuery: runtimeVulnerabilitiesQuery,
+      capabilityEvidence: runtimeCapabilityEvidence
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(runtimeSecurityPanel.webview));
+  }
+
+  function renderInfrastructurePage() {
+    if (!infrastructurePanel) return;
+    infrastructurePanel.webview.html = renderInfrastructurePageHtml({
+      prometheus: {
+        ...prometheusStatus,
+        // Non-secret values for the form; secrets are described as booleans
+        // only — never their values.
+        values: observabilityConfiguration.getProviderConfig(observabilityFormProvider()),
+        secretsConfigured: observabilitySecretsConfigured,
+        provider: prometheusStatus.provider || observabilityFormProvider()
+      },
+      openConfig: infrastructureOpenConfig,
+      actionState: infrastructureActionState
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(infrastructurePanel.webview));
+  }
+
+  function integrationActionState(status, successLabel) {
+    const tone = ['healthy', 'online'].includes(String(status?.status || '').toLowerCase())
+      ? 'ok'
+      : ['degraded'].includes(String(status?.status || '').toLowerCase())
+        ? 'warn'
+        : 'bad';
+    const message = tone === 'ok'
+      ? successLabel
+      : status?.message || 'Connection test failed with the current provider response.';
+    return { tone, message };
+  }
+
+  async function refreshPrometheusStatus({ config = null } = {}) {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const active = await observabilityConfiguration.resolveActiveProvider();
+    const adapter = active.adapter || observabilityAdapter(DEFAULT_OBSERVABILITY_PROVIDER);
+    // A form submission is previewed with the values typed, without saving.
+    const publicConfig = { ...active.config };
+    const secretValues = { ...active.secrets };
+    for (const field of adapter?.configurationFields || []) {
+      const provided = config?.[field.id];
+      if (provided === undefined || provided === '') continue;
+      if (field.secret) secretValues[field.id] = String(provided);
+      else publicConfig[field.id] = typeof provided === 'boolean' ? provided : String(provided).trim();
+    }
+    prometheusStatus = adapter
+      ? await adapter.fetchStatus(publicConfig, secretValues, { timeoutMs: 8000, entity: infrastructureHost })
+      : buildPrometheusStatus({ configured: false });
+    publishEnterpriseContext();
+    renderIntegrationsPage();
+    renderInfrastructurePage();
+    return prometheusStatus;
+  }
+
+  /**
+   * Reads the ACTIVE provider through its own adapter.
+   *
+   * `config` is the unsaved form being tested, so « Test connection » exercises
+   * the real adapter with the values on screen without persisting them.
+   */
+  async function refreshRuntimeSecurityStatus({ config = null, providerId = '' } = {}) {
+    const active = await siemConfiguration.resolveActiveProvider();
+    const targetId = String(providerId || config?.provider || active.providerId || '').toLowerCase();
+    const adapter = targetId ? siemAdapter(targetId) : null;
+    if (!adapter) {
+      runtimeSecurityStatus = buildRuntimeSecurityStatus({ configured: false });
+    } else {
+      const stored = siemConfiguration.getProviderConfig(adapter.id);
+      const storedSecrets = await siemConfiguration.getProviderSecrets(adapter.id);
+      const publicConfig = { ...stored };
+      const secretValues = { ...storedSecrets };
+      for (const field of adapter.configurationFields) {
+        const provided = config?.[field.id];
+        if (provided === undefined || String(provided) === '') continue;
+        if (field.secret) secretValues[field.id] = String(provided);
+        else publicConfig[field.id] = String(provided).trim();
+      }
+      // A provider failure is a state, never an exception: Runtime Security
+      // degrades alone and nothing else in Security Center is affected.
+      try {
+        runtimeSecurityStatus = await adapter.fetchStatus(publicConfig, secretValues, { timeoutMs: 10000 });
+      } catch (error) {
+        runtimeSecurityStatus = buildRuntimeSecurityStatus({
+          provider: adapter.id, label: adapter.label, configured: true,
+          status: 'error', message: summarizeScannerError(error?.message || '')
+        });
+      }
+    }
+    publishEnterpriseContext();
+    renderIntegrationsPage();
+    renderRuntimeSecurityPage();
+    return runtimeSecurityStatus;
+  }
+
+  /**
+   * Refreshes the capabilities served by a secondary data source.
+   *
+   * Deliberately NOT part of `refreshRuntimeSecurityStatus`: sharing a failure
+   * boundary with the provider's main API is exactly how an unreachable
+   * secondary service would take the whole domain offline. Nothing in here can
+   * touch `runtimeSecurityStatus`, and the capability the probe reports on is
+   * the only one its outcome can change.
+   */
+  async function refreshRuntimeVulnerabilities() {
+    const active = await siemConfiguration.resolveActiveProvider();
+    const adapter = active.adapter;
+    if (!adapter || typeof adapter.fetchVulnerabilities !== 'function') {
+      runtimeVulnerabilities = null;
+      recordCapabilityEvidence(adapter, 'fetchVulnerabilities', '');
+      return null;
+    }
+    try {
+      // The adapter answers « not configured » without reaching the network,
+      // so a Manager-only installation never issues a request here.
+      const result = await adapter.fetchVulnerabilities(active.config, active.secrets, {
+        query: runtimeVulnerabilitiesQuery
+      });
+      runtimeVulnerabilities = result;
+      recordCapabilityEvidence(adapter, 'fetchVulnerabilities', result.ok ? 'ready' : result.state);
+      // One line per refresh, on the channel the extension already owns. It
+      // reports the OUTCOME and the SCHEMA the provider exposed — the resolved
+      // field paths — and never a URL, a credential or a document value.
+      scanLog.appendLine(result.ok
+        ? `Runtime vulnerabilities: ready · fields ${Object.entries(result.fieldMap || {}).map(([key, field]) => `${key}=${field.path}`).sort().join(', ') || 'none'}`
+        : `Runtime vulnerabilities: ${result.state}${result.code ? ` (${result.code})` : ''}`);
+    } catch (error) {
+      // A thrown adapter is still only a failure of ITS capability.
+      runtimeVulnerabilities = {
+        ok: false, state: 'error', items: [], summary: null,
+        message: 'Vulnerability data could not be read from the provider.'
+      };
+      recordCapabilityEvidence(adapter, 'fetchVulnerabilities', 'error');
+    }
+    return runtimeVulnerabilities;
+  }
+
+  /**
+   * Refreshes the alert-backed capabilities.
+   *
+   * Alert history is served by the provider's search backend rather than its
+   * management API, so it gets the same treatment as any other secondary
+   * source: its own call, its own try/catch, and an outcome that can only
+   * change the capabilities it actually backs. Nothing here may touch the
+   * connection status — a provider whose management API answered is online,
+   * whatever its search backend did.
+   */
+  async function refreshRuntimeAlerts() {
+    const active = await siemConfiguration.resolveActiveProvider();
+    const adapter = active.adapter;
+    if (!adapter || typeof adapter.fetchAlerts !== 'function') {
+      recordCapabilityEvidence(adapter, 'fetchAlerts', '');
+      return null;
+    }
+    let result;
+    try {
+      // Answers « not configured » without reaching the network, so a
+      // management-API-only installation never issues a request here.
+      result = await adapter.fetchAlerts(active.config, active.secrets, {});
+    } catch (error) {
+      result = { ok: false, state: 'error', alerts: [], message: 'Alert data could not be read from the provider.' };
+    }
+    const alerts = Array.isArray(result.alerts) ? result.alerts : [];
+    // Merged into the model the surfaces already read, so the alert list, the
+    // dashboard card and the MITRE view keep consuming one normalized shape.
+    runtimeSecurityStatus = {
+      ...runtimeSecurityStatus,
+      alerts,
+      alertSummary: summarizeRuntimeAlerts(alerts),
+      techniques: [...new Set(alerts.flatMap((alert) => alert.mitreTechniques || []))].sort()
+    };
+    // Which capabilities this outcome decides is the adapter's declaration —
+    // generic orchestration never assumes one capability follows another.
+    recordCapabilityEvidence(adapter, 'fetchAlerts', result.ok ? 'ready' : result.state);
+    runtimeAlertsState = result;
+    return result;
+  }
+
+  async function refreshEnterpriseIntegrations() {
+    await Promise.all([
+      refreshDeliveryStatus().catch(() => deliveryStatus),
+      refreshPrometheusStatus().catch(() => prometheusStatus),
+      refreshRuntimeSecurityStatus().catch(() => runtimeSecurityStatus)
+    ]);
+    publishEnterpriseContext();
+    renderIntegrationsPage();
+    renderRuntimeSecurityPage();
+    renderInfrastructurePage();
+  }
+
+  async function applyPrometheusConfiguration({ provider = DEFAULT_OBSERVABILITY_PROVIDER, ...values } = {}) {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    // Same boundary as the SIEM domain: the webview offers only implemented
+    // adapters, but the decision that a provider is usable belongs on this side.
+    const requested = String(provider || DEFAULT_OBSERVABILITY_PROVIDER).toLowerCase();
+    if (!isSupportedObservabilityProvider(requested)) {
+      const known = observabilityProvider(requested);
+      return {
+        ok: false,
+        message: known
+          ? `L'adaptateur ${known.label} n'est pas encore disponible.`
+          : `Fournisseur d'observabilité inconnu : ${requested}.`
+      };
+    }
+    // Schema-driven: validation, namespaced settings and SecretStorage are the
+    // provider-neutral service's job, exactly as for Runtime Security.
+    const saved = await observabilityConfiguration.saveProviderConfiguration(requested, values);
+    if (!saved.ok) return { ok: false, message: (saved.errors || []).join(' ') };
+    observabilitySelectedProvider = '';
+    await refreshObservabilitySecretState();
+    await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
+      comment: 'Intégration observabilité configurée.',
+      metadata: { integration: requested, configured: true }
+    }).catch(() => {});
+    return { ok: true, url: saved.config?.url || '' };
+  }
+
+  /**
+   * Saves a SIEM provider, then activates it — never the other way round.
+   *
+   * Validation, persistence and activation are ordered so a rejected
+   * configuration can never leave Runtime Security pointing at it. Other
+   * providers' saved configuration is untouched, which is what makes switching
+   * back free of re-entry.
+   */
+  async function applyWazuhConfiguration({ provider = DEFAULT_SIEM_PROVIDER, ...values } = {}) {
+    const requested = String(provider || DEFAULT_SIEM_PROVIDER).toLowerCase();
+    if (!isSupportedSiemProvider(requested)) {
+      const known = siemProvider(requested);
+      return { ok: false, message: known
+        ? `L'adaptateur ${known.label} n'est pas encore disponible.`
+        : `Fournisseur SIEM inconnu : ${requested}.` };
+    }
+    const saved = await siemConfiguration.saveProviderConfiguration(requested, values);
+    if (!saved.ok) return { ok: false, message: saved.errors.join(' ') };
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
+      comment: `Fournisseur Runtime Security configuré : ${siemProvider(requested)?.label || requested}.`,
+      metadata: { integration: requested, credentialsStored: true }
+    }).catch(() => {});
+    return { ok: true, providerId: requested };
+  }
+
+  /** Clears the active provider. Stored configuration and secrets are kept. */
+  async function disconnectRuntimeSecurity() {
+    await siemConfiguration.disconnect();
+    runtimeSecurityStatus = buildRuntimeSecurityStatus({ configured: false });
+    publishEnterpriseContext();
+    renderIntegrationsPage();
+    renderRuntimeSecurityPage();
+    return { ok: true };
+  }
+
+  /**
+   * Disconnect, confirmed by the user and named after the provider actually
+   * connected — never after Wazuh, which is only one adapter among several.
+   *
+   * The wording states what is kept, because that is the part a user cannot
+   * verify from the dialog: disconnecting unplugs the source, it does not throw
+   * away an endpoint and a credential the user would then have to retype.
+   */
+  async function confirmDisconnectRuntimeSecurity() {
+    const activeId = siemConfiguration.getActiveProviderId();
+    if (!activeId) return { ok: false, reason: 'not-configured' };
+    const label = siemProvider(activeId)?.label || activeId;
+    const confirmation = await vscode.window.showWarningMessage(
+      `Déconnecter ${label} de Runtime Security ?`,
+      {
+        modal: true,
+        detail: `Security Center cessera d'utiliser ${label} comme fournisseur Runtime Security actif. La configuration enregistrée et les identifiants sont conservés pour pouvoir vous reconnecter plus tard.`
+      },
+      'Déconnecter'
+    );
+    if (confirmation !== 'Déconnecter') return { ok: false, reason: 'cancelled' };
+    await disconnectRuntimeSecurity();
+    runtimeActionState = { tone: 'muted', message: `${label} disconnected. Saved configuration and credentials were kept.` };
+    renderRuntimeSecurityPage();
+    // Même vocabulaire d'audit que la configuration : aucun nouvel événement,
+    // et jamais d'identifiant dans les métadonnées.
+    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+      scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
+      comment: `Fournisseur Runtime Security déconnecté : ${label}.`,
+      metadata: { integration: activeId, disconnected: true, configurationRetained: true }
+    }).catch(() => {});
+    return { ok: true, providerId: activeId };
+  }
+
+  async function configureSlackIntegration() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const webhook = await vscode.window.showInputBox({ title: 'Webhook entrant Slack', password: true, prompt: 'URL HTTPS fournie par Slack. Elle sera stockée dans SecretStorage.' });
+    if (!webhook) return;
+    await context.secrets.store('securityCenter.slackWebhook', webhook.trim());
+    await cfg.update('notifications.slack.enabled', true, vscode.ConfigurationTarget.Workspace);
+    renderIntegrationsPage();
+    vscode.window.showInformationMessage('Security Center : notifications Slack activées pour ce workspace.');
+  }
+
+  async function configureJiraIntegration() {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const baseUrl = await vscode.window.showInputBox({ title: 'URL Jira Cloud', prompt: 'Exemple : https://entreprise.atlassian.net' });
+    if (!baseUrl) return;
+    const email = await vscode.window.showInputBox({ title: 'Adresse du compte Jira' });
+    if (!email) return;
+    const projectKey = await vscode.window.showInputBox({ title: 'Clé du projet Jira', prompt: 'Exemple : SEC' });
+    if (!projectKey) return;
+    const token = await vscode.window.showInputBox({ title: 'Jeton API Jira', password: true, prompt: 'Stocké uniquement dans SecretStorage.' });
+    if (!token) return;
+    await context.secrets.store('securityCenter.jiraToken', token.trim());
+    await cfg.update('notifications.jira.baseUrl', baseUrl.trim(), vscode.ConfigurationTarget.Workspace);
+    await cfg.update('notifications.jira.email', email.trim(), vscode.ConfigurationTarget.Workspace);
+    await cfg.update('notifications.jira.projectKey', projectKey.trim(), vscode.ConfigurationTarget.Workspace);
+    await cfg.update('notifications.jira.enabled', true, vscode.ConfigurationTarget.Workspace);
+    renderIntegrationsPage();
+    vscode.window.showInformationMessage('Security Center : création de tickets Jira activée pour ce workspace.');
+  }
+
+  async function openIntegrationsPage({ view = 'overview' } = {}) {
+    integrationsView = view;
+    if (!integrationsPanel) {
+      integrationsPanel = vscode.window.createWebviewPanel('securityCenter.integrations', 'Security Center — Integrations', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
+      integrationsPanel.onDidDispose(() => { integrationsPanel = undefined; });
+      integrationsPanel.webview.onDidReceiveMessage(async (message) => {
+        if (message?.type === 'command') {
+          if (await handleShellNavMessage(message)) return;
+          const allowed = new Set(['securityCenter.openSecurityDelivery', 'securityCenter.configureJenkins']);
+          if (allowed.has(message.command)) await vscode.commands.executeCommand(message.command);
+          return;
+        }
+        if (message?.type !== 'action') return;
+        if (message.action === 'refresh') return void await refreshEnterpriseIntegrations();
+        if (message.action === 'showOverview') { integrationsView = 'overview'; renderIntegrationsPage(); return; }
+        if (message.action === 'viewPrometheus') { integrationsView = 'prometheus'; renderIntegrationsPage(); return; }
+        if (message.action === 'viewRuntime') { integrationsView = 'runtime'; renderIntegrationsPage(); return; }
+        if (message.action === 'testPrometheus') return void await refreshPrometheusStatus();
+        if (message.action === 'testWazuh') return void await refreshRuntimeSecurityStatus();
+        if (message.action === 'testPrometheusConfig') return void await refreshPrometheusStatus({ config: message.config || {} });
+        if (message.action === 'testWazuhConfig') return void await refreshRuntimeSecurityStatus({ config: message.config || {} });
+        if (message.action === 'savePrometheusConfig') {
+          const saved = await applyPrometheusConfiguration(message.config || {});
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          vscode.window.showInformationMessage('Security Center : Prometheus configuré.');
+          return void await refreshPrometheusStatus();
+        }
+        if (message.action === 'saveWazuhConfig') {
+          const saved = await applyWazuhConfiguration(message.config || {});
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          vscode.window.showInformationMessage('Security Center : Wazuh configuré.');
+          return void await refreshRuntimeSecurityStatus();
+        }
+        if (message.action === 'configureSlack') return void await configureSlackIntegration();
+        if (message.action === 'configureJira') return void await configureJiraIntegration();
+      });
+    } else integrationsPanel.reveal(vscode.ViewColumn.Active);
+    renderIntegrationsPage();
+    await refreshEnterpriseIntegrations();
+  }
+
+  async function openRuntimeSecurityPage({ configure = false } = {}) {
+    await refreshRuntimeSecretState();
+    runtimeOpenConfig = Boolean(configure);
+    if (!runtimeSecurityPanel) {
+      runtimeSecurityPanel = vscode.window.createWebviewPanel('securityCenter.runtimeSecurity', 'Security Center — Runtime Security', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
+      runtimeSecurityPanel.onDidDispose(() => { runtimeSecurityPanel = undefined; });
+      runtimeSecurityPanel.webview.onDidReceiveMessage(async (message) => {
+        if (message?.type === 'command') {
+          if (await handleShellNavMessage(message)) return;
+          return;
+        }
+        // Navigation locale : meme contrat de message que la page Pipeline. La
+        // section demandee est validee au rendu, contre les capacites resolues.
+        if (message?.type === 'tab') {
+          runtimeTab = String(message.tab || 'overview');
+          // Changer de section ferme l'investigation en cours : revenir sur
+          // Alerts doit montrer la liste, pas la derniere alerte ouverte.
+          runtimeAlertsQuery = { ...runtimeAlertsQuery, alert: '' };
+          renderRuntimeSecurityPage();
+          return;
+        }
+        // Recherche, filtres, pagination et ouverture d'une alerte : une seule
+        // requete, toujours complete, validee au rendu.
+        // Vulnerabilities are paged and filtered by the provider, so a query
+        // change is a refetch rather than a re-render.
+        if (message?.type === 'vulns') {
+          const query = message.query || {};
+          runtimeVulnerabilitiesQuery = {
+            search: String(query.search || ''),
+            severity: String(query.severity || ''),
+            asset: String(query.asset || ''),
+            cve: String(query.cve || ''),
+            package: String(query.package || ''),
+            page: Number(query.page) || 1,
+            vulnerability: String(query.vulnerability || '')
+          };
+          await refreshRuntimeVulnerabilities();
+          renderRuntimeSecurityPage();
+          return;
+        }
+        if (message?.type === 'alerts') {
+          const query = message.query || {};
+          runtimeAlertsQuery = {
+            search: String(query.search || ''),
+            severity: String(query.severity || ''),
+            agent: String(query.agent || ''),
+            rule: String(query.rule || ''),
+            page: Number(query.page) || 1,
+            alert: String(query.alert || '')
+          };
+          renderRuntimeSecurityPage();
+          return;
+        }
+        if (message?.type !== 'action') return;
+        if (message.action === 'openIntegrations') return void await openIntegrationsPage();
+        // Choisir un fournisseur ne configure rien : cela recharge seulement le
+        // formulaire avec le schema de ce fournisseur.
+        if (message.action === 'selectRuntimeProvider') {
+          const requested = String(message.config?.provider || '').toLowerCase();
+          if (siemProvider(requested)) {
+            runtimeSelectedProvider = requested;
+            runtimeOpenConfig = true;
+            runtimeActionState = null;
+            await refreshRuntimeSecretState();
+            renderRuntimeSecurityPage();
+          }
+          return;
+        }
+        if (message.action === 'disconnectRuntime') return void await confirmDisconnectRuntimeSecurity();
+        if (message.action === 'refreshRuntime') {
+          runtimeActionState = { tone: 'muted', message: 'Testing connection...' };
+          renderRuntimeSecurityPage();
+          await refreshRuntimeSecurityStatus();
+          // Separate awaits, separate outcomes: a failing secondary source
+          // leaves the connection state above exactly as the provider reported it.
+          await refreshRuntimeAlerts();
+          await refreshRuntimeVulnerabilities();
+          runtimeActionState = integrationActionState(runtimeSecurityStatus, 'Connection successful');
+          renderRuntimeSecurityPage();
+          return;
+        }
+        if (message.action === 'testRuntimeConfig') {
+          runtimeActionState = { tone: 'muted', message: 'Testing connection...' };
+          renderRuntimeSecurityPage();
+          await refreshRuntimeSecurityStatus({ config: message.config || {} });
+          runtimeActionState = integrationActionState(runtimeSecurityStatus, 'Connection successful');
+          runtimeOpenConfig = true;
+          renderRuntimeSecurityPage();
+          return;
+        }
+        if (message.action === 'saveRuntimeConfig') {
+          const saved = await applyWazuhConfiguration(message.config || {});
+          if (!saved.ok) {
+            runtimeActionState = { tone: 'bad', message: saved.message };
+            renderRuntimeSecurityPage();
+            return;
+          }
+          runtimeOpenConfig = false;
+          runtimeSelectedProvider = '';
+          await refreshRuntimeSecretState();
+          runtimeActionState = { tone: 'muted', message: 'Testing connection...' };
+          renderRuntimeSecurityPage();
+          await refreshRuntimeSecurityStatus();
+          runtimeActionState = integrationActionState(runtimeSecurityStatus, 'Configuration saved. Connection state refreshed.');
+          renderRuntimeSecurityPage();
+        }
+      });
+    } else runtimeSecurityPanel.reveal(vscode.ViewColumn.Active);
+    renderRuntimeSecurityPage();
+    if (!configure) {
+      await refreshRuntimeSecurityStatus().catch(() => runtimeSecurityStatus);
+      await refreshRuntimeAlerts().catch(() => runtimeAlertsState);
+      await refreshRuntimeVulnerabilities().catch(() => runtimeVulnerabilities);
+      renderRuntimeSecurityPage();
+    }
+  }
+
+  async function openInfrastructurePage({ configure = false } = {}) {
+    await refreshObservabilitySecretState();
+    infrastructureOpenConfig = Boolean(configure);
+    if (!infrastructurePanel) {
+      infrastructurePanel = vscode.window.createWebviewPanel('securityCenter.infrastructure', 'Security Center — Infrastructure', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
+      infrastructurePanel.onDidDispose(() => { infrastructurePanel = undefined; });
+      infrastructurePanel.webview.onDidReceiveMessage(async (message) => {
+        if (message?.type === 'command') {
+          if (await handleShellNavMessage(message)) return;
+          return;
+        }
+        if (message?.type !== 'action') return;
+        if (message.action === 'openIntegrations') return void await openIntegrationsPage();
+        // Choosing a host is a read, not a configuration change: nothing is
+        // persisted and no credential is touched.
+        // Choisir un fournisseur ne configure rien : cela recharge seulement le
+        // formulaire avec le schema de ce fournisseur.
+        if (message.action === 'selectObservabilityProvider') {
+          const requested = String(message.config?.provider || '').toLowerCase();
+          if (observabilityProvider(requested)) {
+            observabilitySelectedProvider = requested;
+            infrastructureOpenConfig = true;
+            infrastructureActionState = null;
+            await refreshObservabilitySecretState();
+            renderInfrastructurePage();
+          }
+          return;
+        }
+        if (message.action === 'selectInfrastructureHost') {
+          infrastructureHost = String(message.config?.host || '');
+          await refreshPrometheusStatus();
+          renderInfrastructurePage();
+          return;
+        }
+        if (message.action === 'refreshInfrastructure') {
+          infrastructureActionState = { tone: 'muted', message: 'Testing connection...' };
+          renderInfrastructurePage();
+          await refreshPrometheusStatus();
+          infrastructureActionState = integrationActionState(prometheusStatus, 'Connection successful');
+          renderInfrastructurePage();
+          return;
+        }
+        if (message.action === 'testInfrastructureConfig') {
+          infrastructureActionState = { tone: 'muted', message: 'Testing connection...' };
+          renderInfrastructurePage();
+          await refreshPrometheusStatus({ config: message.config || {} });
+          infrastructureActionState = integrationActionState(prometheusStatus, 'Connection successful');
+          infrastructureOpenConfig = true;
+          renderInfrastructurePage();
+          return;
+        }
+        if (message.action === 'saveInfrastructureConfig') {
+          const saved = await applyPrometheusConfiguration(message.config || {});
+          if (!saved.ok) {
+            infrastructureActionState = { tone: 'bad', message: saved.message };
+            renderInfrastructurePage();
+            return;
+          }
+          infrastructureOpenConfig = false;
+          infrastructureActionState = { tone: 'muted', message: 'Testing connection...' };
+          renderInfrastructurePage();
+          await refreshPrometheusStatus();
+          infrastructureActionState = integrationActionState(prometheusStatus, 'Configuration saved. Connection state refreshed.');
+          renderInfrastructurePage();
+        }
+      });
+    } else infrastructurePanel.reveal(vscode.ViewColumn.Active);
+    renderInfrastructurePage();
+    if (!configure) await refreshPrometheusStatus().catch(() => prometheusStatus);
+  }
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureSiem', async () => openRuntimeSecurityPage({ configure: true })));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureWazuh', async () => openRuntimeSecurityPage({ configure: true })));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openRuntimeSecurity', async () => openRuntimeSecurityPage()));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureObservability', async () => openInfrastructurePage({ configure: true })));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configurePrometheus', async () => openInfrastructurePage({ configure: true })));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openInfrastructure', async () => openInfrastructurePage()));
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openPrometheusMetrics', async () => openInfrastructurePage()));
+  publishEnterpriseContext();
+  refreshEnterpriseIntegrations().catch(() => publishEnterpriseContext());
+
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openScannerDetails', (scannerName) => {
     dashboardProvider.openScannerDetails(scannerName);
   }));
@@ -2859,49 +4076,62 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showTrends', async () => {
+    const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+    // Le panneau est cree AVANT l'appel au backend. Auparavant il etait cree
+    // apres, a l'interieur du `try` : un backend injoignable faisait echouer
+    // l'await, et la page ne s'ouvrait jamais — seule une notification
+    // apparaissait. La page s'ouvre desormais toujours et montre l'erreur reelle.
+    const panel = vscode.window.createWebviewPanel('securityCenter.trends', 'Security Center — Tendances et MTTR', vscode.ViewColumn.Active, { enableScripts: true });
+    const nonce = crypto.randomBytes(16).toString('base64');
+    let reports = { 7: buildTrendReport([], [], 7), 30: buildTrendReport([], [], 30), 90: buildTrendReport([], [], 90) };
+    let backendError = '';
     try {
-      const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
       const summaries = await listScans(baseUrl, 100);
       const [scans, events] = await Promise.all([
         Promise.all(summaries.map((scan) => getScan(baseUrl, scan.scan_id))),
         listAuditEvents(baseUrl, 1000)
       ]);
-      const report7 = buildTrendReport(scans, events, 7);
-      const report30 = buildTrendReport(scans, events, 30);
-      const report90 = buildTrendReport(scans, events, 90);
-      const reports = { 7: report7, 30: report30, 90: report90 };
-      const panel = vscode.window.createWebviewPanel('securityCenter.trends', 'Security Center — Tendances et MTTR', vscode.ViewColumn.Active, { enableScripts: true });
-      const nonce = crypto.randomBytes(16).toString('base64');
-      const renderTrends = () => { panel.webview.html = renderTrendReportHtml(reports, nonce, themeController.getTheme()); };
-      renderTrends();
-      const trendThemeSubscription = themeController.onDidChange(renderTrends);
-      panel.onDidDispose(() => trendThemeSubscription.dispose());
-      panel.webview.onDidReceiveMessage(async (message) => {
-        if (message?.command === 'openDashboard') await vscode.commands.executeCommand('securityCenter.openDashboard');
-      });
+      // Calculs de tendance et de MTTR inchanges : memes entrees, meme fonction.
+      reports = { 7: buildTrendReport(scans, events, 7), 30: buildTrendReport(scans, events, 30), 90: buildTrendReport(scans, events, 90) };
     } catch (error) {
-      vscode.window.showErrorMessage(`Security Center : tendances indisponibles — ${error.message}`);
+      backendError = error.message;
     }
+    const renderTrends = () => { panel.webview.html = renderTrendReportHtml(reports, nonce, themeController.getTheme(), backendError); };
+    renderTrends();
+    const trendThemeSubscription = themeController.onDidChange(renderTrends);
+    panel.onDidDispose(() => trendThemeSubscription.dispose());
+    panel.webview.onDidReceiveMessage(async (message) => {
+      if (await handleShellNavMessage(message)) return;
+      if (message?.command === 'openDashboard') await vscode.commands.executeCommand('securityCenter.openDashboard');
+    });
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showAuditLog', async () => {
+    const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+    // Meme correction que pour les tendances : le panneau naissait apres l'await
+    // et disparaissait donc entierement quand le backend etait injoignable.
+    const panel = vscode.window.createWebviewPanel('securityCenter.auditLog', 'Security Center — Journal d’audit', vscode.ViewColumn.Active, { enableScripts: true });
+    const theme = themeController.getTheme ? themeController.getTheme() : 'light';
+    let events = [];
+    let backendError = '';
     try {
-      const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
-      const events = await listAuditEvents(baseUrl, 500);
-      const panel = vscode.window.createWebviewPanel('securityCenter.auditLog', 'Security Center — Journal d’audit', vscode.ViewColumn.Active, { enableScripts: true });
-      const theme = themeController.getTheme ? themeController.getTheme() : 'light';
-      panel.webview.html = renderAuditLogHtml(events, crypto.randomBytes(16).toString('base64'), theme);
-      
-      // Keep theme synchronized dynamically
-      const themeSubscription = themeController?.onDidChange((updatedTheme) => {
-        panel.webview.postMessage({ command: 'setTheme', theme: updatedTheme });
-      });
-      panel.onDidDispose(() => {
-        themeSubscription?.dispose();
-      });
+      // Lecture du journal inchangee : meme appel, meme limite, meme source.
+      events = await listAuditEvents(baseUrl, 500);
     } catch (error) {
-      vscode.window.showErrorMessage(`Security Center : journal d’audit indisponible — ${error.message}`);
+      backendError = error.message;
     }
+    panel.webview.html = renderAuditLogHtml(events, crypto.randomBytes(16).toString('base64'), theme, backendError);
+    // Le journal est rendu dans le cadre applicatif : le rail y demande des
+    // commandes deja enregistrees, rien de plus.
+    panel.webview.onDidReceiveMessage(async (message) => { await handleShellNavMessage(message); });
+
+    // Keep theme synchronized dynamically
+    const themeSubscription = themeController?.onDidChange((updatedTheme) => {
+      panel.webview.postMessage({ command: 'setTheme', theme: updatedTheme });
+    });
+    panel.onDidDispose(() => {
+      themeSubscription?.dispose();
+    });
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openProjectPolicy', async () => {
@@ -3006,8 +4236,17 @@ async function activate(context) {
         const projectPolicy = await loadProjectPolicy(folder.uri.fsPath);
         const deniedLicenses = projectPolicy?.licensesDenied?.length ? projectPolicy.licensesDenied : cfg.get('licenses.denied', []);
         const report = analyzeLicenses(result.payload, deniedLicenses);
-        const panel = vscode.window.createWebviewPanel('securityCenter.licenseCompliance', 'Security Center — Conformité des licences', vscode.ViewColumn.Active, { enableScripts: false });
-        panel.webview.html = renderLicenseReportHtml(report, crypto.randomBytes(16).toString('base64'));
+        // Les scripts restent DESACTIVES : ce rapport n'en a aucun besoin. Pour
+        // obtenir la navigation partagee sans les activer, le rail est rendu en
+        // URI de commande et l'hote n'en autorise QUE celles qu'il affiche —
+        // une capacite bien plus etroite que l'execution de script arbitraire.
+        const panel = vscode.window.createWebviewPanel('securityCenter.licenseCompliance', 'Security Center — Conformité des licences', vscode.ViewColumn.Active, { enableScripts: false, enableCommandUris: navCommands() });
+        const renderLicenses = () => { panel.webview.html = renderLicenseReportHtml(report, crypto.randomBytes(16).toString('base64'), themeController.getTheme()); };
+        renderLicenses();
+        // Sans script, la page ne peut pas recevoir `setTheme` : c'est l'extension
+        // qui la redessine, comme elle le fait deja pour la configuration des scanners.
+        const licenseThemeSubscription = themeController.onDidChange(renderLicenses);
+        panel.onDidDispose(() => licenseThemeSubscription.dispose());
         if (!report.compliant) vscode.window.showWarningMessage(`Security Center : ${report.counts.denied} composant(s) utilisent une licence interdite.`);
       });
     } catch (error) {
@@ -3018,18 +4257,42 @@ async function activate(context) {
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.compareScans', async () => {
     try {
       const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
-      const summaries = await listScans(baseUrl, 100);
-      if (!summaries || summaries.length === 0) {
-        return vscode.window.showInformationMessage('Security Center : aucun scan disponible pour comparer.');
+      // A comparison needs a baseline and a current: two scans, or nothing to do.
+      const MINIMUM_COMPARABLE_SCANS = 2;
+      // The backend stays the preferred source and is read exactly as before.
+      // Its unavailability becomes a state instead of ending the command — the
+      // same thing the Scan History page already does with `backendError`.
+      let summaries = [];
+      let backendError = '';
+      try {
+        summaries = await listScans(baseUrl, 100) || [];
+      } catch (error) {
+        backendError = error.message;
       }
-      
-      const scans = await Promise.all(summaries.map(async (scan) => {
+      let scans = summaries.length ? await Promise.all(summaries.map(async (scan) => {
         try {
           return await getScan(baseUrl, scan.scan_id);
         } catch {
           return { scan_id: scan.scan_id, finished_at: scan.finished_at, workspace: scan.workspace, result: { findings: [], scanners: [] } };
         }
-      }));
+      })) : [];
+      // Fallback, never a merge: Security Center already persisted these scans
+      // locally, so an offline backend must not read as « no scan has ever run ».
+      // The local saves are presented in the shape the comparison already reads;
+      // no finding, no scanner status and no persisted entry is modified.
+      if (scans.length < MINIMUM_COMPARABLE_SCANS) {
+        const localScans = comparableLocalScans(context.workspaceState.get(LOCAL_SCAN_HISTORY_KEY, []));
+        if (localScans.length >= MINIMUM_COMPARABLE_SCANS) {
+          scans = localScans;
+          scanLog.appendLine(`Comparaison des scans — historique local utilisé (${localScans.length} scan(s)).${backendError ? ` Backend indisponible : ${backendError}` : ''}`);
+        }
+      }
+      if (scans.length < MINIMUM_COMPARABLE_SCANS) {
+        // Neither source can supply a comparison. A real backend failure is named
+        // rather than hidden behind « aucun scan ».
+        if (backendError) throw new Error(backendError);
+        return vscode.window.showInformationMessage('Security Center : aucun scan disponible pour comparer.');
+      }
 
       // Prune scans array for list display to avoid HTML breakage / massive payloads
       const prunedScans = scans.map(s => {
@@ -3073,6 +4336,7 @@ async function activate(context) {
 
       panel.webview.onDidReceiveMessage(async (message) => {
         if (!message) return;
+        if (await handleShellNavMessage(message)) return;
         switch (message.command) {
           case 'compare': {
             const { baselineId, currentId } = message;
@@ -3156,6 +4420,7 @@ async function activate(context) {
     const historyThemeSubscription = themeController.onDidChange(renderHistory);
     panel.onDidDispose(() => historyThemeSubscription.dispose());
     panel.webview.onDidReceiveMessage(async (message) => {
+      if (await handleShellNavMessage(message)) return;
       if (message?.command === 'openDashboard') {
         await vscode.commands.executeCommand('securityCenter.openDashboard');
         return;
@@ -3741,6 +5006,9 @@ async function activate(context) {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) return vscode.window.showWarningMessage('Ouvrez un dossier avant de lancer un scan.');
     if (scanInProgress) return vscode.window.showInformationMessage('Security Center : une analyse est déjà en cours.');
+    const scanRequest = Array.isArray(requestedTools) ? { tools: requestedTools } : (requestedTools || {});
+    const requested = Array.isArray(scanRequest.tools) ? new Set(scanRequest.tools) : undefined;
+    const incrementalFiles = Array.isArray(scanRequest.incrementalFiles) ? scanRequest.incrementalFiles : [];
     let projectPolicy;
     try {
       projectPolicy = await loadProjectPolicy(folder.uri.fsPath);
@@ -3773,22 +5041,37 @@ async function activate(context) {
     } catch (error) {
       return vscode.window.showErrorMessage(`Security Center : politique projet invalide — ${error.message}`);
     }
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const zapPreflightRequired = zapRequestedForScan(cfg, projectPolicy, requested);
+    let preflightZapMode = zapModeFromPolicy(projectPolicy);
+    let zapAuthorizedByPreflight = scanRequest.zapAuthorized === true;
+    if (zapPreflightRequired && preflightZapMode !== 'baseline' && !zapAuthorizedByPreflight) {
+      const decision = await resolveZapActiveScanConsent({
+        window: vscode.window,
+        dashboardProvider,
+        mode: preflightZapMode,
+        target: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')
+      });
+      if (decision.cancelled) {
+        scanLog.appendLine('ZAP — préflight annulé par l’utilisateur ; analyse non démarrée.');
+        return vscode.window.showInformationMessage('Security Center : analyse annulée avant démarrage.');
+      }
+      preflightZapMode = decision.mode || preflightZapMode;
+      zapAuthorizedByPreflight = Boolean(decision.authorized);
+      if (decision.passiveFallback) scanLog.appendLine('ZAP — scan offensif refusé, exécution passive baseline à la place.');
+    }
     scanInProgress = true;
     // The companion mirrors the scan lifecycle without polling anything.
     currentScanRunning = true;
     liveCompanionProvider.render();
     const previousFindings = [...currentFindings];
     const previousScanId = currentScanId;
-    const scanRequest = Array.isArray(requestedTools) ? { tools: requestedTools } : (requestedTools || {});
-    const requested = Array.isArray(scanRequest.tools) ? new Set(scanRequest.tools) : undefined;
-    const incrementalFiles = Array.isArray(scanRequest.incrementalFiles) ? scanRequest.incrementalFiles : [];
     const retainedFindings = requested
       ? incrementalFiles.length
         ? retainUnchangedFindings(currentFindings, [...requested], incrementalFiles)
         : currentFindings.filter((finding) => !requested.has(finding.tool))
       : [];
     const analysisPath = scanRequest.scanRoot || folder.uri.fsPath;
-    const cfg = vscode.workspace.getConfiguration('securityCenter');
     let activeExecution = null;
     dashboardProvider.setData(currentFindings, currentScanStatuses, { ...currentDashboardOptions, workspace: folder.name, scanStatus: 'running', backendStatus: 'checking', previousResultsVisible: true, snapshotAvailable: currentFindings.length > 0 });
     try {
@@ -3907,30 +5190,19 @@ async function activate(context) {
             normalize: normalizeSnykOutput
           });
         }
-        const zapRequested = cfg.get('zap.enabled', true)
-          && (!requested || requested.has('ZAP'))
-          && projectPolicy?.scanners?.ZAP !== false;
-        let zapMode = projectPolicy?.zapOpenapi ? 'openapi' : projectPolicy?.zapActive ? 'active' : 'baseline';
-        if (zapRequested && zapMode !== 'baseline') {
-          const authorized = scanRequest.zapAuthorized === true || await dashboardProvider.requestZapAuthorization({
-            mode: zapMode,
-            target: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')
-          });
-          if (!authorized) {
-            zapMode = 'baseline';
-            scanLog.appendLine('ZAP — scan offensif refusé, exécution passive baseline à la place.');
-          } else {
-            const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-            const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
-            await createAuditEvent(backendBaseUrl, {
-              scan_id: currentScanId || 0,
-              finding_id: `zap:${cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')}`,
-              action: `zap:${zapMode}:authorized`,
-              actor,
-              comment: 'Autorisation locale confirmée dans Security Center.'
-            }).catch((error) => scanLog.appendLine(`ZAP — audit local indisponible : ${error.message}`));
-            scanLog.appendLine(`ZAP — autorisation locale confirmée pour ${actor}, sans justification textuelle.`);
-          }
+        const zapRequested = zapPreflightRequired;
+        let zapMode = preflightZapMode;
+        if (zapRequested && zapMode !== 'baseline' && zapAuthorizedByPreflight) {
+          const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
+          const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
+          await createAuditEvent(backendBaseUrl, {
+            scan_id: currentScanId || 0,
+            finding_id: `zap:${cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')}`,
+            action: `zap:${zapMode}:authorized`,
+            actor,
+            comment: 'Autorisation locale confirmée dans Security Center.'
+          }).catch((error) => scanLog.appendLine(`ZAP — audit local indisponible : ${error.message}`));
+          scanLog.appendLine(`ZAP — autorisation locale confirmée pour ${actor}, sans justification textuelle.`);
         }
         let zapAuthEnv = process.env;
         if (zapRequested && projectPolicy?.zapAuth?.login
@@ -4028,6 +5300,7 @@ async function activate(context) {
             backendStatus: 'checking',
             snapshotAvailable: Object.keys(currentSecuritySnapshot.resultSets || {}).length > 0,
             activeExecution,
+            currentRunFindings: projection.currentRunFindings || [],
             executionType: activeExecution.type,
             ...extra
           });
@@ -4099,7 +5372,12 @@ async function activate(context) {
                 findingIds: scanFindings.map((finding) => finding.id)
               });
             }
-            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'completed', { details, durationMs });
+            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'completed', {
+              details,
+              durationMs,
+              findings: scanFindings,
+              completedAt: new Date().toISOString()
+            });
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — terminé en ${Math.round(durationMs / 1000)} s (${scanFindings.length} résultat(s))`);
 
             await createAuditEvent(backendBaseUrl, {
@@ -4204,7 +5482,11 @@ async function activate(context) {
         currentScanStatuses = completedProjection.scanners;
         const consolidatedCorrelated = correlateFindings(currentFindings);
         currentFindings = consolidatedCorrelated.findings;
+        // Still computed: the backend scan record and the CLI keep the legacy
+        // contract. It simply no longer decides what any surface displays.
         const consolidatedPolicyResult = evaluatePolicy(currentFindings, projectPolicy);
+        // Filled from the Policy Gate once Security Intelligence has produced it.
+        let authoritativePolicyResult = null;
         // Security intelligence runs on the consolidated result, through the
         // very same services the headless CLI calls. The verdicts are merged
         // back onto the findings so the tree, the dashboard and the details
@@ -4214,9 +5496,20 @@ async function activate(context) {
           progress.report({ message: 'Corrélation et priorisation' });
           const analysis = await analyzeWorkspace({
             workspacePath: folder.uri.fsPath, findings: currentFindings,
-            policy: projectPolicy, signal: abortController.signal
+            policy: projectPolicy, signal: abortController.signal,
+            // The artefacts that already exist, exactly as the manual
+            // re-evaluation reads them. Nothing is generated here: this scan does
+            // not run the supply-chain stages, it only lets the gate judge
+            // `require_sbom` / `require_provenance` / `require_signature` on the
+            // real current state instead of reporting « étape non exécutée » for
+            // an artefact that is sitting on disk. An empty state stays `null`,
+            // which is what keeps « non évaluée » distinct from « absente ».
+            artifacts: Object.keys(currentPipelineArtifacts || {}).length ? currentPipelineArtifacts : null
           });
           currentFindings = mergeIntelligence(currentFindings, analysis);
+          // The verdict the Pipeline page will show, projected for the banner and
+          // the notification. Same object, no second evaluation.
+          authoritativePolicyResult = policyResultFromGate(analysis.policy, projectPolicy);
           currentPipelineResult = buildPipelineResult({
             scanId: String(currentScanId || activeExecution?.executionId || ''),
             workspace: folder.uri.fsPath,
@@ -4323,9 +5616,10 @@ async function activate(context) {
           backendStatus = 'offline';
           currentScanId = null;
         }
+        const finalScanStatus = aggregateRunStatus(scanStatuses, { cancelled });
         currentDashboardOptions = {
           workspace: folder.name,
-          scanStatus: cancelled ? 'cancelled' : failures.length ? 'partial' : 'completed',
+          scanStatus: finalScanStatus,
           backendStatus,
           correlations: consolidatedCorrelated.correlations,
           httpScenarioCount: currentDashboardOptions.httpScenarioCount || 0,
@@ -4333,7 +5627,13 @@ async function activate(context) {
           burpConnected: Boolean(currentDashboardOptions.burpConnected),
           scanDurationMs: Date.now() - scanStartedAt,
           scanStartedAt: new Date(scanStartedAt).toISOString(),
-          policyResult: consolidatedPolicyResult,
+          // One authoritative verdict. The banner shows the Policy Gate the
+          // Security Pipeline shows, projected into the shape it already renders.
+          // The legacy evaluation still runs above for the backend record and the
+          // CLI contract, but it no longer decides what the developer is told.
+          // When Security Intelligence could not run there is no gate, so no
+          // verdict is claimed at all rather than falling back to a weaker one.
+          policyResult: authoritativePolicyResult,
           snapshotAvailable: Object.keys(currentSecuritySnapshot.resultSets || {}).length > 0,
           lastExecution: currentSecuritySnapshot.lastExecution,
           executionType: activeExecution.type
@@ -4359,19 +5659,40 @@ async function activate(context) {
         scanLog.appendLine(`[${new Date().toISOString()}] Analyse terminée — ${currentFindings.length} résultat(s) consolidé(s), ${failures.length} échec(s)`);
         const activeCount = currentFindings.filter(isActiveFinding).length;
         const summary = summarizeFindings(currentFindings.filter(isActiveFinding)) || 'aucune vulnérabilité active';
-        const completedCount = scanStatuses.filter((scanner) => scanner.status === 'completed').length;
-        vscode.window.showInformationMessage(`Security Center : ${summary} — ${completedCount}/${scans.length} outil(s) terminé(s).`);
-        if (cancelled) vscode.window.showWarningMessage(`Security Center : scan partiel — ${completedCount}/${scans.length} scanners terminés, ${scanStatuses.filter((scanner) => scanner.status === 'cancelled').map((scanner) => scanner.tool).join(', ')} annulé(s).`);
+        const finishedCount = finishedScannerCount(scanStatuses);
+        const successCount = successfulScannerCount(scanStatuses);
+        vscode.window.showInformationMessage(`Security Center : ${summary} — ${finishedCount}/${scans.length} outil(s) terminé(s), ${successCount}/${scans.length} réussi(s).`);
+        if (cancelled) vscode.window.showWarningMessage(`Security Center : scan partiel — ${finishedCount}/${scans.length} scanners terminés, ${scanStatuses.filter((scanner) => scanner.status === 'cancelled').map((scanner) => scanner.tool).join(', ')} annulé(s).`);
         if (validatedFindings.length) vscode.window.showInformationMessage(`Security Center : ${validatedFindings.length} correction(s) validée(s) automatiquement — alertes absentes après re-scan réussi.`);
         if (failures.length) vscode.window.showWarningMessage(`Security Center : scan partiel — ${failures.join(' | ')}`);
-        if (policyResult && !policyResult.passed) {
-          vscode.window.showWarningMessage(`Security Center : politique projet non respectée — ${policyResult.reasons.join(' ; ')}.`);
+        // The same verdict the banner and the Security Pipeline show. BLOCK and
+        // ERROR are different failures and stay distinguishable: a policy that
+        // could not be evaluated has not refused the delivery, it has judged
+        // nothing. WARN keeps its own wording instead of being silently promoted
+        // to a refusal or silently dropped.
+        if (authoritativePolicyResult) {
+          const gateStatus = authoritativePolicyResult.gateStatus;
+          if (gateStatus === GATE_STATUS.BLOCK) {
+            vscode.window.showWarningMessage(`Security Center : politique projet non respectée — ${authoritativePolicyResult.reasons.join(' ; ')}.`);
+          } else if (gateStatus === GATE_STATUS.ERROR) {
+            vscode.window.showErrorMessage(`Security Center : politique projet invalide — ${authoritativePolicyResult.reasons.join(' ; ')}.`);
+          } else if (gateStatus === GATE_STATUS.WARN) {
+            vscode.window.showWarningMessage(`Security Center : ${authoritativePolicyResult.gateSummary}`);
+          }
         }
       } catch (error) {
         const projection = projectSnapshot(currentSecuritySnapshot);
         currentFindings = projection.findings;
         currentScanStatuses = projection.scanners;
-        dashboardProvider.setData(currentFindings, currentScanStatuses, { ...currentDashboardOptions, workspace: folder.name, scanStatus: 'failed', backendStatus: 'unknown', snapshotAvailable: currentFindings.length > 0, activeExecution });
+        currentDashboardOptions = {
+          ...currentDashboardOptions,
+          workspace: folder.name,
+          scanStatus: 'failed',
+          backendStatus: 'unknown',
+          snapshotAvailable: currentFindings.length > 0,
+          activeExecution: null
+        };
+        dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
         vscode.window.showErrorMessage(`Security Center : ${error.message}`);
       }
       });
@@ -4428,4 +5749,15 @@ function deactivate() {
   liveSecurityService?.dispose();
   liveSecurityService = undefined;
 }
-module.exports = { activate, deactivate, toDiagnostic };
+// DashboardProvider est expose pour que les tests puissent exercer le vrai
+// recepteur des messages du webview — notamment le garde-fou ZAP, dont la
+// decision se resout ici. Aucun comportement n'est ajoute par cet export.
+module.exports = {
+  activate,
+  deactivate,
+  toDiagnostic,
+  DashboardProvider,
+  zapRequestedForScan,
+  zapModeFromPolicy,
+  resolveZapActiveScanConsent
+};

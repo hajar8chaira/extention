@@ -318,7 +318,48 @@ function gateExitCode(result) {
   return result?.status === STATUS.BLOCK ? 1 : 0;
 }
 
+/**
+ * Presents a gate verdict in the shape the dashboard banner already renders.
+ *
+ * One verdict, several surfaces. The Security Pipeline, the dashboard banner and
+ * the end-of-scan notification must never disagree about the same scan, which
+ * they could while the banner was fed by the legacy evaluator: that one knows
+ * nothing about `block_secrets`, `priority_threshold` or the artefact rules, so
+ * a blocked delivery could still be announced as « politique respectée ».
+ *
+ * This is a projection, not a second evaluation. Nothing is recomputed, no
+ * threshold is applied here, and the gate object itself is never mutated.
+ *
+ * `NOT_CONFIGURED` deliberately yields `null`: the banner is only rendered when
+ * a result exists, and an absent gate has authorised nothing — claiming
+ * « politique respectée » would be exactly the unearned reassurance this module
+ * refuses everywhere else.
+ */
+function policyResultFromGate(gate, policy = null) {
+  if (!gate || gate.status === STATUS.NOT_CONFIGURED) return null;
+  const blocking = gate.status === STATUS.BLOCK || gate.status === STATUS.ERROR;
+  const reasons = gate.status === STATUS.ERROR
+    ? [gate.error || STATUS_SUMMARY.ERROR]
+    : (gate.violations || []).map((violation) => violation.message);
+  return {
+    passed: !blocking,
+    // The gate counts what it actually judged.
+    activeCount: gate.counts?.evaluatedFindings ?? 0,
+    // Legacy-only notion (per-tool severity floor). The gate has no equivalent,
+    // so it stays 0 rather than being invented; the banner only shows it when set.
+    ignoredByToolThreshold: 0,
+    reasons,
+    // Carried through unchanged: the ZAP section reads the parsed policy here.
+    policy,
+    // The authoritative verdict, so a surface can tell WARN from PASS without
+    // reinterpreting `passed`. Additive — no existing consumer is affected.
+    gateStatus: gate.status,
+    gateSummary: gate.summary || '',
+    warningCount: gate.counts?.warnings ?? 0
+  };
+}
+
 module.exports = {
   STATUS, STATUS_SUMMARY, evaluatePolicyGate, policyGateError, describeGateRules,
-  formatGateResult, gateExitCode, activeFindings, severityRank
+  formatGateResult, gateExitCode, activeFindings, severityRank, policyResultFromGate
 };

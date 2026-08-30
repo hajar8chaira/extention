@@ -81,4 +81,36 @@ async function repairOllamaFix({ baseUrl, model, context, rejectedPatch, validat
   return { ...result, repaired: true };
 }
 
-module.exports = { RESPONSE_SCHEMA, localOllamaUrl, selectFixModel, fixPrompt, repairPrompt, parseModelJson, listOllamaModels, generateOllamaFix, repairOllamaFix };
+/**
+ * The assistant task.
+ *
+ * Same host guard, same redaction boundary and the same local-only rule as the
+ * remediation calls — but deliberately NOT the fix schema: this path returns
+ * prose, never a patch object, so an assistant answer can never be mistaken for
+ * something applyable. The model strategy for corrections is untouched.
+ */
+async function generateAssistantReply({
+  baseUrl, model, messages, fetchImpl = fetch, timeoutMs = 60000, signal, numPredict = 420
+}) {
+  if (!model) throw new Error('Aucun modèle Ollama sélectionné.');
+  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
+  const safeMessages = redactOutgoingMessages(messages);
+  const response = await fetchImpl(new URL('/api/chat', localOllamaUrl(baseUrl)), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    signal: requestSignal,
+    body: JSON.stringify({
+      model, stream: false, keep_alive: '10m',
+      options: { temperature: 0.2, num_ctx: 4096, num_predict: numPredict },
+      messages: safeMessages
+    })
+  });
+  if (!response.ok) throw new Error(`Ollama HTTP ${response.status} — ${(await response.text()).slice(0, 300)}`);
+  const payload = await response.json();
+  const content = String(payload.message?.content || '').trim();
+  if (!content) throw new Error('Ollama n’a retourné aucune réponse.');
+  return { content, model: payload.model || model };
+}
+
+module.exports = {
+  generateAssistantReply, RESPONSE_SCHEMA, localOllamaUrl, selectFixModel, fixPrompt, repairPrompt, parseModelJson, listOllamaModels, generateOllamaFix, repairOllamaFix };

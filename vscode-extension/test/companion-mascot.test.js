@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { MASCOT_VISUAL_STATES, mascotVisualFor, renderMascotSvg, mascotCss } = require('../src/live/companionMascot');
+const fs = require('node:fs');
+const path = require('node:path');
+const { MASCOT_VISUAL_STATES, mascotVisualFor, renderMascotSvg, mascotCss, DEFAULT_MASCOT_IMAGE } = require('../src/live/companionMascot');
 const { renderCompanionHtml, LiveCompanionProvider } = require('../src/live/liveCompanion');
 const { companionMessageFor } = require('../src/live/companionMessages');
 
@@ -48,29 +50,35 @@ test('un état inconnu retombe sur idle sans planter', () => {
   assert.equal(mascotVisualFor('n’importe quoi'), 'idle');
 });
 
-// ------------------------------------------------------------------- SVG
+// ------------------------------------------------------------------- asset
 
-test('la mascotte est un SVG inline original, sans asset externe', () => {
-  const svg = renderMascotSvg('idle');
-  assert.match(svg, /^<svg class="mascot mascot-idle mascot-regular"/);
-  assert.ok(!svg.includes('<image'), 'aucune image externe');
-  assert.ok(!/https?:\/\//.test(svg), 'aucune URL distante');
-  assert.match(svg, /role="img"/);
-  assert.match(svg, /aria-label="Security Companion"/);
+test('la mascotte est une image locale packagee, sans URL distante', () => {
+  const html = renderMascotSvg('idle');
+  assert.equal(DEFAULT_MASCOT_IMAGE, 'media/live/security-companion.png');
+  assert.match(html, /^<img class="mascot mascot-idle mascot-regular"/);
+  assert.match(html, /src="media\/live\/security-companion\.png"/);
+  assert.match(html, /data-companion-asset="local"/);
+  assert.ok(!/https?:\/\//.test(html), 'aucune URL distante');
+  assert.match(html, /role="img"/);
+  assert.match(html, /alt="Security Companion"/);
 });
 
-test('la classe du SVG porte l’état demandé', () => {
+test('la classe de la mascotte porte l’état demandé', () => {
   for (const state of MASCOT_VISUAL_STATES) {
     assert.match(renderMascotSvg(state), new RegExp(`class="mascot mascot-${state} `));
   }
 });
 
-test('la mascotte n’utilise que des couleurs de thème', () => {
+test('l’asset PNG est package localement et le rendu ne recree pas de SVG', () => {
+  const asset = path.join(__dirname, '..', DEFAULT_MASCOT_IMAGE);
+  assert.equal(fs.readFileSync(asset).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.ok(fs.statSync(asset).size > 1024, 'asset PNG vide ou absent');
   const css = mascotCss();
-  const svg = renderMascotSvg('warning');
-  // Aucune couleur littérale dans la géométrie : tout passe par des variables.
-  assert.ok(!/fill="#|stroke="#/.test(svg));
-  assert.match(css, /var\(--sc-accent\)/);
+  const html = renderMascotSvg('warning');
+  assert.ok(!html.includes('<svg'));
+  assert.ok(!/<rect|<circle|<path|fill="#|stroke="#/.test(html));
+  assert.match(css, /object-fit:contain/);
+  assert.match(css, /var\(--sc-accent[,)]/);
   assert.match(renderCompanionHtml(model(), 'n'), /--sc-danger:var\(--vscode-editorError-foreground/);
 });
 
@@ -79,18 +87,19 @@ test('la mascotte n’utilise que des couleurs de thème', () => {
 test('chaque état animé a une règle CSS dédiée', () => {
   const css = mascotCss();
   for (const [state, keyframe] of [
-    ['idle', 'sc-breathe'], ['watching', 'sc-look'], ['thinking', 'sc-scan'],
-    ['warning', 'sc-recoil'], ['critical', 'sc-pulse'], ['success', 'sc-jump'],
-    ['sleeping', 'sc-float'], ['error', 'sc-shake']
+    ['idle', 'sc-breathe'], ['watching', 'sc-breathe'], ['thinking', 'sc-scan'],
+    ['warning', 'sc-attend'], ['critical', 'sc-pulse'], ['success', 'sc-success-pulse'],
+    ['error', 'sc-shake']
   ]) {
     assert.match(css, new RegExp(`\\.mascot-${state}[^}]*${keyframe}`), `animation manquante pour ${state}`);
   }
+  assert.match(css, /\.mascot-sleeping\{opacity:\.72;transform:translateY\(8px\)\}/);
 });
 
 test('les animations respectent la préférence système et le réglage', () => {
   const css = mascotCss();
-  assert.match(css, /@media\(prefers-reduced-motion:reduce\)\{\.mascot \*\{animation:none!important/);
-  assert.match(css, /\.no-motion \.mascot \*\{animation:none!important/);
+  assert.match(css, /@media\(prefers-reduced-motion:reduce\)\{\.mascot\{animation:none!important/);
+  assert.match(css, /\.no-motion \.mascot\{animation:none!important/);
 });
 
 test('désactiver les animations ajoute la classe no-motion', () => {

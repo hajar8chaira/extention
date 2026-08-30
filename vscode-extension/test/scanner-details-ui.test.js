@@ -16,9 +16,11 @@ test('Back to Dashboard action is present in scanner details', () => {
   const model = buildDashboardModel([], [], {});
   model.activeScanner = 'Semgrep';
   const html = renderDashboardHtml(model, 'nonce', 'scanner-details');
-  
+
+  // Le retour au dashboard passe par la navigation partagee du cadre, la ou il
+  // etait auparavant un bouton propre a cette page.
+  assert.match(html, /class="sc-internal-nav"/);
   assert.match(html, /data-command="securityCenter\.openDashboard"/);
-  assert.match(html, /Retour au Dashboard/);
 });
 
 test('Semgrep details are rendered correctly', () => {

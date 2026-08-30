@@ -26,10 +26,9 @@ test('montre un conseil une seule fois après répétition de la même règle', 
 
 test('affiche le compagnon animé et le contexte connu uniquement avec preuves', () => {
   const html = renderLiveSecurityPage({ state: 'analyzing', file: 'src/app.js', findings: [], activity: { detected: 0, resolved: 0, prevented: 0, recent: [], tip: '' }, ollamaModel: '', knownFindings: [{ title: 'Known issue' }], companion: { mascotState: 'thinking', message: { kind: 'scanning', headline: 'J’analyse les modifications…' }, liveFindingCount: 0 } }, 'nonce', 'vscode-resource:/security-companion.png', 'vscode-webview:');
-  // Le compagnon décoratif en PNG est remplacé par la vraie mascotte animée,
-  // pilotée par le modèle partagé. Une seule mascotte sur la page.
-  assert.ok(!html.includes('security-companion.png'));
-  assert.equal((html.match(/<svg class="mascot/g) || []).length, 1);
+  // La mascotte est l'asset local de la webview, pilote par le modèle partagé.
+  assert.match(html, /src="vscode-resource:\/security-companion\.png"/);
+  assert.equal((html.match(/<img class="mascot/g) || []).length, 1);
   assert.match(html, /class="mascot mascot-thinking/);
   assert.match(html, /@keyframes/);
   assert.match(html, /Checking current file/);
@@ -43,7 +42,14 @@ test('garde le compagnon actif même lorsque le fichier ouvert n’est pas encor
   assert.match(html, /Watching your code/);
   assert.match(html, /README\.md is not analyzed yet/);
   assert.match(html, /JavaScript and TypeScript/);
-  assert.match(html, /class="theme-light active idle"/);
+  // La page est desormais hebergee par le cadre partage : le body porte en plus
+  // la surface (sc-surface-live), donc les classes ne sont plus contigues.
+  // L'intention d'origine — theme et etat du service lisibles sur le body — est
+  // verifiee telle quelle.
+  const bodyClasses = html.match(/<body class="([^"]*)"/)[1].split(String.fromCharCode(32));
+  assert.ok(bodyClasses.includes('theme-light'), 'le theme doit rester sur le body');
+  assert.ok(bodyClasses.includes('active'), 'l etat du service doit rester sur le body');
+  assert.ok(bodyClasses.includes('idle'), 'l etat detaille doit rester sur le body');
 });
 
 test('rend une page Live dédiée sans historique des scans normaux', () => {
@@ -56,7 +62,8 @@ test('rend une page Live dédiée sans historique des scans normaux', () => {
   assert.match(html, /JavaScript \/ TypeScript/);
   assert.match(html, /qwen2\.5-coder:14b/);
   assert.match(html, /Used only on request/);
-  assert.doesNotMatch(html, /scan history|Semgrep|ZAP|Burp/i);
+  const main = html.slice(html.indexOf('<main class="sc-main">'), html.indexOf('</main>'));
+  assert.doesNotMatch(main, /scan history|Semgrep|ZAP|Burp/i);
   assert.match(html, /var\(--vscode-editor-background\)/);
 });
 

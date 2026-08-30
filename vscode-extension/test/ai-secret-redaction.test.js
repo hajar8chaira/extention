@@ -323,8 +323,14 @@ test('la barriere est appelee au point d egress unique', () => {
   const fs = require('fs');
   const path = require('path');
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'ai', 'ollama-provider.js'), 'utf8');
-  // Un seul appel reseau, et il n envoie que les messages assainis.
-  assert.equal((source.match(/fetchImpl\(new URL\('\/api\/chat'/g) || []).length, 1);
-  assert.match(source, /messages: safeMessages/);
+  // L invariant n est pas « un seul appel » mais « aucun appel ne peut fuiter » :
+  // CHAQUE envoi vers /api/chat doit passer par la barriere de redaction. La
+  // tache assistant a ajoute un second point d egress ; le contrat vaut pour lui
+  // exactement comme pour la remediation.
+  const egress = source.match(/fetchImpl\(new URL\('\/api\/chat'/g) || [];
+  assert.ok(egress.length >= 1, 'au moins un point d egress doit exister');
+  const redactions = source.match(/redactOutgoingMessages\(messages\)/g) || [];
+  assert.equal(redactions.length, egress.length, 'chaque appel /api/chat doit assainir ses messages');
+  assert.equal((source.match(/messages: safeMessages/g) || []).length, egress.length);
   assert.ok(!/body: JSON\.stringify\(\{[^}]*messages \}\)/.test(source), 'aucun envoi de messages bruts');
 });

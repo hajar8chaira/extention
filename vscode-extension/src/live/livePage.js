@@ -3,6 +3,8 @@ const { escapeHtml } = require('./liveCompanion');
 const { SUPPORTED_LANGUAGES } = require('./liveScheduler');
 const { themeOverridesCss } = require('../theme-controller');
 const { renderCompanionWidget, companionWidgetCss } = require('./companionWidget');
+const { renderSecurityCenterShell, navCommands } = require('../security-center-shell');
+const { buildAssistantCardModel, renderAssistantCard, assistantCardCss, assistantCardScript } = require('../companion-assistant-card');
 
 class LiveSessionActivity {
   constructor({ now = () => new Date() } = {}) {
@@ -58,11 +60,18 @@ class LiveSessionActivity {
 function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource = '', selectedTheme = 'light') {
   const active = model.state !== 'disabled' && model.state !== 'paused';
   const stateLabel = active ? 'Active' : model.state === 'paused' ? 'Paused' : 'Off';
+  // Texte BRUT : le cadre applique escapeHtml au sous-titre. Pre-echapper ici
+  // produirait un double echappement (« &amp;lt;script&amp;gt; ») a l'ecran.
   const fileSupportMessage = !model.file
     ? 'Open a JavaScript or TypeScript file to start local analysis.'
     : model.supportedFile
-      ? `Current file: ${escapeHtml(model.file)}`
-      : `Live Security is active. ${escapeHtml(model.file)} is not analyzed yet; detection currently supports JavaScript and TypeScript.`;
+      ? `Current file: ${model.file}`
+      : `Live Security is active. ${model.file} is not analyzed yet; detection currently supports JavaScript and TypeScript.`;
+  // La ligne d'etat vivait dans l'en-tete de la page autonome. Elle reste
+  // affichee, dans le contenu, avec exactement le meme libelle qu'avant.
+  const stateMessage = model.state === 'analyzing' ? 'Checking current file…'
+    : model.state === 'issues' ? `${model.findings.length} potential issue(s)`
+      : active ? 'Watching your code' : 'Live analysis is not running';
   const findingRows = model.findings.map((finding) => {
     const ref = escapeHtml(JSON.stringify([finding.uri, finding.documentVersion, finding.ruleId]));
     return `<article class="finding"><div><strong>${escapeHtml(String(finding.severity).toUpperCase())} · ${escapeHtml(finding.title)}</strong><span>${escapeHtml(finding.cwe || finding.ruleId)} · Line ${finding.range.start.line + 1}</span></div><div class="actions"><button data-action="open" data-ref="${ref}">Open</button><button class="secondary" data-action="explain" data-ref="${ref}">Explain</button><button class="secondary" data-action="${finding.quickFixAvailable ? 'quickfix' : 'fix'}" data-ref="${ref}">Fix</button></div></article>`;
@@ -75,16 +84,45 @@ function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource 
   // count. It only chooses where it sits.
   // FULL mode: this is the only page where the companion is the assistant of
   // the surface itself and may comment on the file being edited.
-  const companion = renderCompanionWidget(model.companion, {
-    variant: 'full', enabled: model.companionEnabled !== false
+  // L'assistant du rail lit le meme modele visuel partage que la mascotte : il
+  // parle du fichier ouvert, avec le compte que le moteur Live a reellement
+  // produit. Sans modele companion, il ne s'affiche pas.
+  const assistantCard = renderAssistantCard(buildAssistantCardModel({
+    surface: 'live',
+    companion: model.companion,
+    enabled: model.companionEnabled !== false
+  }), { mascotImageUri: companionImageUri });
+  // Une seule mascotte par surface. La carte est le meme companion, avec le
+  // meme modele et la meme posture, plus des actions explicites : quand elle
+  // occupe le rail, le widget flottant n'a plus lieu d'etre dessine. Sans
+  // carte — aucun fait a rapporter — le widget reprend sa place inchangee.
+  const companion = assistantCard ? '' : renderCompanionWidget(model.companion, {
+    variant: 'full', enabled: model.companionEnabled !== false, imageUri: companionImageUri
   });
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource || "'none'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${themeOverridesCss()}
-    :root{color-scheme:light dark}*{box-sizing:border-box}${selectedTheme === 'light' ? themeOverridesCss().replaceAll('body.theme-light','body') : ''}body{margin:0;padding:24px;color:var(--vscode-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family);font-size:var(--vscode-font-size)}main{max-width:1050px;margin:auto}h1{margin:0}.muted,.finding span,small{color:var(--vscode-descriptionForeground)}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding-bottom:16px;border-bottom:1px solid var(--vscode-panel-border)}.identity{display:flex;align-items:center;gap:14px}.state{display:inline-block;margin-top:8px;padding:2px 8px;border-radius:10px;color:var(--vscode-badge-foreground);background:var(--vscode-badge-background)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);margin:20px 0;border:1px solid var(--vscode-panel-border);border-radius:5px}.metric{padding:14px}.metric+.metric{border-left:1px solid var(--vscode-panel-border)}.metric strong{display:block;font-size:1.5em}.grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(260px,.7fr);gap:20px}section{margin-bottom:20px}h2{font-size:1.05em;margin:0 0 10px}.finding{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-top:1px solid var(--vscode-panel-border)}.finding span{display:block;margin-top:3px}.actions{display:flex;gap:6px;flex-wrap:wrap}button{font:inherit;border:0;border-radius:2px;padding:5px 10px;cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background)}button:hover{background:var(--vscode-button-hoverBackground)}button.secondary{color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground)}.empty,.info,.hint{padding:12px;border:1px solid var(--vscode-panel-border);border-radius:4px}.hint{border-left:3px solid var(--vscode-focusBorder)}.info{display:grid;gap:8px}ul{list-style:none;padding:0;margin:0}li{display:grid;grid-template-columns:55px 1fr auto;gap:8px;padding:9px 0;border-top:1px solid var(--vscode-panel-border)}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}@media(max-width:700px){body{padding:14px}.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}.metric+.metric{border-left:0;border-top:1px solid var(--vscode-panel-border)}.finding{align-items:flex-start;flex-direction:column}}
-  ${companion ? companionWidgetCss() : ''}
-  </style></head><body class="theme-${selectedTheme === 'dark' ? 'dark' : 'light'} ${active ? 'active' : 'disabled'} ${escapeHtml(model.state)}"><main><header><div class="identity"><div><h1>Live Security</h1><div class="state">● ${stateLabel}</div><p class="muted">${model.state === 'analyzing' ? 'Checking current file…' : model.state === 'issues' ? `${model.findings.length} potential issue(s)` : active ? 'Watching your code' : 'Live analysis is not running'}</p><p class="muted">${fileSupportMessage}</p></div></div>${active ? '<button data-command="securityCenter.disableLiveSecurity">Turn off</button>' : '<button data-command="securityCenter.enableLiveSecurity">Enable Live Security</button>'}</header>
+  // Le cadre partage recoit la CSP EXACTE de cette page : `img-src` doit garder
+  // `cspSource`, sinon l'image du companion servie depuis localResourceRoots
+  // serait bloquee. Rien d'autre n'est assoupli.
+  return renderSecurityCenterShell({
+    surface: 'live',
+    nonce,
+    theme: selectedTheme,
+    title: 'Live Security',
+    subtitle: fileSupportMessage,
+    headerActions: `${active ? '<button data-command="securityCenter.disableLiveSecurity">Turn off</button>' : '<button data-command="securityCenter.enableLiveSecurity">Enable Live Security</button>'}`,
+    content: `
+  <div class="live-state-strip"><span class="state">● ${stateLabel}</span><p class="muted">${escapeHtml(stateMessage)}</p></div>
   <div class="metrics"><div class="metric"><strong>${model.findings.length}</strong><span>Current file warnings</span></div><div class="metric"><strong>${model.activity.detected}</strong><span>Session warnings</span></div><div class="metric"><strong>${model.activity.resolved}</strong><span>Resolved live</span></div><div class="metric"><strong>${model.activity.prevented || 0}</strong><span>Prevented during coding</span></div></div>
-  <div class="grid"><div><section><h2>Current File</h2>${findingRows || '<div class="empty">No Live warnings for the current file.</div>'}</section>${tip}<section><h2>Recent Live Activity</h2>${activityRows ? `<ul>${activityRows}</ul>` : '<div class="empty">No Live activity in this session yet.</div>'}</section></div><aside>${knownContext}<section><h2>Engine</h2><div class="info"><strong>JavaScript / TypeScript</strong><span>Security Center Live Rules</span><small>Local, lightweight and ephemeral analysis</small></div></section><section><h2>AI</h2><div class="info"><strong>Ollama</strong><span>${escapeHtml(model.ollamaModel || 'No model selected')}</span><small>Used only on request</small></div></section></aside></div>
-  </main>${companion}<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.addEventListener('click',e=>{const button=e.target.closest('button');if(!button)return;if(button.dataset.command)return vscode.postMessage({type:'command',command:button.dataset.command});vscode.postMessage({type:button.dataset.action,ref:JSON.parse(button.dataset.ref||'[]')});});</script></body></html>`;
+  <div class="grid"><div><section><h2>Current File</h2>${findingRows || '<div class="empty">No Live warnings for the current file.</div>'}</section>${tip}<section><h2>Recent Live Activity</h2>${activityRows ? `<ul>${activityRows}</ul>` : '<div class="empty">No Live activity in this session yet.</div>'}</section></div><aside>${knownContext}<section><h2>Engine</h2><div class="info"><strong>JavaScript / TypeScript</strong><span>Security Center Live Rules</span><small>Local, lightweight and ephemeral analysis</small></div></section><section><h2>AI</h2><div class="info"><strong>Ollama</strong><span>${escapeHtml(model.ollamaModel || 'No model selected')}</span><small>Used only on request</small></div></section></aside></div>`,
+    // Le companion garde son modele et son rendu ; il passe dans le rail.
+    contextRail: `${assistantCard}${companion}`,
+    styles: `    :root{color-scheme:light dark}*{box-sizing:border-box}.live-state-strip{display:flex;align-items:center;gap:12px;margin:0 0 4px}.live-state-strip p{margin:0}${selectedTheme === 'light' ? themeOverridesCss().replaceAll('body.theme-light','body') : ''}h1{margin:0}.muted,.finding span,small{color:var(--vscode-descriptionForeground)}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding-bottom:16px;border-bottom:1px solid var(--vscode-panel-border)}.identity{display:flex;align-items:center;gap:14px}.state{display:inline-block;margin-top:8px;padding:2px 8px;border-radius:10px;color:var(--vscode-badge-foreground);background:var(--vscode-badge-background)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);margin:20px 0;border:1px solid var(--vscode-panel-border);border-radius:5px}.metric{padding:14px}.metric+.metric{border-left:1px solid var(--vscode-panel-border)}.metric strong{display:block;font-size:1.5em}.grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(260px,.7fr);gap:20px}section{margin-bottom:20px}h2{font-size:1.05em;margin:0 0 10px}.finding{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-top:1px solid var(--vscode-panel-border)}.finding span{display:block;margin-top:3px}.actions{display:flex;gap:6px;flex-wrap:wrap}button{font:inherit;border:0;border-radius:2px;padding:5px 10px;cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background)}button:hover{background:var(--vscode-button-hoverBackground)}button.secondary{color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground)}.empty,.info,.hint{padding:12px;border:1px solid var(--vscode-panel-border);border-radius:4px}.hint{border-left:3px solid var(--vscode-focusBorder)}.info{display:grid;gap:8px}ul{list-style:none;padding:0;margin:0}li{display:grid;grid-template-columns:55px 1fr auto;gap:8px;padding:9px 0;border-top:1px solid var(--vscode-panel-border)}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}@media(max-width:700px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}.metric+.metric{border-left:0;border-top:1px solid var(--vscode-panel-border)}.finding{align-items:flex-start;flex-direction:column}}
+  ${companion ? companionWidgetCss() : ''}
+  ${assistantCard ? assistantCardCss() : ''}`,
+    script: `const vscode=window.__scShellApi||acquireVsCodeApi();document.addEventListener('click',e=>{const button=e.target.closest('button');if(!button||button.classList.contains('sc-nav-item'))return;if(button.closest('.sc-assistant'))return;if(button.dataset.command)return vscode.postMessage({type:'command',command:button.dataset.command});vscode.postMessage({type:button.dataset.action,ref:JSON.parse(button.dataset.ref||'[]')});});
+${assistantCard ? assistantCardScript() : ''}`,
+    csp: `default-src 'none'; img-src ${cspSource || "'none'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    bodyClass: `${active ? 'active' : 'disabled'} ${escapeHtml(model.state)}`
+  });
 }
 
 class LiveSecurityPageProvider {
@@ -127,7 +165,13 @@ class LiveSecurityPageProvider {
     // own buttons can emit are forwarded; the name is never passed through
     // blindly, which it used to be.
     if (message.type === 'command') {
-      const ALLOWED = new Set(['securityCenter.enableLiveSecurity', 'securityCenter.disableLiveSecurity']);
+      // Les deux commandes propres a cette page, plus les destinations que le
+      // rail partage affiche reellement. Chacune existe deja et est enregistree :
+      // la page n'en cree aucune et ne relaie jamais un nom arbitraire.
+      const ALLOWED = new Set([
+        'securityCenter.enableLiveSecurity', 'securityCenter.disableLiveSecurity',
+        ...navCommands()
+      ]);
       return ALLOWED.has(message.command) ? this.executeCommand(message.command) : undefined;
     }
     // Clicking the companion goes wherever its current message points — the

@@ -75,19 +75,26 @@ test('la page Live Security reçoit le modèle compagnon du moteur unique', () =
 
 test('la page rend la mascotte compacte quand le compagnon est activé', () => {
   const html = page({ state: 'issues', findings: [live()], companion: visualFor({ state: 'issues', findings: [live()] }) });
-  assert.equal((html.match(/<svg class="mascot/g) || []).length, 1, 'une seule mascotte');
-  assert.match(html, /class="sc-widget sc-widget-full/);
+  assert.equal((html.match(/<img class="mascot/g) || []).length, 1, 'une seule mascotte');
+  // Le personnage est désormais porté par la carte « Companion Assistant » du
+  // rail, qui remplace le widget flottant dès qu'elle a un fait réel à
+  // rapporter : même modèle partagé, même posture, plus des actions explicites.
+  // Le widget reste la présence par défaut partout où la carte ne s'affiche pas.
+  assert.match(html, /class="sc-assistant sc-assistant-hero"/);
+  assert.ok(!html.includes('class="sc-widget'), 'le widget flottant ne double pas la carte');
   assert.match(html, /class="mascot mascot-warning/);
-  // Mode FULL : bande 70–100px, très loin des 140px de l'ancien panneau.
-  assert.match(html, new RegExp(`sc-widget-full \\.mascot\\{width:${WIDGET_SIZES.full.width}px;height:${WIDGET_SIZES.full.height}px`));
+  // Mode FULL : bande 70–100px, très loin des 140px de l'ancien panneau. Le
+  // contrat de taille et l'ancrage restent vérifiés sur le module lui-même,
+  // qui les porte toujours pour les surfaces où le widget est rendu.
+  assert.match(companionWidgetCss(), new RegExp(`sc-widget-full \\.mascot\\{width:${WIDGET_SIZES.full.width}px;height:${WIDGET_SIZES.full.height}px`));
   assert.ok(WIDGET_SIZES.full.height <= 100 && WIDGET_SIZES.full.height >= 70);
   // Ancrée dans le document de la webview, jamais au-dessus du workbench.
-  assert.match(html, /\.sc-widget\{position:fixed/);
+  assert.match(companionWidgetCss(), /\.sc-widget\{position:fixed/);
 });
 
 test('la page ne rend rien du compagnon quand le réglage est désactivé', () => {
   const html = page({ state: 'issues', findings: [live()], companion: visualFor({ state: 'issues', findings: [live()] }), companionEnabled: false });
-  assert.ok(!html.includes('<svg class="mascot'));
+  assert.ok(!html.includes('<img class="mascot'));
   assert.ok(!html.includes('sc-widget'));
   // Live Security elle-même continue de fonctionner.
   assert.match(html, /Live Security/);
@@ -97,7 +104,7 @@ test('la page ne rend rien du compagnon quand le réglage est désactivé', () =
 
 test('sans modèle compagnon, la page ne rend pas de mascotte par défaut', () => {
   const html = page({ companion: null });
-  assert.ok(!html.includes('<svg class="mascot'));
+  assert.ok(!html.includes('<img class="mascot'));
   assert.match(html, /Live Security/);
 });
 
@@ -112,28 +119,25 @@ test('le dashboard consomme le MÊME modèle partagé que la page Live', () => {
   assert.equal(posture(dashHtml), 'warning');
   // Le même objet nourrit les deux : aucun recalcul côté dashboard.
   assert.equal(shared.liveFindingCount, 2);
-  assert.match(dashHtml, /sc-widget-count[^>]*>2</);
+  assert.match(dashHtml, /data-assistant-fact-scope="live-file"[\s\S]*<strong[^>]*>2<\/strong>[\s\S]*Live issues/);
 });
 
-test('la mascotte du dashboard reste très petite et hors du flux', () => {
+test('la mascotte du dashboard reste compacte dans le hero du rail', () => {
   const dashHtml = renderDashboardHtml({ ...buildDashboardModel([], []), companion: visualFor({ state: 'clean' }), companionEnabled: true }, 'n', 'full', 'light');
-  assert.match(dashHtml, new RegExp(`sc-widget-compact \\.mascot\\{width:${WIDGET_SIZES.compact.width}px;height:${WIDGET_SIZES.compact.height}px`));
-  // Mode COMPACT : bande 42–56px.
-  assert.ok(WIDGET_SIZES.compact.height <= 56 && WIDGET_SIZES.compact.width >= 42, 'la présence dashboard doit rester dans la bande 42–56px');
-  // Aucune carte, et rien dans le flux : le compagnon flotte en fin de document.
-  assert.ok(!dashHtml.includes('companion-card'));
-  assert.equal((dashHtml.match(/<svg class="mascot/g) || []).length, 1);
-  const body = dashHtml.slice(dashHtml.indexOf('<body'));
-  assert.ok(body.indexOf('class="sc-widget') > body.indexOf('</script>'), 'le compagnon est le dernier élément du document');
-  // Et surtout pas dans `.operational-banner`, que `body.surface-full >` masque.
-  assert.ok(!/operational-banner[^<]*<span[\s\S]{0,300}sc-widget/.test(dashHtml));
+  assert.match(dashHtml, /\.sc-assistant-talk \{ display: grid; grid-template-columns: minmax\(82px, 36%\) minmax\(0, 1fr\)/);
+  assert.match(dashHtml, /\.sc-assistant-mascot \.mascot \{[^}]*width: 86px; height: 108px;/);
+  // Le rail porte désormais l'assistant : pas de widget flottant en double.
+  assert.ok(!/class="sc-widget/.test(dashHtml));
+  assert.equal((dashHtml.match(/<img class="mascot/g) || []).length, 1);
+  assert.match(dashHtml, /class="sc-assistant sc-assistant-hero"/);
+  assert.ok(!/operational-banner[^<]*<span[\s\S]{0,300}sc-assistant/.test(dashHtml));
 });
 
 test('le compagnon compact couvre les pages du dashboard, jamais la sidebar', () => {
   for (const surface of ['full', 'findings', 'scans', 'dynamic', 'analytics']) {
     const html = renderDashboardHtml({ ...buildDashboardModel([], []), companion: visualFor({ state: 'issues', findings: [live()] }), companionEnabled: true }, 'n', surface, 'light');
-    assert.match(html, /class="sc-widget sc-widget-compact/, `compagnon absent de la surface ${surface}`);
-    assert.equal((html.match(/<svg class="mascot/g) || []).length, 1, `mascotte dupliquée sur ${surface}`);
+    assert.match(html, /class="sc-assistant sc-assistant-hero"/, `compagnon absent de la surface ${surface}`);
+    assert.equal((html.match(/<img class="mascot/g) || []).length, 1, `mascotte dupliquée sur ${surface}`);
   }
   // La sidebar est une bande étroite : l'arbre des vulnérabilités a besoin de la place.
   const sidebar = renderDashboardHtml({ ...buildDashboardModel([], []), companion: visualFor({ state: 'issues', findings: [live()] }), companionEnabled: true }, 'n', 'sidebar', 'light');
@@ -141,13 +145,13 @@ test('le compagnon compact couvre les pages du dashboard, jamais la sidebar', ()
   // cite '.sc-widget-mascot' dans son selecteur, ce qui faisait echouer une
   // recherche de sous-chaine sans qu'aucun compagnon ne soit rendu.
   assert.ok(!/class="sc-widget/.test(sidebar), 'aucun compagnon rendu dans la sidebar');
-  assert.ok(!sidebar.includes('<svg class="mascot'), 'aucune mascotte dans la sidebar');
+  assert.ok(!sidebar.includes('<img class="mascot'), 'aucune mascotte dans la sidebar');
 });
 
 test('le dashboard ne rend rien quand le réglage est désactivé', () => {
   const html = renderDashboardHtml({ ...buildDashboardModel([], []), companion: visualFor({ state: 'issues', findings: [live()] }), companionEnabled: false }, 'n', 'full', 'light');
   assert.ok(!/class="sc-widget/.test(html), 'aucun compagnon rendu quand le reglage est desactive');
-  assert.ok(!html.includes('<svg class="mascot'), 'aucune mascotte quand le reglage est desactive');
+  assert.ok(!html.includes('<img class="mascot'), 'aucune mascotte quand le reglage est desactive');
   assert.match(html, /operational-banner/, 'la bannière de statut reste intacte');
 });
 
@@ -291,11 +295,11 @@ test('le contenu interpolé reste échappé', () => {
 
 // ------------------------- pas de retour aux problèmes précédents
 
-test('la mascotte définit toujours sa palette : jamais de silhouette noire', () => {
+test('la mascotte est une image asset locale : pas de silhouette CSS noire', () => {
   const css = companionWidgetCss();
-  for (const token of ['--sc-body', '--sc-line', '--sc-visor', '--sc-accent', '--sc-warn', '--sc-danger', '--sc-ok']) {
-    assert.match(css, new RegExp(`${token}:var\\(--vscode-[\\w-]+,#[0-9a-fA-F]+\\)`), `${token} sans repli littéral`);
-  }
+  assert.match(css, /\.mascot\{display:block;[^}]*object-fit:contain/);
+  assert.match(css, /filter:drop-shadow/);
+  assert.match(renderCompanionWidget(visualFor({ state: 'idle' }), { variant: 'full' }), /data-companion-asset="local"/);
   // Et la bulle a un repli sur chaque couleur de thème qu'elle utilise.
   assert.ok(!/background:var\(--vscode-editorHoverWidget-background\)[;}]/.test(css));
 });
@@ -306,16 +310,16 @@ test('la bulle reste courte, limitée à deux lignes, et se tait quand inutile',
   // `idle` n'a rien à dire sur une page qui parle déjà de Live Security.
   const idle = renderCompanionWidget(visualFor({ state: 'idle', file: '' }), { variant: 'full' });
   assert.ok(!idle.includes('sc-widget-bubble'), 'aucune bulle pour un état sans information');
-  assert.match(idle, /<svg class="mascot/, 'la mascotte reste présente');
+  assert.match(idle, /<img class="mascot/, 'la mascotte reste présente');
 });
 
 test('aucune mascotte dupliquée sur l’ensemble des surfaces', () => {
   const shared = visualFor({ state: 'issues', findings: [live()] });
   const pageHtml = page({ state: 'issues', findings: [live()], companion: shared });
-  assert.equal((pageHtml.match(/<svg class="mascot/g) || []).length, 1);
-  assert.ok(!pageHtml.includes('security-companion.png'), 'l’ancien avatar PNG ne coexiste plus avec la mascotte');
+  assert.equal((pageHtml.match(/<img class="mascot/g) || []).length, 1);
+  assert.ok(pageHtml.includes('security-companion.png') || pageHtml.includes('class="mascot'), 'la mascotte image locale est rendue');
   const dashHtml = renderDashboardHtml({ ...buildDashboardModel([], []), companion: shared, companionEnabled: true }, 'n', 'full', 'light');
-  assert.equal((dashHtml.match(/<svg class="mascot/g) || []).length, 1);
+  assert.equal((dashHtml.match(/<img class="mascot/g) || []).length, 1);
 });
 
 test('le compagnon n’occupe aucune hauteur dans le flux de la page Live', () => {

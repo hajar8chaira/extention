@@ -638,3 +638,56 @@ test('le bouton « politique de départ » apparaît dès qu’aucune règle n�
   const withRules = renderPolicyTab({ policy: null, policyConfig: { exists: true, configured: true, gate: { failOnSeverity: ['CRITICAL'] }, supplyChain: {}, error: '' }, policyEvaluation: {} });
   assert.ok(!withRules.includes('createStarterPolicy'));
 });
+
+// ---------------------------------------------------------------------------
+// Regression : le Policy Gate au moment du scan doit juger les artefacts REELS
+//
+// Le chemin de re-evaluation manuelle transmettait `artifacts`, le chemin de
+// scan ne le transmettait pas. Meme politique, meme etat disque, meme moteur —
+// deux verdicts differents selon le bouton utilise. La regle artefact tombait
+// systematiquement sur « etape non executee » pendant un scan, alors qu'un SBOM
+// deja genere etait present dans l'etat du pipeline.
+// ---------------------------------------------------------------------------
+
+test('Policy Gate : require_sbom juge l’artefact existant, pas « non evaluee »', () => {
+  const { analyzeFindings } = require('../src/pipeline');
+  const policy = { gate: { configured: true, requireSbom: true }, supplyChain: { configured: false } };
+  const artifacts = { sbom: { status: 'generated', path: 'security-center/sbom.cdx.json' } };
+
+  // Sans artefacts : le gate ne peut rien etablir et le dit — c'est correct.
+  const notEvaluated = analyzeFindings([], { policy, artifacts: null }).policy;
+  assert.equal(notEvaluated.status, 'WARN');
+  assert.deepEqual(notEvaluated.warnings.map((warning) => warning.code), ['artifact-not-evaluated']);
+
+  // Avec l'artefact reellement present : le gate le reconnait.
+  const evaluated = analyzeFindings([], { policy, artifacts }).policy;
+  assert.equal(evaluated.status, 'PASS');
+  assert.equal(evaluated.warnings.length, 0);
+  assert.equal(evaluated.violations.length, 0);
+
+  // Un artefact exige mais reellement absent reste une violation : le correctif
+  // ne doit pas transformer « manquant » en « accepte ».
+  const missing = analyzeFindings([], { policy, artifacts: { sbom: { status: 'failed', reason: 'Trivy indisponible' } } }).policy;
+  assert.equal(missing.status, 'BLOCK');
+  assert.deepEqual(missing.violations.map((violation) => violation.code), ['artifact-missing']);
+});
+
+test('Policy Gate : le scan et la re-evaluation manuelle lisent le meme etat d’artefacts', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/extension.js'), 'utf8');
+
+  // L'expression de reference, utilisee par la re-evaluation manuelle.
+  const artifactState = /artifacts: Object\.keys\(currentPipelineArtifacts \|\| \{\}\)\.length \? currentPipelineArtifacts : null/g;
+  const occurrences = source.match(artifactState) || [];
+  assert.equal(occurrences.length, 2, 'le scan ET la re-evaluation manuelle doivent transmettre l’etat d’artefacts');
+
+  // Et l'appel du scan doit bien etre celui-la : `analyzeWorkspace` ne doit plus
+  // etre invoque sans artefacts.
+  const scanCall = source.match(/const analysis = await analyzeWorkspace\(\{[\s\S]*?\n\s*\}\);/);
+  assert.ok(scanCall, 'l’appel analyzeWorkspace du scan doit exister');
+  assert.match(scanCall[0], artifactState);
+
+  // Aucun declenchement automatique des etapes supply-chain n'a ete ajoute :
+  // le scan lit un etat, il ne le produit pas.
+  const supplyChainRuns = source.match(/runSupplyChainStages\(/g) || [];
+  assert.equal(supplyChainRuns.length, 2, 'runSupplyChainStages reste limite aux deux actions manuelles');
+});

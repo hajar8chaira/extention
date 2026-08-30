@@ -162,7 +162,8 @@ test('SonarQube apparaît dans le pipeline et les résultats par outil', () => {
 test('le filtre par outil du dashboard propose SonarQube dès qu’il produit des résultats', () => {
   const model = buildDashboardModel([sonarFinding()], [{ tool: 'SonarQube', status: 'completed' }], {});
   const html = renderDashboardHtml(model, 'n', 'findings', 'light', {});
-  assert.match(html, /<option value="SonarQube">SonarQube<\/option>/);
+  assert.match(html, /<option value="sonarqube">SonarQube<\/option>/);
+  assert.match(html, /data-tool-id="sonarqube"/);
 });
 
 test('un SonarQube désactivé est annoncé sans inventer de compteur', () => {

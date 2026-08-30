@@ -51,11 +51,17 @@ pipeline {
         //
         // `returnStatus` est indispensable : on veut LIRE le code de sortie, pas
         // laisser Jenkins interrompre le pipeline avant l'archivage.
+        //
+        // Le CLI est celui du dépôt fraîchement extrait, exactement comme dans le
+        // workflow GitHub. Il n'est jamais téléchargé : « security-center » n'est
+        // pas un paquet npm publié, et un `npx --yes` sur ce nom irait chercher
+        // sur le registre public ce qui l'occupe — précisément le risque de chaîne
+        // d'approvisionnement que ce pipeline est censé détecter.
         script {
           env.SC_EXIT = sh(
             returnStatus: true,
             script: '''
-              npx --yes security-center scan \
+              node vscode-extension/src/cli.js scan \
                 --workspace "$WORKSPACE" \
                 --format json \
                 --output security-center-full-report.json \

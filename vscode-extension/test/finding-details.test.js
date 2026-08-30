@@ -31,8 +31,12 @@ test('conserve le contexte HTTP et affiche uniquement les preuves réellement li
   assert.match(html, /backToHttpRequest/);
   assert.match(html, /openHttpRequest/);
   assert.match(html, /var\(--vscode-editor-background\)/);
-  assert.match(html, /class="theme-light"/);
+  assert.match(html, /class="theme-light[^"]*"/);
   assert.match(html, /--vscode-editor-background:#f8f9fb/);
+  // Les details vivent maintenant dans le cadre applicatif partage, sans que le
+  // rendu du finding lui-meme change.
+  assert.match(html, /class="sc-internal-nav"/);
+  assert.match(html, /<button class="sc-nav-item active"[^>]*data-command="securityCenter\.openFindingsPage"/);
 });
 
 test('affiche la correction Ollama seulement pour un finding relié au code local', () => {

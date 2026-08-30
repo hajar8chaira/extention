@@ -604,3 +604,181 @@ test('missing scanner does not create false resolved findings and marks partial 
 });
 
 
+
+// ===========================================================================
+// Regression : Compare Scans doit retomber sur l historique local (Checkpoint 5)
+//
+// La commande ne lisait que le backend. Hors ligne, ou avec moins de deux scans
+// exploitables, elle annoncait « aucun scan disponible pour comparer » alors que
+// Security Center avait deja persiste ces scans sous LOCAL_SCAN_HISTORY_KEY.
+// La page Historique des scans avait deja le bon comportement : c est elle qui
+// sert de reference.
+// ===========================================================================
+
+const fsCk5 = require('node:fs');
+const pathCk5 = require('node:path');
+const { appendLocalHistory, localScanAsComparable, comparableLocalScans, HISTORY_KEY } = require('../src/scan-history-page');
+
+const ck5ExtensionSource = () => fsCk5.readFileSync(pathCk5.join(__dirname, '..', 'src', 'extension.js'), 'utf8').split('\r').join('');
+
+/** Une sauvegarde locale telle que `addCurrentScanToLocalHistory` l ecrit. */
+function localEntry(localId, savedAt, findings, scanners = [{ tool: 'Semgrep', status: 'completed' }]) {
+  return { localId, savedAt, workspace: 'demo', findings, scanners, dashboardOptions: { workspace: 'demo' } };
+}
+
+/** Un enregistrement backend tel que `getScan` le renvoie. */
+function backendScan(scanId, finishedAt, findings, scanners = [{ tool: 'Semgrep', status: 'completed' }]) {
+  return { scan_id: scanId, finished_at: finishedAt, workspace: 'demo', result: { finished_at: finishedAt, workspace: 'demo', findings, scanners } };
+}
+
+const ck5Finding = (id, severity = 'HIGH') => ({ id, fingerprint: id, tool: 'Semgrep', rawSeverity: severity, title: `Alerte ${id}`, file: 'src/a.js', startLine: 1, triageStatus: 'new' });
+
+/**
+ * Reproduit la selection de source du produit corrige : backend d abord,
+ * historique local en repli, message honnete si aucune des deux ne suffit.
+ */
+function selectComparisonSource({ backendScans = null, backendThrows = '', history = [] }) {
+  const MINIMUM = 2;
+  let scans = [];
+  let backendError = '';
+  try {
+    if (backendThrows) throw new Error(backendThrows);
+    scans = backendScans || [];
+  } catch (error) { backendError = error.message; }
+  let source = 'backend';
+  if (scans.length < MINIMUM) {
+    const local = comparableLocalScans(history);
+    if (local.length >= MINIMUM) { scans = local; source = 'local'; }
+  }
+  if (scans.length < MINIMUM) {
+    if (backendError) return { state: 'error', message: backendError };
+    return { state: 'empty', message: 'Security Center : aucun scan disponible pour comparer.' };
+  }
+  return { state: 'ready', source, scans };
+}
+
+test('compare : le backend reste prefere quand il fournit assez de scans', () => {
+  const history = [localEntry('local-1', '2026-08-01T00:00:00Z', [ck5Finding('L1')]), localEntry('local-2', '2026-08-02T00:00:00Z', [])];
+  const result = selectComparisonSource({
+    backendScans: [backendScan(1, '2026-08-10T00:00:00Z', [ck5Finding('B1')]), backendScan(2, '2026-08-11T00:00:00Z', [])],
+    history
+  });
+  assert.equal(result.state, 'ready');
+  assert.equal(result.source, 'backend', 'le backend ne doit jamais etre remplace quand il suffit');
+  assert.deepEqual(result.scans.map((scan) => scan.scan_id), [1, 2]);
+});
+
+test('compare : backend indisponible, l historique local prend le relais', () => {
+  const history = [localEntry('local-1', '2026-08-01T00:00:00Z', [ck5Finding('L1')]), localEntry('local-2', '2026-08-02T00:00:00Z', [])];
+  const result = selectComparisonSource({ backendThrows: 'Le backend local ne répond pas.', history });
+  assert.equal(result.state, 'ready');
+  assert.equal(result.source, 'local');
+  const comparison = compareScans(result.scans[0], result.scans[1]);
+  assert.equal(comparison.resolved.length, 1, 'la comparaison fonctionne depuis l historique local');
+  assert.equal(comparison.added.length, 0);
+});
+
+test('compare : backend vide, l historique local prend le relais', () => {
+  const history = [localEntry('local-1', '2026-08-01T00:00:00Z', [ck5Finding('L1')]), localEntry('local-2', '2026-08-02T00:00:00Z', [ck5Finding('L1'), ck5Finding('L2')])];
+  const result = selectComparisonSource({ backendScans: [], history });
+  assert.equal(result.state, 'ready');
+  assert.equal(result.source, 'local');
+  const comparison = compareScans(result.scans[0], result.scans[1]);
+  assert.equal(comparison.added.length, 1);
+  assert.equal(comparison.persistent.length, 1);
+});
+
+test('compare : un seul scan backend ne suffit pas, le local prend le relais', () => {
+  const history = [localEntry('local-1', '2026-08-01T00:00:00Z', [ck5Finding('L1')]), localEntry('local-2', '2026-08-02T00:00:00Z', [])];
+  const result = selectComparisonSource({ backendScans: [backendScan(1, '2026-08-10T00:00:00Z', [])], history });
+  assert.equal(result.state, 'ready');
+  assert.equal(result.source, 'local', 'deux scans sont necessaires pour comparer');
+  assert.equal(result.scans.length, 2);
+});
+
+test('compare : aucune source suffisante conserve le message honnete existant', () => {
+  assert.equal(selectComparisonSource({ backendScans: [], history: [] }).message, 'Security Center : aucun scan disponible pour comparer.');
+  assert.equal(selectComparisonSource({ backendScans: [], history: [localEntry('local-1', '2026-08-01T00:00:00Z', [])] }).state, 'empty');
+  // Une panne backend reelle n est pas masquee par « aucun scan ».
+  const failed = selectComparisonSource({ backendThrows: 'Le backend local ne répond pas.', history: [] });
+  assert.equal(failed.state, 'error');
+  assert.match(failed.message, /ne répond pas/);
+});
+
+test('compare : une sauvegarde locale sans scanner n est pas comparable', () => {
+  // Sans statut de scanner, `compareScans` n a aucune couverture a intersecter :
+  // l entree est ecartee au lieu de produire une comparaison vide trompeuse.
+  const history = [localEntry('local-1', '2026-08-01T00:00:00Z', [ck5Finding('L1')], []), localEntry('local-2', '2026-08-02T00:00:00Z', [], [])];
+  assert.equal(comparableLocalScans(history).length, 0);
+  assert.equal(selectComparisonSource({ backendScans: [], history }).state, 'empty');
+});
+
+test('compare : l historique local n est ni mute ni vide par la comparaison', () => {
+  const history = [localEntry('local-1', '2026-08-01T00:00:00Z', [ck5Finding('L1')]), localEntry('local-2', '2026-08-02T00:00:00Z', [])];
+  const snapshot = JSON.stringify(history);
+  const result = selectComparisonSource({ backendThrows: 'offline', history });
+  compareScans(result.scans[0], result.scans[1]);
+  assert.equal(JSON.stringify(history), snapshot, 'les entrees persistees restent intactes');
+  assert.equal(history.length, 2);
+  // L adaptateur retourne bien un nouvel objet.
+  const adapted = localScanAsComparable(history[0]);
+  assert.notEqual(adapted, history[0]);
+  assert.equal(adapted.result.findings, history[0].findings, 'les findings sont passes tels quels, sans copie ni recalcul');
+});
+
+test('compare : l algorithme de comparaison est inchange, quelle que soit la source', () => {
+  const findingsA = [ck5Finding('X1'), ck5Finding('X2', 'LOW')];
+  const findingsB = [ck5Finding('X2', 'HIGH'), ck5Finding('X3')];
+  const fromBackend = compareScans(backendScan(1, '2026-08-01T00:00:00Z', findingsA), backendScan(2, '2026-08-02T00:00:00Z', findingsB));
+  const fromLocal = compareScans(
+    localScanAsComparable(localEntry('local-1', '2026-08-01T00:00:00Z', findingsA)),
+    localScanAsComparable(localEntry('local-2', '2026-08-02T00:00:00Z', findingsB))
+  );
+  for (const key of ['added', 'resolved', 'persistent', 'severityChanged', 'unchanged']) {
+    assert.deepEqual(fromLocal[key].map((f) => f.id), fromBackend[key].map((f) => f.id), `${key} doit etre identique quelle que soit la source`);
+  }
+});
+
+test('compare : l adaptateur local respecte le contrat lu par la comparaison', () => {
+  const entry = localEntry('local-9', '2026-08-05T12:00:00Z', [ck5Finding('Z1')]);
+  const adapted = localScanAsComparable(entry);
+  assert.equal(adapted.scan_id, 'local-9');
+  assert.equal(adapted.finished_at, '2026-08-05T12:00:00Z');
+  assert.equal(adapted.result.finished_at, '2026-08-05T12:00:00Z');
+  assert.deepEqual(adapted.result.scanners, entry.scanners);
+  assert.equal(localScanAsComparable(null), null);
+  assert.equal(localScanAsComparable({ savedAt: 'x' }), null, 'une entree sans identifiant local est ignoree');
+});
+
+test('compare : cablage reel, repli local sans seconde cle de persistance', () => {
+  const source = ck5ExtensionSource();
+  const command = source.match(/registerCommand\('securityCenter\.compareScans'[\s\S]*?const prunedScans/);
+  assert.ok(command, 'la commande compareScans doit exister');
+  // Le backend reste tente en premier.
+  assert.match(command[0], /await listScans\(baseUrl, 100\)/);
+  // Le repli lit l historique local existant, via la meme cle.
+  assert.match(command[0], /comparableLocalScans\(context\.workspaceState\.get\(LOCAL_SCAN_HISTORY_KEY, \[\]\)\)/);
+  // Une panne backend n avorte plus la commande avant le repli.
+  assert.doesNotMatch(command[0], /const summaries = await listScans\(baseUrl, 100\);\s*\n\s*if \(!summaries/);
+  // Aucune seconde cle de persistance n a ete introduite.
+  assert.equal(HISTORY_KEY, 'securityCenter.scanHistory.v1');
+  assert.equal((source.match(/securityCenter\.scanHistory\.v\d/g) || []).length, 0, 'la cle n est referencee que par son export');
+  // Et rien n est ecrit dans l historique par la comparaison.
+  assert.doesNotMatch(command[0], /workspaceState\.update\(LOCAL_SCAN_HISTORY_KEY/);
+});
+
+test('compare : la page Historique des scans conserve son comportement', () => {
+  const source = ck5ExtensionSource();
+  const history = source.match(/registerCommand\('securityCenter\.showScanHistoryPage'[\s\S]*?renderScanHistoryHtml\(localScans, backendScans, backendError/);
+  assert.ok(history, 'la page Historique lit toujours local + backend + erreur backend');
+  assert.match(source, /const localScans = context\.workspaceState\.get\(LOCAL_SCAN_HISTORY_KEY, \[\]\);/);
+});
+
+test('compare : aucune refonte visuelle de la page de comparaison', () => {
+  const source = ck5ExtensionSource();
+  const command = source.match(/registerCommand\('securityCenter\.compareScans'[\s\S]*?renderScanComparisonHtml\(prunedScans, nonce, theme\)/);
+  assert.ok(command, 'le rendu de la comparaison est inchange');
+  assert.match(command[0], /createWebviewPanel\(\s*'securityCenter\.scanComparison'/);
+  // Aucun libelle de debogage de source n a ete ajoute a la page.
+  assert.doesNotMatch(source, /LOCAL FALLBACK|REPLI LOCAL|fallbackBadge/i);
+});

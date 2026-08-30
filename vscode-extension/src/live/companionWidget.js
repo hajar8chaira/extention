@@ -92,7 +92,7 @@ const BUBBLE_LINGER_MS = 6000;
  * renders nothing at all rather than a placeholder companion — an assistant with
  * no state to report should not appear.
  */
-function renderCompanionWidget(visual, { variant = 'full', enabled = true, interactive = true } = {}) {
+function renderCompanionWidget(visual, { variant = 'full', enabled = true, interactive = true, imageUri = '' } = {}) {
   if (!enabled || !visual) return '';
   const mode = variant === 'compact' ? 'compact' : 'full';
   const state = visual.mascotState || 'idle';
@@ -122,7 +122,7 @@ function renderCompanionWidget(visual, { variant = 'full', enabled = true, inter
         ${secondary ? `<span class="sc-widget-secondary">${escapeHtml(secondary)}</span>` : ''}
       </div>` : ''}
       <${tag} class="sc-widget-mascot"${interactive ? ' type="button" data-action="companion" title="Security Companion"' : ''} aria-label="${escapeHtml(label)}">
-        ${renderMascotSvg(state)}
+        ${renderMascotSvg(state, 'Security Companion', { src: imageUri })}
         ${findings ? `<span class="sc-widget-count">${findings}<span class="sc-widget-sr"> problème(s) Live dans ce fichier</span></span>` : ''}
       </${tag}>
     </aside>`;
@@ -172,7 +172,7 @@ function companionWidgetCss() {
     .sc-widget-headline{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
     .sc-widget-secondary{color:var(--sc-bubble-muted);font-size:.9em;
       display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
-    /* Severity is carried by the border *and* by the mascot's own expression, so
+    /* Severity is carried by the border *and* by the mascot's own state class, so
        it is never communicated by colour alone. */
     .sc-widget-bubble.sc-important{border-color:var(--sc-bubble-alert)}
     .sc-widget-bubble::after{content:"";position:absolute;left:50%;margin-left:-4px;bottom:-5px;width:8px;height:8px;
@@ -198,7 +198,7 @@ function companionWidgetCss() {
 
     .sc-widget-full .mascot{width:${WIDGET_SIZES.full.width}px;height:${WIDGET_SIZES.full.height}px}
     .sc-widget-compact .mascot{width:${WIDGET_SIZES.compact.width}px;height:${WIDGET_SIZES.compact.height}px}
-    .sc-no-motion .mascot *{animation:none!important}
+    .sc-no-motion .mascot{animation:none!important;transition:none!important}
 
     /* Medium viewport: closer to the edges, still clear of the content. */
     @media(max-width:1000px){.sc-widget{right:${SAFE_AREA.medium.right}px;bottom:${SAFE_AREA.medium.bottom}px}}

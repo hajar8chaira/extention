@@ -8,7 +8,7 @@ const extensionSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'exten
 
 const { LiveCompanionProvider, renderCompanionHtml } = require('../src/live/liveCompanion');
 const { buildCompanionVisualModel, companionMessageFor, secondaryFor, CompanionMessageGate, shortMessageFor } = require('../src/live/companionMessages');
-const { renderMascotSvg, mascotCss, mascotVisualFor, MASCOT_PARTS } = require('../src/live/companionMascot');
+const { renderMascotSvg, mascotCss, mascotVisualFor, DEFAULT_MASCOT_IMAGE } = require('../src/live/companionMascot');
 const { buildDashboardModel, renderDashboardHtml } = require('../src/dashboard');
 
 const live = (ruleId = 'unsafe-eval', severity = 'high') => ({
@@ -116,10 +116,13 @@ test('le provider survit sans vue attachée', () => {
 });
 
 test('la mascotte et ses animations sont préservées', () => {
-  const svg = renderMascotSvg('warning');
-  for (const part of MASCOT_PARTS) assert.match(svg, new RegExp(`id="${part}"`), `partie ${part} perdue`);
+  const html = renderMascotSvg('warning');
+  assert.match(html, /<img class="mascot mascot-warning /);
+  assert.equal(DEFAULT_MASCOT_IMAGE, 'media/live/security-companion.png');
+  assert.match(html, /src="media\/live\/security-companion\.png"/);
+  assert.match(html, /data-companion-asset="local"/);
   assert.match(mascotCss(), /@keyframes/);
-  assert.match(mascotCss(), /--sc-body:var\(--vscode-[\w-]+,#[0-9a-fA-F]+\)/);
+  assert.match(mascotCss(), /\.mascot-warning\{animation:sc-attend/);
   assert.equal(mascotVisualFor('findings', { severity: 'critical' }), 'critical');
 });
 
@@ -183,7 +186,7 @@ test('le détail ne répète pas le titre', () => {
 test('le dashboard ne contient toujours aucune mascotte complète', () => {
   for (const surface of ['sidebar', 'full', 'findings', 'scans', 'dynamic', 'analytics']) {
     const html = renderDashboardHtml(buildDashboardModel([], []), 'n', surface, 'light');
-    assert.ok(!html.includes('<svg class="mascot'), `mascotte réapparue sur ${surface}`);
+    assert.ok(!html.includes('<img class="mascot'), `mascotte réapparue sur ${surface}`);
     assert.ok(!html.includes('companion-card'), `carte compagnon réapparue sur ${surface}`);
   }
 });

@@ -2,7 +2,7 @@
   "name": "security-center-vscode",
   "displayName": "Security Center",
   "description": "Plateforme DevSecOps locale pour SAST, secrets, SCA, DAST, triage, audit et rapports SARIF.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "pfa-security-center",
   "license": "MIT",
   "engines": {
@@ -41,6 +41,13 @@
     "onCommand:securityCenter.applyFindingFix",
     "onCommand:securityCenter.verifyFindingFix",
     "onCommand:securityCenter.configureTeamIntegrations",
+    "onCommand:securityCenter.configureSiem",
+    "onCommand:securityCenter.configurePrometheus",
+    "onCommand:securityCenter.configureObservability",
+    "onCommand:securityCenter.openPrometheusMetrics",
+    "onCommand:securityCenter.configureWazuh",
+    "onCommand:securityCenter.openRuntimeSecurity",
+    "onCommand:securityCenter.openInfrastructure",
     "onCommand:securityCenter.configureOllama",
     "onCommand:securityCenter.generateAiFix",
     "onCommand:securityCenter.rollbackAiFix",
@@ -173,8 +180,43 @@
       },
       {
         "command": "securityCenter.configureTeamIntegrations",
-        "title": "Security Center: Configurer Slack ou Jira",
+        "title": "Security Center: Ouvrir les intégrations",
         "icon": "$(broadcast)"
+      },
+      {
+        "command": "securityCenter.configureSiem",
+        "title": "Security Center: Configurer Runtime Security",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "securityCenter.configurePrometheus",
+        "title": "Security Center: Configurer Prometheus",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "securityCenter.configureObservability",
+        "title": "Security Center: Configurer l'infrastructure",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "securityCenter.openPrometheusMetrics",
+        "title": "Security Center: Ouvrir les métriques Prometheus",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "securityCenter.configureWazuh",
+        "title": "Security Center: Configurer Wazuh",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "securityCenter.openRuntimeSecurity",
+        "title": "Security Center: Ouvrir Runtime Security",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "securityCenter.openInfrastructure",
+        "title": "Security Center: Ouvrir Infrastructure",
+        "icon": "$(graph)"
       },
       {
         "command": "securityCenter.checkOllama",
@@ -691,6 +733,58 @@
           "default": "",
           "description": "Utilisateur Jenkins associé au jeton d'API. Le jeton lui-même n'est jamais stocké ici."
         },
+        "securityCenter.prometheus.url": {
+          "type": "string",
+          "default": "",
+          "description": "URL d'un serveur Prometheus existant, par exemple http://host:9090. Security Center n'installe pas Prometheus et n'utilise pas Grafana."
+        },
+        "securityCenter.wazuh.url": {
+          "type": "string",
+          "default": "",
+          "description": "URL de l'API Wazuh existante, par exemple https://host:55000. Les identifiants restent dans SecretStorage."
+        },
+        "securityCenter.wazuh.username": {
+          "type": "string",
+          "default": "",
+          "description": "Utilisateur Wazuh associé au credential stocké dans VS Code SecretStorage."
+        },
+        "securityCenter.infrastructure.provider": {
+          "type": "string",
+          "default": "",
+          "description": "Identifiant du fournisseur d'observabilite actif pour Infrastructure, par exemple « prometheus ». Vide signifie qu'aucun fournisseur n'est connecte. La liste des identifiants disponibles vient du catalogue d'adaptateurs de Security Center ; aucun identifiant n'est duplique ici pour eviter qu'il ne diverge. Les identifiants de connexion ne sont jamais stockes dans ce parametre : ils restent dans VS Code SecretStorage."
+        },
+        "securityCenter.infrastructure.providers": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "description": "Configuration NON SECRETE d'un fournisseur d'observabilite (point de terminaison, options de connexion…).",
+            "additionalProperties": {
+              "type": [
+                "string",
+                "boolean"
+              ]
+            }
+          },
+          "markdownDescription": "Configuration **non secrete** de chaque fournisseur d'observabilite, indexee par identifiant de fournisseur (par exemple `prometheus`). Conserve la configuration d'un fournisseur meme lorsqu'il n'est plus actif, afin de pouvoir revenir a lui sans tout ressaisir.\n\n**Aucun mot de passe, jeton, cle d'API ou secret client ne doit figurer ici.** Les identifiants de connexion sont stockes exclusivement dans VS Code SecretStorage, sous `securityCenter.observability.<fournisseur>.<secret>`, et ne sont jamais reecrits dans les parametres ni renvoyes a une webview."
+        },
+        "securityCenter.runtimeSecurity.provider": {
+          "type": "string",
+          "default": "",
+          "description": "Identifiant du fournisseur SIEM actif pour Runtime Security, par exemple « wazuh ». Vide signifie qu'aucun fournisseur n'est connecté. La liste des identifiants disponibles vient du catalogue d'adaptateurs de Security Center ; aucun identifiant n'est dupliqué ici pour éviter qu'il ne diverge. Les identifiants de connexion ne sont jamais stockés dans ce paramètre : ils restent dans VS Code SecretStorage."
+        },
+        "securityCenter.runtimeSecurity.providers": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "description": "Configuration NON SECRÈTE d'un fournisseur SIEM (point de terminaison, identifiant d'utilisateur, espace…).",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "markdownDescription": "Configuration **non secrète** de chaque fournisseur SIEM, indexée par identifiant de fournisseur (par exemple `wazuh`). Conserve la configuration d'un fournisseur même lorsqu'il n'est plus actif, afin de pouvoir revenir à lui sans tout ressaisir.\n\n**Aucun mot de passe, jeton, clé d'API ou secret client ne doit figurer ici.** Les identifiants de connexion sont stockés exclusivement dans VS Code SecretStorage, sous `securityCenter.runtimeSecurity.<fournisseur>.<secret>`, et ne sont jamais réécrits dans les paramètres ni renvoyés à une webview."
+        },
         "securityCenter.audit.actor": {
           "type": "string",
           "default": "",
@@ -816,6 +910,6 @@
     "benchmark:ai": "node scripts/ai-remediation-benchmark.js",
     "scan:real": "node scripts/run-real-scan.js ../test-application/juice-shop ../security-reports",
     "package:vsix": "npx --yes @vscode/vsce package --out ../security-center-vscode.vsix",
-    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/policy-config.js && node --check src/license-compliance.js && node --check src/dashboard.js && node --check src/dynamic-campaign.js && node --check src/dynamic-inventory.js && node --check src/dynamic-retest.js && node --check src/dynamic-auth.js && node --check src/dynamic-workspace.js && node --check src/jenkins.js && node --check src/ci-report.js && node --check src/delivery-page.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/snyk.js && node --check src/snyk-api.js && node --check src/pipeline.js && node --check src/pipeline-page.js && node --check src/intelligence/finding-model.js && node --check src/intelligence/route-map.js && node --check src/intelligence/correlation-v2.js && node --check src/intelligence/reachability.js && node --check src/intelligence/prioritization.js && node --check src/intelligence/policy-gate.js && node --check src/supply-chain/sbom.js && node --check src/supply-chain/cosign.js && node --check src/supply-chain/provenance.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/fix-verification.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/ollama-health.js && node --check src/ai/secret-redaction.js && node --check src/ai/remediation-result.js && node --check src/live/companionMascot.js && node --check src/live/companionMessages.js && node --check src/live/liveCompanion.js && node --check src/live/companionWidget.js && node --check src/live/livePage.js"
+    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/policy-config.js && node --check src/license-compliance.js && node --check src/security-center-shell.js && node --check src/companion-assistant-card.js && node --check src/sidebar-launcher.js && node --check src/dashboard.js && node --check src/scanner-presentation.js && node --check src/integrations/http.js && node --check src/integrations/observability.js && node --check src/integrations/observability-contract.js && node --check src/integrations/observability-catalogue.js && node --check src/integrations/observability-prometheus.js && node --check src/integrations/observability-zabbix.js && node --check src/integrations/observability-datadog.js && node --check src/integrations/provider-configuration.js && node --check src/integrations/siem.js && node --check src/integrations/siem-contract.js && node --check src/integrations/siem-catalogue.js && node --check src/integrations/siem-wazuh.js && node --check src/integrations/siem-elastic.js && node --check src/integrations/siem-splunk.js && node --check src/integrations/siem-configuration.js && node --check src/integrations/siem-navigation.js && node --check src/integrations/siem-alerts.js && node --check src/integrations/siem-indexer.js && node --check src/integrations/siem-vulnerabilities.js && node --check src/integrations-page.js && node --check src/enterprise-domain-pages.js && node --check src/dynamic-campaign.js && node --check src/dynamic-inventory.js && node --check src/dynamic-retest.js && node --check src/dynamic-auth.js && node --check src/dynamic-workspace.js && node --check src/jenkins.js && node --check src/ci-report.js && node --check src/delivery-page.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/snyk.js && node --check src/snyk-api.js && node --check src/pipeline.js && node --check src/pipeline-page.js && node --check src/intelligence/finding-model.js && node --check src/intelligence/route-map.js && node --check src/intelligence/correlation-v2.js && node --check src/intelligence/reachability.js && node --check src/intelligence/prioritization.js && node --check src/intelligence/policy-gate.js && node --check src/supply-chain/sbom.js && node --check src/supply-chain/cosign.js && node --check src/supply-chain/provenance.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/fix-verification.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/ollama-health.js && node --check src/ai/secret-redaction.js && node --check src/ai/remediation-result.js && node --check src/live/companionMascot.js && node --check src/live/companionMessages.js && node --check src/live/liveCompanion.js && node --check src/live/companionWidget.js && node --check src/live/livePage.js"
   }
 }

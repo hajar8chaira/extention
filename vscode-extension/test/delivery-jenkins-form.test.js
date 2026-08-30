@@ -241,12 +241,23 @@ test('le contenu hostile des champs préremplis est échappé', () => {
 
 // ============================================================ thème
 
-test('le formulaire n’utilise que des variables de thème', () => {
+test('le formulaire n’utilise que les tokens de thème Security Center', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'delivery-page.js'), 'utf8');
   const css = source.slice(source.indexOf('.jenkins-form[hidden]'), source.indexOf('.footnote'));
-  assert.match(css, /var\(--vscode-input-background\)/);
-  assert.match(css, /var\(--vscode-input-foreground\)/);
-  assert.match(css, /var\(--vscode-focusBorder\)/);
+  // Les contrôles passent par les tokens --sc-input-*, que le contrôleur de
+  // thème redéfinit pour chaque thème.
+  assert.match(css, /var\(--sc-input-bg\)/);
+  assert.match(css, /var\(--sc-input-text\)/);
+  assert.match(css, /var\(--sc-input-border\)/);
+  assert.match(css, /var\(--sc-input-placeholder\)/);
+  // L'anneau de focus est un token lui aussi — l'accent Security Center.
+  assert.match(css, /input:focus\{[^}]*var\(--sc-primary\)/);
+  // GARDE-FOU DE RÉGRESSION. Lire --vscode-input-* directement était le défaut
+  // de mode clair : ces variables gardent le fond sombre de VS Code alors que la
+  // page est forcée en clair, ce qui donnait des champs presque noirs au milieu
+  // d'une page blanche. Les tokens --sc-input-* retombent sur --vscode-input-*
+  // en thème sombre uniquement, donc les deux thèmes restent corrects.
+  assert.ok(!/var\(--vscode-input-/.test(css), 'les contrôles ne doivent plus lire --vscode-input-* directement');
   // Aucun fond ni texte noir/blanc codé en dur.
   assert.ok(!/background:\s*#(000|111|1e1e1e|222|fff|ffffff)\b/i.test(css));
   assert.ok(!/color:\s*#(000|000000|fff|ffffff)\b/i.test(css));
@@ -257,9 +268,14 @@ test('la page rend les deux thèmes sans changer de structure', () => {
   const dark = renderDeliveryPageHtml(configured(), 'n', 'dark');
   assert.match(light, /data-theme="light"/);
   assert.match(dark, /data-theme="dark"/);
-  // Seul l'attribut de thème diffère : les couleurs viennent des variables.
-  assert.equal(light.replace('data-theme="light"', ''), dark.replace('data-theme="dark"', ''));
-  assert.match(light, /color-scheme:light dark/);
+  // Seuls l'attribut de thème et la classe du body diffèrent : les couleurs
+  // viennent des variables du cadre partagé.
+  const strip = (html, theme) => html
+    .replace(`data-theme="${theme}"`, '')
+    .replace(`<body class="theme-${theme}`, '<body class="');
+  assert.equal(strip(light, 'light'), strip(dark, 'dark'));
+  assert.match(light, /color-scheme: light/);
+  assert.match(dark, /color-scheme: dark/);
 });
 
 test('la politique de sécurité de contenu reste stricte', () => {

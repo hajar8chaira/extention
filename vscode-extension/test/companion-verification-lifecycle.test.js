@@ -42,7 +42,7 @@ test('chaque etat du cycle se rend sur le widget', () => {
   for (const state of Object.values(VERIFICATION_STATE)) {
     if (state === VERIFICATION_STATE.OPEN) continue;
     const html = renderCompanionWidget(modelFor(state), { variant: 'full' });
-    assert.match(html, /<svg class="mascot mascot-[a-z]+/, `${state} rend une mascotte`);
+    assert.match(html, /<img class="mascot mascot-[a-z]+/, `${state} rend une mascotte`);
     assert.ok(!html.includes('undefined'), `${state} ne rend aucun undefined`);
   }
 });
