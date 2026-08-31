@@ -84,7 +84,7 @@ test('le lanceur n’importe aucune logique metier', () => {
 test('le CTA principal existe, domine la vue et ne cite pas la commande lui-meme', () => {
   const html = render();
   assert.match(html, /<button class="cta" data-open-security-center/);
-  assert.match(html, /Ouvrir Security Center/);
+  assert.match(html, /Ouvrir Secenter/);
   // Le bouton demande une intention ; c'est l'extension qui choisit la commande
   // et l'ordre des operations. Un `data-command` ici court-circuiterait le
   // repliement de la barre laterale.
@@ -254,7 +254,7 @@ test('le lanceur reste utilisable au clavier et ne depend pas de la couleur seul
   assert.match(html, /\.cta:focus-visible/);
   assert.match(html, /\.quick-action:focus-visible/);
   assert.match(html, /\.live-link:focus-visible/);
-  assert.match(html, /aria-label="Ouvrir Security Center"/);
+  assert.match(html, /aria-label="Ouvrir Secenter"/);
   assert.match(html, /aria-label="Actions rapides"/);
   // Chaque pastille porte un glyphe en plus de sa teinte.
   const pills = [...html.matchAll(/<p class="state-pill [^"]+"[\s\S]*?<\/p>/g)].map(([pill]) => pill);

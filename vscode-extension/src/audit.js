@@ -77,7 +77,7 @@ function getReadableAction(action) {
  *   La page s'ouvre dans tous les cas : un backend injoignable doit se voir,
  *   pas faire disparaitre le journal. Aucun evenement n'est invente.
  */
-function renderAuditLogHtml(events, nonce, selectedTheme = 'light', backendError = '') {
+function renderAuditLogHtml(events, nonce, selectedTheme = 'light', backendError = '', assets = {}) {
   const eventsJson = JSON.stringify(events.map(e => ({
     ...e,
     readableAction: getReadableAction(e.action)
@@ -709,7 +709,9 @@ function renderAuditLogHtml(events, nonce, selectedTheme = 'light', backendError
     // Boot
     populateDropdowns();
     render();`,
-    csp: `default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${assets.cspSource || "'none'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets.brandLogoUri || '',
+    cspSource: assets.cspSource || '',
   });
 }
 

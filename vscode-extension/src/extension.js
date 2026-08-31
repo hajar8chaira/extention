@@ -20,8 +20,14 @@ const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, n
 const { groupFindings, summarizeFindings } = require('./tree');
 const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpStatus, updateFindingStatus, listAuditEvents, createAuditEvent, listScans, getScan, requestText, scanExportUrl } = require('./backend');
 const { CACHE_KEY: LOCAL_SCAN_CACHE_KEY, createLocalScanCache, restoreLocalScanCache } = require('./local-scan-cache');
-const { fetchDeliveryStatus, normalizeJenkinsUrl, jobUrl: jenkinsJobUrl, deliveryStatusFrom, testJenkinsConnection, artifactUrl: jenkinsArtifactUrl } = require('./jenkins');
+const { normalizeJenkinsUrl, deliveryStatusFrom, artifactUrl: jenkinsArtifactUrl } = require('./jenkins');
 const { renderDeliveryPageHtml } = require('./delivery-page');
+const {
+  DELIVERY_PROVIDERS, DEFAULT_DELIVERY_PROVIDER, deliveryAdapter, deliveryProvider,
+  isSupportedDeliveryProvider, fetchDeliveryModel, testDeliveryConnection: testDeliveryProviderConnection,
+  deliveryConsoleUrl, notConfiguredModel
+} = require('./integrations/delivery');
+const { renderDeliveryProviderPageHtml } = require('./delivery-provider-view');
 const {
   fetchPrometheusStatus, buildPrometheusStatus, normalizePrometheusUrl,
   DEFAULT_OBSERVABILITY_PROVIDER, isSupportedObservabilityProvider, observabilityProvider, observabilityAdapter
@@ -78,6 +84,14 @@ const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
 const { evaluatePolicyGate, policyGateError, policyResultFromGate, STATUS: GATE_STATUS } = require('./intelligence/policy-gate');
 const { readPolicyGateConfig, savePolicyGate, createStarterPolicy, policyGateHash, policyFilePath } = require('./policy-config');
 const { analyzeLicenses, renderLicenseReportHtml } = require('./license-compliance');
+const { probeBackend, normalizeBackendUrl, BACKEND_STATE, DEFAULT_BACKEND_URL } = require('./backend-config');
+const {
+  BackendManager, BACKEND_MODE, BACKEND_MODE_LABELS, RESOLVED_MODE, MODE_SETTING, REMOTE_URL_SETTING,
+  resolveBackendMode, resolveDataDirectory, generateLocalApiKey,
+  dashboardBackendStatus, DASHBOARD_BACKEND_STATUS
+} = require('./backend-manager');
+const { describeWorkspaceIdentity } = require('./workspace-identity');
+const { collectLicenseSources } = require('./supply-chain/license-sources');
 const { installPreCommitHook } = require('./precommit');
 const { buildTrendReport, renderTrendReportHtml } = require('./trends');
 const { runWithConcurrency } = require('./scheduler');
@@ -117,6 +131,50 @@ const { renderPipelinePageHtml } = require('./pipeline-page');
 const { detectLocalCosign, generateKeyPair, signBlob, verifyBlob, supportedModes: cosignModes, keylessSupport } = require('./supply-chain/cosign');
 const { SCANNER_RUNTIMES, diagnoseScanner, normalizeMode } = require('./scanner-diagnostics');
 const execFileAsync = promisify(execFile);
+/** The key the local backend and the Burp connector share. Generated once, never logged. */
+const BACKEND_API_KEY_SECRET = 'securityCenter.backend.apiKey';
+const BACKEND_LOCAL_KEY_SECRET = 'securityCenter.backend.localKey';
+
+/**
+ * The backend, as one object for the whole extension.
+ *
+ * Every capability that persists something asks this manager for the address
+ * instead of reading the setting itself: in Auto mode the port is whatever the
+ * running service published, which no caller can know on its own. It is created
+ * in `activate` and lives as long as the window.
+ */
+let backendManager = null;
+
+/**
+ * Le workspace courant, lu dans VS Code au moment ou on le demande.
+ *
+ * Jamais memorise : un dossier ferme, remplace ou ajoute doit changer la reponse
+ * au prochain appel, sans qu'aucun cache n'ait a etre invalide.
+ */
+function currentWorkspaceIdentity() {
+  return describeWorkspaceIdentity(vscode.workspace.workspaceFolders, vscode.workspace.name);
+}
+
+/** The address to call. Valid before activation completes, so no call site can crash on it. */
+function backendBaseUrl() {
+  return backendManager ? backendManager.resolveBackendUrl() : DEFAULT_BACKEND_URL;
+}
+
+/**
+ * The backend, up.
+ *
+ * Called by the capabilities that need it — history, trends, the audit journal,
+ * Burp ingestion — and by nothing else. In Auto mode it starts the local service
+ * on first use; in Remote mode it reports what the configured address answers.
+ * Capabilities that do not persist anything never call it and are never blocked
+ * by it: scanning, Live Security and the fix workflow are unaffected by a
+ * backend that is down.
+ */
+async function ensureBackendOnline() {
+  if (!backendManager) return { online: false, state: BACKEND_STATE.NOT_CONFIGURED, label: 'Non configuré', url: '', hint: '', message: '' };
+  return backendManager.ensureBackend();
+}
+
 const SONAR_TOKEN_SECRET_KEY = 'securityCenter.sonar.token';
 const SNYK_TOKEN_SECRET_KEY = 'securityCenter.snyk.token';
 const COSIGN_PASSWORD_SECRET_KEY = 'securityCenter.cosign.keyPassword';
@@ -281,10 +339,14 @@ class DashboardProvider {
   providerAssetRoot() {
     return this.extensionUri ? vscode.Uri.joinPath(this.extensionUri, 'media', 'providers') : null;
   }
+  brandingAssetRoot() {
+    return this.extensionUri ? vscode.Uri.joinPath(this.extensionUri, 'media', 'branding') : null;
+  }
   companionAssetOptions(webview) {
     const root = this.companionAssetRoot();
     const scannerRoot = this.scannerAssetRoot();
     const providerRoot = this.providerAssetRoot();
+    const brandingRoot = this.brandingAssetRoot();
     if (!root || !webview?.asWebviewUri) return {};
     const scannerLogoUris = {};
     for (const [tool, file] of [
@@ -304,6 +366,11 @@ class DashboardProvider {
     }
     return {
       companionImageUri: webview.asWebviewUri(vscode.Uri.joinPath(root, 'security-companion.png')).toString(),
+      // L'identite Secenter. 256 px : la marque est rendue entre 28 et 34 px,
+      // ce qui laisse la place a un ecran 3x sans image floue.
+      brandLogoUri: brandingRoot
+        ? webview.asWebviewUri(vscode.Uri.joinPath(brandingRoot, 'secenter-icon-256.png')).toString()
+        : '',
       scannerLogoUris,
       providerLogoUris,
       jenkinsLogoUri: providerLogoUris.jenkins || '',
@@ -311,11 +378,11 @@ class DashboardProvider {
     };
   }
   companionWebviewOptions(options = {}) {
-    const roots = [this.companionAssetRoot(), this.scannerAssetRoot(), this.providerAssetRoot()].filter(Boolean);
+    const roots = [this.companionAssetRoot(), this.scannerAssetRoot(), this.providerAssetRoot(), this.brandingAssetRoot()].filter(Boolean);
     return roots.length ? { ...options, localResourceRoots: roots } : { ...options };
   }
   configureCompanionAssets(webview, options = {}) {
-    const roots = [this.companionAssetRoot(), this.scannerAssetRoot(), this.providerAssetRoot()].filter(Boolean);
+    const roots = [this.companionAssetRoot(), this.scannerAssetRoot(), this.providerAssetRoot(), this.brandingAssetRoot()].filter(Boolean);
     if (!roots.length || !webview) return;
     webview.options = {
       enableScripts: options.enableScripts !== false,
@@ -724,10 +791,33 @@ function publishDiagnostics(collection, findings) {
 }
 
 async function activate(context) {
-  setApiKey(await context.secrets.get('securityCenter.backend.apiKey') || '');
+  // The backend is a local service this extension owns, not a container the
+  // user is asked to run. Its key is generated on first activation and kept in
+  // SecretStorage: the local service, the extension and the Burp connector are
+  // three processes that have to agree on one secret, and none of them logs it.
+  const configuredBackendKey = await context.secrets.get(BACKEND_API_KEY_SECRET) || '';
+  let localBackendKey = await context.secrets.get(BACKEND_LOCAL_KEY_SECRET) || '';
+  if (!localBackendKey) {
+    localBackendKey = generateLocalApiKey();
+    await context.secrets.store(BACKEND_LOCAL_KEY_SECRET, localBackendKey);
+  }
+  const activeBackendKey = configuredBackendKey || localBackendKey;
+  setApiKey(activeBackendKey);
   const diagnostics = vscode.languages.createDiagnosticCollection('security-center');
   const liveDiagnosticCollection = vscode.languages.createDiagnosticCollection('security-center-live');
   const scanLog = vscode.window.createOutputChannel('Security Center');
+  backendManager = new BackendManager({
+    dataDir: resolveDataDirectory(context),
+    getConfiguration: () => vscode.workspace.getConfiguration('securityCenter'),
+    apiKey: activeBackendKey,
+    version: context.extension?.packageJSON?.version || '',
+    log: (message) => scanLog.appendLine(`Backend — ${message}`)
+  });
+  context.subscriptions.push({ dispose: () => backendManager && backendManager.dispose() });
+  // Started on activation so the first panel that needs history does not wait
+  // for a cold start. Failure here is reported by the pages that need it, never
+  // as a modal on an editor the user just opened.
+  ensureBackendOnline().catch(() => {});
   const provider = new FindingsProvider();
   const themeController = new ThemeController(context.globalState.get('securityCenter.theme', 'light'), (theme) => context.globalState.update('securityCenter.theme', theme));
   const scannerToolManager = new ScannerToolManager(context.globalStorageUri.fsPath);
@@ -741,6 +831,7 @@ async function activate(context) {
   const companionAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'live');
   const scannerAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'scanners');
   const providerAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'providers');
+  const brandingAssetRoot = vscode.Uri.joinPath(context.extensionUri, 'media', 'branding');
   const scannerLogoFiles = Object.freeze({
     Semgrep: 'semgrep.svg',
     Gitleaks: 'gitleaks.svg',
@@ -761,6 +852,7 @@ async function activate(context) {
     }
     return {
       companionImageUri: webview.asWebviewUri(vscode.Uri.joinPath(companionAssetRoot, 'security-companion.png')).toString(),
+      brandLogoUri: webview.asWebviewUri(vscode.Uri.joinPath(brandingAssetRoot, 'secenter-icon-256.png')).toString(),
       scannerLogoUris,
       providerLogoUris,
       jenkinsLogoUri: providerLogoUris.jenkins || '',
@@ -769,11 +861,62 @@ async function activate(context) {
   };
   const companionWebviewOptions = (extra = {}) => ({
     ...extra,
-    localResourceRoots: [companionAssetRoot, scannerAssetRoot, providerAssetRoot]
+    localResourceRoots: [companionAssetRoot, scannerAssetRoot, providerAssetRoot, brandingAssetRoot]
   });
   let currentFindings = [];
   let currentScanStatuses = [];
-  let currentDashboardOptions = {};
+  // Le workspace et l'etat du backend sont deux faits que le dashboard doit
+  // connaitre avant tout appel reseau et avant tout scan. Ils sont semes ici,
+  // puis rafraichis chacun par sa propre source : l'editeur pour le workspace,
+  // le gestionnaire de backend pour le badge. Aucun des deux ne depend plus du
+  // sort d'une requete de donnees.
+  let currentDashboardOptions = {
+    workspace: currentWorkspaceIdentity().label,
+    backendStatus: DASHBOARD_BACKEND_STATUS.UNKNOWN
+  };
+
+  const publishDashboard = () => dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+
+  /** Le dossier ouvert a change : l'affichage suit l'editeur, sans cache a invalider. */
+  const refreshWorkspaceIdentity = () => {
+    const identity = currentWorkspaceIdentity();
+    if (currentDashboardOptions.workspace !== identity.label) {
+      currentDashboardOptions = { ...currentDashboardOptions, workspace: identity.label };
+      publishDashboard();
+    }
+    return identity;
+  };
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => refreshWorkspaceIdentity()));
+
+  /**
+   * Le badge du backend, deduit du gestionnaire.
+   *
+   * `start: true` demarre le service local en mode Auto ; sinon on se contente
+   * de sonder. Dans les deux cas l'etat affiche est celui que le gestionnaire a
+   * etabli, y compris quand il est hors ligne.
+   */
+  /**
+   * Le badge apres un appel de donnees reussi.
+   *
+   * Une reponse prouve que le backend repond ; elle ne dit pas s'il est local ou
+   * opere par une organisation. Le mode resolu, lui, est connu sans reseau.
+   */
+  const backendBadgeAfterSuccess = () => (
+    backendManager && backendManager.resolvedMode() === RESOLVED_MODE.REMOTE
+      ? DASHBOARD_BACKEND_STATUS.REMOTE
+      : DASHBOARD_BACKEND_STATUS.ONLINE
+  );
+
+  const refreshBackendBadge = async ({ start = false } = {}) => {
+    if (!backendManager) return DASHBOARD_BACKEND_STATUS.UNKNOWN;
+    const status = start ? await backendManager.ensureBackend() : await backendManager.getBackendStatus();
+    const badge = dashboardBackendStatus(status);
+    if (currentDashboardOptions.backendStatus !== badge) {
+      currentDashboardOptions = { ...currentDashboardOptions, backendStatus: badge };
+      publishDashboard();
+    }
+    return badge;
+  };
   let currentSecuritySnapshot = snapshotFromLegacy();
   // Security Intelligence state lives with the other scan state so it can be
   // restored from the cache at activation, before any page is opened.
@@ -1215,7 +1358,10 @@ async function activate(context) {
     currentDashboardOptions = {
       ...restoredScan.dashboardOptions,
       dynamicCampaign: restoredCampaign || (scenarioCount ? dynamicLegacyBucket(scenarioCount) : null),
-      backendStatus: 'offline',
+      // Les resultats viennent du cache ; l'etat du service, lui, sera demande
+      // au gestionnaire. Le declarer « offline » ici serait une supposition.
+      workspace: currentWorkspaceIdentity().label,
+      backendStatus: currentDashboardOptions.backendStatus || DASHBOARD_BACKEND_STATUS.UNKNOWN,
       restoredFromCache: true,
       restoredAt: restoredScan.savedAt
     };
@@ -1243,7 +1389,16 @@ async function activate(context) {
   }
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.clearFindings', async () => {
-    diagnostics.clear(); provider.setFindings([]); dashboardProvider.setData([], [], { scanStatus: 'idle', backendStatus: 'unknown' });
+    diagnostics.clear(); provider.setFindings([]);
+    // Effacer les resultats efface les resultats. Le dossier ouvert et l'etat du
+    // service sont des faits exterieurs au scan : ils survivent a cette commande.
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      workspace: currentWorkspaceIdentity().label,
+      scanStatus: 'idle'
+    };
+    dashboardProvider.setData([], [], currentDashboardOptions);
+    refreshBackendBadge().catch(() => {});
     currentSecuritySnapshot = snapshotFromLegacy(); currentFindings = []; currentScanStatuses = []; currentDashboardOptions = {};
     await context.workspaceState.update(LOCAL_SCAN_CACHE_KEY, undefined);
   }));
@@ -1309,11 +1464,11 @@ async function activate(context) {
     dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
     await saveLocalScanCache();
     if (currentScanId) {
-      const backendBaseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+      const backendAddress = backendBaseUrl();
       try {
-        await updateFindingStatus(backendBaseUrl, currentScanId, finding.id, selected.value, actor, comment.trim());
+        await updateFindingStatus(backendAddress, currentScanId, finding.id, selected.value, actor, comment.trim());
         
-        await createAuditEvent(backendBaseUrl, {
+        await createAuditEvent(backendAddress, {
           scan_id: currentScanId || 0,
           finding_id: finding.id,
           action: 'finding.triage.changed',
@@ -1324,7 +1479,7 @@ async function activate(context) {
         }).catch(() => {});
         
         if (selected.value === 'accepted') {
-          await createAuditEvent(backendBaseUrl, {
+          await createAuditEvent(backendAddress, {
             scan_id: currentScanId || 0,
             finding_id: finding.id,
             action: 'finding.risk.accepted',
@@ -1335,7 +1490,7 @@ async function activate(context) {
           }).catch(() => {});
         }
 
-        currentDashboardOptions = { ...currentDashboardOptions, backendStatus: 'online' };
+        currentDashboardOptions = { ...currentDashboardOptions, backendStatus: backendBadgeAfterSuccess() };
       } catch (error) {
         currentDashboardOptions = { ...currentDashboardOptions, backendStatus: 'offline' };
         scanLog.appendLine(`[${new Date().toISOString()}] Persistance du triage impossible : ${error.message}`);
@@ -1481,8 +1636,8 @@ async function activate(context) {
       });
       if (!selected) return;
       const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-      const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
-      await createAuditEvent(backendBaseUrl, {
+      const backendAddress = backendBaseUrl();
+      await createAuditEvent(backendAddress, {
         scan_id: currentScanId || 0,
         action: 'ai.configuration.changed',
         actor,
@@ -1580,8 +1735,8 @@ async function activate(context) {
     if (!roles.models.fast) return vscode.window.showWarningMessage('Configurez d’abord le modèle Fast avec “Security Center: Configurer Ollama”.');
     try {
       const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-      const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
-      await createAuditEvent(backendBaseUrl, {
+      const backendAddress = backendBaseUrl();
+      await createAuditEvent(backendAddress, {
         scan_id: currentScanId || 0,
         finding_id: finding.id,
         action: 'ai.fix.requested',
@@ -1686,7 +1841,7 @@ async function activate(context) {
       const edit = new vscode.WorkspaceEdit(); edit.replace(document.uri, fullRange, proposedText);
       if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code a refusé le patch.');
       await document.save();
-      await createAuditEvent(backendBaseUrl, {
+      await createAuditEvent(backendAddress, {
         scan_id: currentScanId || 0,
         finding_id: finding.id,
         action: 'ai.fix.applied',
@@ -1769,8 +1924,8 @@ async function activate(context) {
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.rollbackAiFix', async () => {
     if (!lastAiRollback) return vscode.window.showInformationMessage('Security Center : aucun patch IA à annuler dans cette session.');
     const actor = vscode.workspace.getConfiguration('securityCenter').get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-    const backendBaseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
-    await createAuditEvent(backendBaseUrl, {
+    const backendAddress = backendBaseUrl();
+    await createAuditEvent(backendAddress, {
       scan_id: currentScanId || 0,
       finding_id: lastAiRollback.findingId,
       action: 'ai.rollback',
@@ -1922,7 +2077,7 @@ async function activate(context) {
   async function auditPolicyChange(result, comment) {
     const actor = vscode.workspace.getConfiguration('securityCenter').get('audit.actor', '')
       || process.env.USERNAME || process.env.USER || 'local-user';
-    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, action: 'policy.changed', actor, comment,
       metadata: { policyHash: result.hash || '', configured: Boolean(result.configured) }
     }).catch(() => {});
@@ -1967,7 +2122,7 @@ async function activate(context) {
     await context.workspaceState.update(PIPELINE_STATE_KEY, {
       ...persisted, policy: gate, policyHash: policyGateHash(policy), policyReevaluatedAt: reevaluatedAt
     });
-    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0,
       action: gate.status === GATE_STATUS.BLOCK ? 'policy.gate.blocked' : 'policy.gate.evaluated',
       actor: 'System',
@@ -1990,7 +2145,7 @@ async function activate(context) {
 
   /** Audit helper shared by every supply-chain action. */
   async function auditSupplyChain(action, comment, metadata = {}) {
-    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, action, actor: 'System', comment, metadata
     }).catch(() => {});
   }
@@ -2249,6 +2404,7 @@ async function activate(context) {
     if (!companionChatPanel) return;
     const context = companionChatContext();
     companionChatPanel.webview.html = renderCompanionChatHtml({
+      ...companionAssetOptions(companionChatPanel.webview),
       messages: companionChatMessages,
       state: companionChatState,
       error: companionChatError,
@@ -2872,7 +3028,7 @@ async function activate(context) {
   // every call and is passed as an Authorization header inside `jenkins.js` —
   // it is not stored in settings, not put in a URL and not rendered.
   let deliveryPanel;
-  let deliveryStatus = deliveryStatusFrom({ configured: false });
+  let deliveryStatus = notConfiguredModel({ message: 'No CI/CD provider configured.' });
 
   async function currentWorkspaceCommit() {
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -2950,7 +3106,7 @@ async function activate(context) {
     replaceFinding(verified);
     await persistVerification(verified);
     await saveLocalScanCache();
-    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, finding_id: finding.id,
       action: `fix.verification.${result.state}`, actor: 'System',
       // Only the verdict and its reason: never patch content, never scanner output.
@@ -3015,76 +3171,165 @@ async function activate(context) {
   }
 
   let deliveryConnection = null;
+  let deliverySelectedProvider = '';
+  let deliverySecretsConfigured = {};
 
-  /**
-   * The single place a Jenkins configuration is written.
-   *
-   * Both entry points — the InputBox command and the inline form in Security
-   * Delivery — end here, so URL normalisation, the workspace-settings write and
-   * the SecretStorage write exist once. A second path would be a second set of
-   * rules to keep in agreement.
-   *
-   * The token is treated as write-only: an empty value keeps whatever is already
-   * stored, and the value never travels back out of this function.
-   */
-  async function applyJenkinsConfiguration({ url = '', job = '', user = '', token = '' } = {}) {
-    const cfg = vscode.workspace.getConfiguration('securityCenter');
-    const trimmedUrl = String(url).trim();
-    let normalizedUrl = '';
-    if (trimmedUrl) {
-      try {
-        normalizedUrl = normalizeJenkinsUrl(trimmedUrl);
-      } catch (error) {
-        return { ok: false, message: error.message };
+  const deliveryConfiguration = createProviderConfigurationService({
+    configuration: {
+      get: (key, fallback) => vscode.workspace.getConfiguration('securityCenter').get(key, fallback),
+      update: (key, value) => vscode.workspace.getConfiguration('securityCenter')
+        .update(key, value, vscode.ConfigurationTarget.Workspace)
+    },
+    secrets: context.secrets,
+    resolveAdapter: deliveryAdapter,
+    domainLabel: 'Security Delivery',
+    keys: {
+      activeProvider: 'delivery.provider',
+      providersConfig: 'delivery.providers',
+      secretPrefix: 'securityCenter.delivery'
+    },
+    legacy: {
+      provider: 'jenkins',
+      fields: { url: 'jenkins.url', job: 'jenkins.job', user: 'jenkins.user' },
+      secrets: { token: JENKINS_TOKEN_SECRET_KEY }
+    }
+  });
+
+  function deliveryFormProvider() {
+    return deliverySelectedProvider
+      || deliveryConfiguration.getActiveProviderId()
+      || DEFAULT_DELIVERY_PROVIDER;
+  }
+
+  async function refreshDeliverySecretState() {
+    deliverySecretsConfigured = await deliveryConfiguration.describeProviderSecrets(deliveryFormProvider());
+  }
+
+  async function mergedDeliveryConfiguration(providerId, values = null) {
+    const adapter = deliveryAdapter(providerId);
+    if (!adapter) return {};
+    const publicConfig = { ...deliveryConfiguration.getProviderConfig(adapter.id) };
+    const secretValues = await deliveryConfiguration.getProviderSecrets(adapter.id);
+    for (const field of adapter.configurationFields) {
+      const provided = values?.[field.id];
+      if (provided === undefined) continue;
+      if (field.secret) {
+        if (String(provided) !== '') secretValues[field.id] = String(provided);
+      } else if (field.type === 'boolean') {
+        publicConfig[field.id] = provided === true;
+      } else if (String(provided).trim() || field.required) {
+        publicConfig[field.id] = String(provided).trim();
       }
     }
-    const trimmedJob = String(job).trim();
-    const trimmedToken = String(token).trim();
-    await cfg.update('jenkins.url', normalizedUrl, vscode.ConfigurationTarget.Workspace);
-    await cfg.update('jenkins.job', trimmedJob, vscode.ConfigurationTarget.Workspace);
-    await cfg.update('jenkins.user', String(user).trim(), vscode.ConfigurationTarget.Workspace);
-    // Only SecretStorage ever receives the token, and only when a new one was
-    // actually typed — an empty field means « keep the one already stored ».
-    if (trimmedToken) await context.secrets.store(JENKINS_TOKEN_SECRET_KEY, trimmedToken);
-    await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+    return { ...publicConfig, ...secretValues };
+  }
+
+  async function buildDeliveryModelFor(providerId = '', values = null) {
+    const active = await deliveryConfiguration.resolveActiveProvider();
+    const id = String(providerId || active.providerId || '').toLowerCase();
+    if (!id) return notConfiguredModel({ message: 'No CI/CD provider configured.' });
+    const config = await mergedDeliveryConfiguration(id, values);
+    return fetchDeliveryModel(id, config, { workspaceCommit: await currentWorkspaceCommit() });
+  }
+
+  /**
+   * The single place a Delivery provider configuration is written.
+   *
+   * Both the provider-neutral webviews and the Jenkins compatibility command end
+   * here, so schema validation, namespaced settings, legacy migration and
+   * SecretStorage live in one place.
+   *
+   * Empty secret fields keep the stored value. Booleans are stored as booleans,
+   * so an explicit false survives save and reload.
+   */
+  async function applyDeliveryConfiguration(providerId, values = {}) {
+    const requested = String(providerId || DEFAULT_DELIVERY_PROVIDER).toLowerCase();
+    if (!isSupportedDeliveryProvider(requested)) {
+      const known = deliveryProvider(requested);
+      return {
+        ok: false,
+        message: known
+          ? `Provider referenced, adapter unavailable in this version: ${known.label}.`
+          : `Unknown CI/CD provider: ${requested}.`
+      };
+    }
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const saved = await deliveryConfiguration.saveProviderConfiguration(requested, values);
+    if (!saved.ok) return { ok: false, message: saved.errors.join(' ') };
+    if (requested === 'jenkins') {
+      await cfg.update('jenkins.url', saved.config?.url || '', vscode.ConfigurationTarget.Workspace);
+      await cfg.update('jenkins.job', saved.config?.job || '', vscode.ConfigurationTarget.Workspace);
+      await cfg.update('jenkins.user', saved.config?.user || '', vscode.ConfigurationTarget.Workspace);
+    }
+    deliverySelectedProvider = '';
+    await refreshDeliverySecretState();
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, action: 'scanner.configuration.changed', actor: 'System',
-      // The token never enters an audit event, only the fact that one is stored.
-      comment: 'Intégration Jenkins configurée.',
-      metadata: { integration: 'jenkins', job: trimmedJob, tokenStored: Boolean(trimmedToken) }
+      comment: `Intégration Delivery configurée : ${deliveryProvider(requested)?.label || requested}.`,
+      metadata: { integration: requested, configured: true }
     }).catch(() => {});
-    return { ok: true, url: normalizedUrl, job: trimmedJob };
+    return { ok: true, providerId: requested, config: saved.config };
+  }
+
+  async function applyJenkinsConfiguration({ url = '', job = '', user = '', token = '' } = {}) {
+    return applyDeliveryConfiguration('jenkins', { url, job, user, token });
+  }
+
+  async function disconnectDeliveryProvider() {
+    await deliveryConfiguration.disconnect();
+    deliveryStatus = notConfiguredModel({ message: 'No CI/CD provider configured.' });
+    deliverySelectedProvider = '';
+    await refreshDeliverySecretState();
+    publishEnterpriseContext();
+    renderDeliveryPage();
+    renderIntegrationsPage();
+    return { ok: true };
+  }
+
+  async function confirmDisconnectDeliveryProvider() {
+    const activeId = deliveryConfiguration.getActiveProviderId();
+    if (!activeId) return { ok: false, reason: 'not-configured' };
+    const label = deliveryProvider(activeId)?.label || activeId;
+    const confirmation = await vscode.window.showWarningMessage(
+      `Disconnect ${label} from Security Delivery?`,
+      {
+        modal: true,
+        detail: `Security Center will stop using ${label} as the active CI/CD provider. Saved non-secret configuration and stored credentials are kept for later reconnection.`
+      },
+      'Disconnect'
+    );
+    if (confirmation !== 'Disconnect') return { ok: false, reason: 'cancelled' };
+    await disconnectDeliveryProvider();
+    await createAuditEvent(backendBaseUrl(), {
+      scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
+      comment: `Fournisseur Security Delivery déconnecté : ${label}.`,
+      metadata: { integration: activeId, disconnected: true, configurationRetained: true }
+    }).catch(() => {});
+    return { ok: true, providerId: activeId };
   }
 
   async function refreshDeliveryStatus() {
-    const cfg = vscode.workspace.getConfiguration('securityCenter');
-    const token = await context.secrets.get(JENKINS_TOKEN_SECRET_KEY) || '';
-    deliveryStatus = await fetchDeliveryStatus({
-      baseUrl: cfg.get('jenkins.url', ''),
-      job: cfg.get('jenkins.job', ''),
-      user: cfg.get('jenkins.user', ''),
-      token,
-      workspaceCommit: await currentWorkspaceCommit()
-    });
-    // Presentation-only context. The token itself never enters the model: only
-    // the fact that one is stored.
-    deliveryStatus = {
-      ...deliveryStatus,
-      // `user` prefills the form; `tokenConfigured` is the only thing the page
-      // learns about the token — the token itself never enters the model.
-      user: cfg.get('jenkins.user', ''),
-      tokenConfigured: Boolean(token),
-      workspaceBranch: await currentWorkspaceBranch(),
-      connection: deliveryConnection
-    };
+    const active = await deliveryConfiguration.resolveActiveProvider();
+    deliveryStatus = active.providerId
+      ? await buildDeliveryModelFor(active.providerId)
+      : notConfiguredModel({ message: 'No CI/CD provider configured.' });
+    publishEnterpriseContext();
     renderDeliveryPage();
+    renderIntegrationsPage();
     return deliveryStatus;
   }
 
   function renderDeliveryPage() {
     if (!deliveryPanel) return;
-    deliveryPanel.webview.html = renderDeliveryPageHtml(
-      deliveryStatus, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview)
-    );
+    const selectedProvider = deliveryFormProvider();
+    deliveryPanel.webview.html = renderDeliveryProviderPageHtml({
+      model: deliveryStatus,
+      providers: DELIVERY_PROVIDERS,
+      selectedProvider,
+      selectedProviderDefinition: deliveryProvider(selectedProvider),
+      configuration: deliveryConfiguration.getProviderConfig(selectedProvider),
+      secretsConfigured: deliverySecretsConfigured
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview));
   }
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openSecurityDelivery', async () => {
@@ -3092,6 +3337,7 @@ async function activate(context) {
       deliveryPanel = vscode.window.createWebviewPanel('securityCenter.delivery', 'Security Center — Security Delivery', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
       deliveryPanel.onDidDispose(() => { deliveryPanel = undefined; });
       deliveryPanel.webview.onDidReceiveMessage(async (message) => {
+        // handleShellNavMessage keeps the shared shell navigation live for securityCenter.delivery.
         if (message?.type === 'command') {
           // A webview message is untrusted input: only this page's own targets,
           // plus the shared navigation the shell renders around it.
@@ -3100,58 +3346,107 @@ async function activate(context) {
           if (ALLOWED.has(message.command)) await vscode.commands.executeCommand(message.command);
           return;
         }
-        if (message?.type !== 'action') return;
-        if (message.action === 'refresh') return void await refreshDeliveryStatus();
-        if (message.action === 'testConnection') {
-          const cfg = vscode.workspace.getConfiguration('securityCenter');
-          deliveryConnection = await testJenkinsConnection({
-            baseUrl: cfg.get('jenkins.url', ''), job: cfg.get('jenkins.job', ''), user: cfg.get('jenkins.user', ''),
-            token: await context.secrets.get(JENKINS_TOKEN_SECRET_KEY) || ''
-          });
+        if (message?.type === 'action') {
+          if (message.action === 'refresh') return void await refreshDeliveryStatus();
+          if (message.action === 'testConnection') {
+            const providerId = deliveryConfiguration.getActiveProviderId() || deliveryFormProvider();
+            const config = await mergedDeliveryConfiguration(providerId);
+            deliveryConnection = await testDeliveryProviderConnection(providerId, config);
+            vscode.window.showInformationMessage(`Security Center : ${deliveryConnection.message}`);
+            return void await refreshDeliveryStatus();
+          }
+          if (message.action === 'testConfig') {
+            const providerId = deliveryFormProvider();
+            const config = await mergedDeliveryConfiguration(providerId, message.config || {});
+            deliveryConnection = await testDeliveryProviderConnection(providerId, config);
+            vscode.window.showInformationMessage(`Security Center : ${deliveryConnection.message}`);
+            deliveryStatus = await buildDeliveryModelFor(providerId, message.config || {});
+            renderDeliveryPage();
+            renderIntegrationsPage();
+            return;
+          }
+          if (message.action === 'saveConfig') {
+            const saved = await applyDeliveryConfiguration(deliveryFormProvider(), message.config || {});
+            if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+            vscode.window.showInformationMessage(`Security Center : ${deliveryProvider(saved.providerId)?.label || saved.providerId} configured.`);
+            return void await refreshDeliveryStatus();
+          }
+          if (message.action === 'configure') return void await vscode.commands.executeCommand('securityCenter.configureJenkins');
+          if (message.action === 'openJenkinsfile') return void await vscode.commands.executeCommand('securityCenter.openJenkinsfileTemplate');
+          if (message.action === 'openBlocking') return void await vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'policy');
+          if (message.action === 'openReport') {
+            const raw = deliveryStatus.raw || {};
+            const cfg = await mergedDeliveryConfiguration(deliveryStatus.providerId);
+            const build = raw.build?.number;
+            const artifact = raw.ci?.artifactPath;
+            if (!build || !artifact) return;
+            try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsArtifactUrl(cfg.url || '', cfg.job || '', build, artifact))); }
+            catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
+            return;
+          }
+          if (message.action === 'openJenkins') {
+            const providerId = deliveryConfiguration.getActiveProviderId() || deliveryFormProvider();
+            const url = deliveryConsoleUrl(providerId, await mergedDeliveryConfiguration(providerId));
+            if (!url) return;
+            try { await vscode.env.openExternal(vscode.Uri.parse(url)); }
+            catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
+            return;
+          }
+        }
+        if (message?.type !== 'delivery') return;
+        if (message.action === 'deliveryRefresh') return void await refreshDeliveryStatus();
+        if (message.action === 'deliverySelectProvider') {
+          deliverySelectedProvider = String(message.provider || DEFAULT_DELIVERY_PROVIDER).toLowerCase();
+          await refreshDeliverySecretState();
+          if (deliveryConfiguration.getActiveProviderId() === deliverySelectedProvider) {
+            await refreshDeliveryStatus();
+          } else {
+            deliveryStatus = await buildDeliveryModelFor(deliverySelectedProvider, {});
+            renderDeliveryPage();
+          }
+          return;
+        }
+        if (message.action === 'deliveryTest') {
+          const providerId = String(message.provider || deliveryFormProvider()).toLowerCase();
+          const config = await mergedDeliveryConfiguration(providerId, message.config || {});
+          deliveryConnection = await testDeliveryProviderConnection(providerId, config);
           vscode.window.showInformationMessage(`Security Center : ${deliveryConnection.message}`);
+          deliveryStatus = await buildDeliveryModelFor(providerId, message.config || {});
+          renderDeliveryPage();
+          renderIntegrationsPage();
+          return;
+        }
+        if (message.action === 'deliverySave') {
+          const saved = await applyDeliveryConfiguration(message.provider || deliveryFormProvider(), message.config || {});
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          vscode.window.showInformationMessage(`Security Center : ${deliveryProvider(saved.providerId)?.label || saved.providerId} configured.`);
           return void await refreshDeliveryStatus();
         }
         if (message.action === 'openReport') {
-          const cfg = vscode.workspace.getConfiguration('securityCenter');
-          const build = deliveryStatus.build?.number;
-          const artifact = deliveryStatus.ci?.artifactPath;
+          const raw = deliveryStatus.raw || {};
+          const cfg = await mergedDeliveryConfiguration(deliveryStatus.providerId);
+          const build = raw.build?.number;
+          const artifact = raw.ci?.artifactPath;
           if (!build || !artifact) return;
-          try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsArtifactUrl(cfg.get('jenkins.url', ''), cfg.get('jenkins.job', ''), build, artifact))); }
+          try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsArtifactUrl(cfg.url || '', cfg.job || '', build, artifact))); }
           catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
           return;
         }
-        // Tests the values currently in the form, before they are saved, so a
-        // wrong URL or job is caught without writing anything. The token field
-        // is empty when the user is not changing it — the stored one is used
-        // instead, which is why a saved token never has to reach the webview.
-        if (message.action === 'testConfig') {
-          const typed = message.config || {};
-          deliveryConnection = await testJenkinsConnection({
-            baseUrl: String(typed.url || ''), job: String(typed.job || ''), user: String(typed.user || ''),
-            token: String(typed.token || '') || await context.secrets.get(JENKINS_TOKEN_SECRET_KEY) || ''
-          });
-          vscode.window.showInformationMessage(`Security Center : ${deliveryConnection.message}`);
-          return void await refreshDeliveryStatus();
-        }
-        if (message.action === 'saveConfig') {
-          const typed = message.config || {};
-          const saved = await applyJenkinsConfiguration({
-            url: typed.url, job: typed.job, user: typed.user, token: typed.token
-          });
-          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
-          vscode.window.showInformationMessage('Security Center : Jenkins configuré.');
-          return void await refreshDeliveryStatus();
-        }
-        if (message.action === 'configure') return void await vscode.commands.executeCommand('securityCenter.configureJenkins');
+        if (message.action === 'deliveryConfigure') { renderDeliveryPage(); return; }
+        if (message.action === 'deliveryOpenSettings') return void await openIntegrationsPage({ openConfig: 'delivery' });
+        if (message.action === 'deliveryDisconnect') return void await confirmDisconnectDeliveryProvider();
         if (message.action === 'openJenkinsfile') return void await vscode.commands.executeCommand('securityCenter.openJenkinsfileTemplate');
         if (message.action === 'openBlocking') return void await vscode.commands.executeCommand('securityCenter.openSecurityPipeline', 'policy');
-        if (message.action === 'openJenkins') {
-          const cfg = vscode.workspace.getConfiguration('securityCenter');
-          try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsJobUrl(cfg.get('jenkins.url', ''), cfg.get('jenkins.job', '')))); }
+        if (message.action === 'deliveryOpenConsole') {
+          const providerId = deliveryConfiguration.getActiveProviderId() || deliveryFormProvider();
+          const url = deliveryConsoleUrl(providerId, await mergedDeliveryConfiguration(providerId));
+          if (!url) return;
+          try { await vscode.env.openExternal(vscode.Uri.parse(url)); }
           catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
         }
       });
     } else deliveryPanel.reveal(vscode.ViewColumn.Active);
+    await refreshDeliverySecretState();
     renderDeliveryPage();
     await refreshDeliveryStatus();
   }));
@@ -3320,13 +3615,41 @@ async function activate(context) {
     dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
   }
 
+  /**
+   * What the Integrations page shows about the backend.
+   *
+   * Refreshed rather than probed inside the renderer: rendering a page must not
+   * depend on a network round trip, and a stale « online » for a second is a
+   * better page than one that blocks while a service is starting.
+   */
+  let backendPageStatus = null;
+  async function refreshBackendStatus({ start = false } = {}) {
+    if (!backendManager) return null;
+    const status = start ? await backendManager.ensureBackend() : await backendManager.getBackendStatus();
+    backendPageStatus = {
+      ...status,
+      // The configured remote address, shown in the form. Distinct from
+      // `status.url`, which is the address actually in use.
+      remoteUrl: vscode.workspace.getConfiguration('securityCenter').get(REMOTE_URL_SETTING, '')
+    };
+    return backendPageStatus;
+  }
+
   function renderIntegrationsPage() {
     if (!integrationsPanel) return;
     const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const selectedDeliveryProvider = deliveryFormProvider();
     integrationsPanel.webview.html = renderIntegrationPageHtml({
       view: integrationsView,
       openConfig: integrationsOpenConfig,
+      ...companionAssetOptions(integrationsPanel.webview),
+      backend: backendPageStatus || {},
       delivery: deliveryStatus,
+      deliveryProviders: DELIVERY_PROVIDERS,
+      deliverySelectedProvider: selectedDeliveryProvider,
+      deliveryProviderDefinition: deliveryProvider(selectedDeliveryProvider),
+      deliveryProviderValues: deliveryConfiguration.getProviderConfig(selectedDeliveryProvider),
+      deliverySecretsConfigured,
       prometheus: prometheusStatus,
       runtime: {
         ...runtimeSecurityStatus,
@@ -3558,7 +3881,10 @@ async function activate(context) {
     await Promise.all([
       refreshDeliveryStatus().catch(() => deliveryStatus),
       refreshPrometheusStatus().catch(() => prometheusStatus),
-      refreshRuntimeSecurityStatus().catch(() => runtimeSecurityStatus)
+      refreshRuntimeSecurityStatus().catch(() => runtimeSecurityStatus),
+      // Probed, never started: refreshing a page is not a reason to bring a
+      // service up. The capabilities that need it are the ones that start it.
+      refreshBackendStatus().catch(() => backendPageStatus)
     ]);
     publishEnterpriseContext();
     renderIntegrationsPage();
@@ -3586,7 +3912,7 @@ async function activate(context) {
     if (!saved.ok) return { ok: false, message: (saved.errors || []).join(' ') };
     observabilitySelectedProvider = '';
     await refreshObservabilitySecretState();
-    await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
       comment: 'Intégration observabilité configurée.',
       metadata: { integration: requested, configured: true }
@@ -3613,7 +3939,7 @@ async function activate(context) {
     const saved = await siemConfiguration.saveProviderConfiguration(requested, values);
     if (!saved.ok) return { ok: false, message: saved.errors.join(' ') };
     const cfg = vscode.workspace.getConfiguration('securityCenter');
-    await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
       comment: `Fournisseur Runtime Security configuré : ${siemProvider(requested)?.label || requested}.`,
       metadata: { integration: requested, credentialsStored: true }
@@ -3657,7 +3983,7 @@ async function activate(context) {
     renderRuntimeSecurityPage();
     // Même vocabulaire d'audit que la configuration : aucun nouvel événement,
     // et jamais d'identifiant dans les métadonnées.
-    await createAuditEvent(vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765'), {
+    await createAuditEvent(backendBaseUrl(), {
       scan_id: currentScanId || 0, action: 'integration.configuration.changed', actor: 'System',
       comment: `Fournisseur Runtime Security déconnecté : ${label}.`,
       metadata: { integration: activeId, disconnected: true, configurationRetained: true }
@@ -3694,8 +4020,10 @@ async function activate(context) {
     vscode.window.showInformationMessage('Security Center : création de tickets Jira activée pour ce workspace.');
   }
 
-  async function openIntegrationsPage({ view = 'overview' } = {}) {
+  async function openIntegrationsPage({ view = 'overview', openConfig = '' } = {}) {
     integrationsView = view;
+    if (openConfig) integrationsOpenConfig = openConfig;
+    await refreshDeliverySecretState();
     if (!integrationsPanel) {
       integrationsPanel = vscode.window.createWebviewPanel('securityCenter.integrations', 'Security Center — Integrations', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
       integrationsPanel.onDidDispose(() => { integrationsPanel = undefined; });
@@ -3709,8 +4037,73 @@ async function activate(context) {
         if (message?.type !== 'action') return;
         if (message.action === 'refresh') return void await refreshEnterpriseIntegrations();
         if (message.action === 'showOverview') { integrationsView = 'overview'; renderIntegrationsPage(); return; }
+        if (message.action === 'selectDeliveryProvider') {
+          deliverySelectedProvider = String(message.provider || DEFAULT_DELIVERY_PROVIDER).toLowerCase();
+          integrationsOpenConfig = 'delivery';
+          await refreshDeliverySecretState();
+          renderIntegrationsPage();
+          renderDeliveryPage();
+          return;
+        }
         if (message.action === 'viewPrometheus') { integrationsView = 'prometheus'; renderIntegrationsPage(); return; }
         if (message.action === 'viewRuntime') { integrationsView = 'runtime'; renderIntegrationsPage(); return; }
+        if (message.action === 'deliveryTest') {
+          const providerId = String(message.provider || deliveryFormProvider()).toLowerCase();
+          const config = await mergedDeliveryConfiguration(providerId, message.config || {});
+          const result = await testDeliveryProviderConnection(providerId, config);
+          vscode.window.showInformationMessage(`Security Center : ${result.message}`);
+          deliveryStatus = await buildDeliveryModelFor(providerId, message.config || {});
+          renderIntegrationsPage();
+          renderDeliveryPage();
+          return;
+        }
+        if (message.action === 'deliverySave') {
+          const saved = await applyDeliveryConfiguration(message.provider || deliveryFormProvider(), message.config || {});
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          vscode.window.showInformationMessage(`Security Center : ${deliveryProvider(saved.providerId)?.label || saved.providerId} configured.`);
+          return void await refreshDeliveryStatus();
+        }
+        if (message.action === 'disconnectDelivery') return void await confirmDisconnectDeliveryProvider();
+        if (message.action === 'testBackend') {
+          const status = await refreshBackendStatus({ start: true });
+          renderIntegrationsPage();
+          vscode.window.showInformationMessage(status.online
+            ? `Security Center : backend en ligne — ${status.url}.`
+            : `Security Center : backend ${status.label}. ${status.hint}`);
+          return;
+        }
+        if (message.action === 'restartBackend') {
+          await vscode.commands.executeCommand('securityCenter.restartBackend');
+          await refreshBackendStatus();
+          renderIntegrationsPage();
+          return;
+        }
+        if (message.action === 'saveBackendConfig') {
+          const configuration = vscode.workspace.getConfiguration('securityCenter');
+          const mode = String(message.config?.mode || BACKEND_MODE.AUTO);
+          if (mode === BACKEND_MODE.REMOTE) {
+            try {
+              await configuration.update(REMOTE_URL_SETTING, normalizeBackendUrl(message.config?.url), vscode.ConfigurationTarget.Global);
+            } catch (error) {
+              return void vscode.window.showErrorMessage(`Security Center : ${error.message}`);
+            }
+          }
+          await configuration.update(MODE_SETTING, mode, vscode.ConfigurationTarget.Global);
+          await refreshBackendStatus({ start: true });
+          integrationsOpenConfig = 'backend';
+          renderIntegrationsPage();
+          return;
+        }
+        if (message.action === 'resetBackendConfig') {
+          const configuration = vscode.workspace.getConfiguration('securityCenter');
+          await configuration.update(MODE_SETTING, undefined, vscode.ConfigurationTarget.Global);
+          await configuration.update(REMOTE_URL_SETTING, undefined, vscode.ConfigurationTarget.Global);
+          await refreshBackendStatus({ start: true });
+          integrationsOpenConfig = 'backend';
+          renderIntegrationsPage();
+          vscode.window.showInformationMessage('Security Center : backend réinitialisé en mode Auto (service local).');
+          return;
+        }
         if (message.action === 'testPrometheus') return void await refreshPrometheusStatus();
         if (message.action === 'testWazuh') return void await refreshRuntimeSecurityStatus();
         if (message.action === 'testPrometheusConfig') return void await refreshPrometheusStatus({ config: message.config || {} });
@@ -3731,6 +4124,7 @@ async function activate(context) {
         if (message.action === 'configureJira') return void await configureJiraIntegration();
       });
     } else integrationsPanel.reveal(vscode.ViewColumn.Active);
+    await refreshBackendStatus();
     renderIntegrationsPage();
     await refreshEnterpriseIntegrations();
   }
@@ -4056,10 +4450,100 @@ async function activate(context) {
     const apiKey = value.trim();
     if (apiKey) await context.secrets.store('securityCenter.backend.apiKey', apiKey);
     else await context.secrets.delete('securityCenter.backend.apiKey');
-    setApiKey(apiKey);
+    // An empty value returns the installation to its own generated key rather
+    // than to no key at all: the local backend is never left unauthenticated.
+    setApiKey(apiKey || localBackendKey);
+    if (backendManager) backendManager.setApiKey(apiKey || localBackendKey);
     vscode.window.showInformationMessage(apiKey
       ? 'Security Center : clé API enregistrée dans le stockage sécurisé de VS Code.'
-      : 'Security Center : clé API supprimée.');
+      : 'Security Center : clé API supprimée, la clé locale générée reprend effet.');
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.testBackendConnection', async () => {
+    const status = await backendManager.ensureBackend();
+    const address = status.url || 'aucune adresse';
+    if (status.online) {
+      vscode.window.showInformationMessage(
+        `Security Center : backend ${BACKEND_MODE_LABELS[status.mode] || status.mode} en ligne — ${address}.`
+      );
+    } else {
+      // What failed, where, and what to do about it. Never a raw ECONNREFUSED.
+      vscode.window.showWarningMessage(`Security Center : backend ${status.label} — ${address}. ${status.hint}`);
+    }
+    return status;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showBackendLogs', async () => {
+    const logFile = backendManager?.logFilePath?.() || '';
+    if (!logFile || !fs.existsSync(logFile)) {
+      return vscode.window.showInformationMessage(
+        'Security Center : aucun journal de service local. Le backend n’a pas encore été démarré par cette installation.'
+      );
+    }
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(logFile));
+    await vscode.window.showTextDocument(document, { preview: true });
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.restartBackend', async () => {
+    if (backendManager.resolvedMode() !== RESOLVED_MODE.LOCAL) {
+      // Restarting a backend an organization operates is not this extension's
+      // call, and restarting a compose stack is the compose file's job.
+      return vscode.window.showWarningMessage(
+        'Security Center : seul le backend local (mode Auto) est redémarré par l’extension.'
+      );
+    }
+    const status = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Security Center — redémarrage du backend local' },
+      () => backendManager.restartLocalBackend()
+    );
+    vscode.window.showInformationMessage(status.online
+      ? `Security Center : backend local redémarré — ${status.url}.`
+      : `Security Center : redémarrage impossible — ${status.message || status.hint}`);
+    return status;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureBackend', async () => {
+    const configuration = vscode.workspace.getConfiguration('securityCenter');
+    const currentMode = resolveBackendMode(configuration);
+    const mode = await vscode.window.showQuickPick([
+      {
+        label: 'Auto / Local',
+        description: currentMode === BACKEND_MODE.AUTO ? 'Mode actuel' : '',
+        detail: 'Le service local est démarré et arrêté par l’extension. Aucune installation requise.',
+        value: BACKEND_MODE.AUTO
+      },
+      {
+        label: 'Remote',
+        description: currentMode === BACKEND_MODE.REMOTE ? 'Mode actuel' : '',
+        detail: 'Un backend Security Center opéré par votre organisation. L’extension ne démarre rien.',
+        value: BACKEND_MODE.REMOTE
+      },
+      {
+        label: 'Docker (développement)',
+        description: currentMode === BACKEND_MODE.DOCKER ? 'Mode actuel' : '',
+        detail: 'docker-compose.backend.yml, pour le développement et les tests d’intégration.',
+        value: BACKEND_MODE.DOCKER
+      }
+    ], { title: 'Backend Security Center', placeHolder: 'Mode du backend' });
+    if (!mode) return;
+    if (mode.value === BACKEND_MODE.REMOTE) {
+      const url = await vscode.window.showInputBox({
+        title: 'Adresse du backend distant',
+        prompt: 'Par exemple https://security.company.internal. La clé d’API reste dans le SecretStorage.',
+        value: configuration.get(REMOTE_URL_SETTING, ''),
+        ignoreFocusOut: true,
+        validateInput: (value) => {
+          try { normalizeBackendUrl(value); return null; } catch (error) { return error.message; }
+        }
+      });
+      if (url === undefined) return;
+      await configuration.update(REMOTE_URL_SETTING, normalizeBackendUrl(url), vscode.ConfigurationTarget.Global);
+    }
+    await configuration.update(MODE_SETTING, mode.value, vscode.ConfigurationTarget.Global);
+    const status = await backendManager.ensureBackend();
+    vscode.window.showInformationMessage(status.online
+      ? `Security Center : backend ${mode.label} en ligne — ${status.url}.`
+      : `Security Center : backend ${mode.label} — ${status.label}. ${status.hint}`);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.installPreCommitHook', async () => {
@@ -4076,15 +4560,20 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showTrends', async () => {
-    const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+    // Trends is history: it is one of the few capabilities that genuinely needs
+    // the backend, so it is one of the few that starts it.
+    const backendStatus = await ensureBackendOnline();
+    const baseUrl = backendBaseUrl();
     // Le panneau est cree AVANT l'appel au backend. Auparavant il etait cree
     // apres, a l'interieur du `try` : un backend injoignable faisait echouer
     // l'await, et la page ne s'ouvrait jamais — seule une notification
     // apparaissait. La page s'ouvre desormais toujours et montre l'erreur reelle.
-    const panel = vscode.window.createWebviewPanel('securityCenter.trends', 'Security Center — Tendances et MTTR', vscode.ViewColumn.Active, { enableScripts: true });
+    const panel = vscode.window.createWebviewPanel('securityCenter.trends', 'Security Center — Tendances et MTTR', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true }));
     const nonce = crypto.randomBytes(16).toString('base64');
     let reports = { 7: buildTrendReport([], [], 7), 30: buildTrendReport([], [], 30), 90: buildTrendReport([], [], 90) };
-    let backendError = '';
+    // A backend that never came up is described by its state, not by the
+    // transport error of the first call that happened to hit it.
+    let backendError = backendStatus.online ? '' : `${backendStatus.label} — ${backendStatus.hint || backendStatus.message}`;
     try {
       const summaries = await listScans(baseUrl, 100);
       const [scans, events] = await Promise.all([
@@ -4093,10 +4582,12 @@ async function activate(context) {
       ]);
       // Calculs de tendance et de MTTR inchanges : memes entrees, meme fonction.
       reports = { 7: buildTrendReport(scans, events, 7), 30: buildTrendReport(scans, events, 30), 90: buildTrendReport(scans, events, 90) };
+      // Les données ont répondu : l'état de démarrage n'a plus à être affiché.
+      backendError = '';
     } catch (error) {
       backendError = error.message;
     }
-    const renderTrends = () => { panel.webview.html = renderTrendReportHtml(reports, nonce, themeController.getTheme(), backendError); };
+    const renderTrends = () => { panel.webview.html = renderTrendReportHtml(reports, nonce, themeController.getTheme(), backendError, companionAssetOptions(panel.webview)); };
     renderTrends();
     const trendThemeSubscription = themeController.onDidChange(renderTrends);
     panel.onDidDispose(() => trendThemeSubscription.dispose());
@@ -4107,10 +4598,11 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showAuditLog', async () => {
-    const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+    await ensureBackendOnline();
+    const baseUrl = backendBaseUrl();
     // Meme correction que pour les tendances : le panneau naissait apres l'await
     // et disparaissait donc entierement quand le backend etait injoignable.
-    const panel = vscode.window.createWebviewPanel('securityCenter.auditLog', 'Security Center — Journal d’audit', vscode.ViewColumn.Active, { enableScripts: true });
+    const panel = vscode.window.createWebviewPanel('securityCenter.auditLog', 'Security Center — Journal d’audit', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true }));
     const theme = themeController.getTheme ? themeController.getTheme() : 'light';
     let events = [];
     let backendError = '';
@@ -4120,7 +4612,7 @@ async function activate(context) {
     } catch (error) {
       backendError = error.message;
     }
-    panel.webview.html = renderAuditLogHtml(events, crypto.randomBytes(16).toString('base64'), theme, backendError);
+    panel.webview.html = renderAuditLogHtml(events, crypto.randomBytes(16).toString('base64'), theme, backendError, companionAssetOptions(panel.webview));
     // Le journal est rendu dans le cadre applicatif : le rail y demande des
     // commandes deja enregistrees, rien de plus.
     panel.webview.onDidReceiveMessage(async (message) => { await handleShellNavMessage(message); });
@@ -4227,7 +4719,11 @@ async function activate(context) {
     const cfg = vscode.workspace.getConfiguration('securityCenter');
     try {
       await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Security Center : contrôle des licences' }, async () => {
-        const result = await generateSbom({
+        // Deux inventaires indépendants, jamais un seul appel commuté par le nom
+        // d'image : sans cela, configurer une image désactive silencieusement
+        // l'analyse du workspace, et l'absence de moteur de conteneur se lit
+        // comme un échec du contrôle de licences.
+        const collected = await collectLicenseSources({
           workspacePath: folder.uri.fsPath,
           mode: cfg.get('trivy.command', 'auto'),
           imageName: cfg.get('trivy.image', ''),
@@ -4235,19 +4731,34 @@ async function activate(context) {
         });
         const projectPolicy = await loadProjectPolicy(folder.uri.fsPath);
         const deniedLicenses = projectPolicy?.licensesDenied?.length ? projectPolicy.licensesDenied : cfg.get('licenses.denied', []);
-        const report = analyzeLicenses(result.payload, deniedLicenses);
+        const report = analyzeLicenses(collected.document || { components: [] }, deniedLicenses, collected.sources);
         // Les scripts restent DESACTIVES : ce rapport n'en a aucun besoin. Pour
         // obtenir la navigation partagee sans les activer, le rail est rendu en
         // URI de commande et l'hote n'en autorise QUE celles qu'il affiche —
         // une capacite bien plus etroite que l'execution de script arbitraire.
-        const panel = vscode.window.createWebviewPanel('securityCenter.licenseCompliance', 'Security Center — Conformité des licences', vscode.ViewColumn.Active, { enableScripts: false, enableCommandUris: navCommands() });
-        const renderLicenses = () => { panel.webview.html = renderLicenseReportHtml(report, crypto.randomBytes(16).toString('base64'), themeController.getTheme()); };
+        const panel = vscode.window.createWebviewPanel('securityCenter.licenseCompliance', 'Security Center — Conformité des licences', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: false, enableCommandUris: navCommands() }));
+        const renderLicenses = () => { panel.webview.html = renderLicenseReportHtml(report, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(panel.webview)); };
         renderLicenses();
         // Sans script, la page ne peut pas recevoir `setTheme` : c'est l'extension
         // qui la redessine, comme elle le fait deja pour la configuration des scanners.
         const licenseThemeSubscription = themeController.onDidChange(renderLicenses);
         panel.onDidDispose(() => licenseThemeSubscription.dispose());
-        if (!report.compliant) vscode.window.showWarningMessage(`Security Center : ${report.counts.denied} composant(s) utilisent une licence interdite.`);
+        // Trois messages distincts, parce que ce sont trois situations
+        // distinctes : rien n'a pu être inventorié, une source manque, ou une
+        // licence interdite est réellement présente.
+        if (!collected.analyzable) {
+          const blocking = collected.sources.find((entry) => !entry.analyzed && entry.reason);
+          vscode.window.showWarningMessage(
+            `Security Center : conformité des licences non établie — aucune source n’a pu être inventoriée${blocking ? ` (${blocking.stateLabel})` : ''}.`
+          );
+        } else if (report.compliant === false) {
+          vscode.window.showWarningMessage(`Security Center : ${report.counts.denied} composant(s) utilisent une licence interdite.`);
+        } else if (collected.degraded) {
+          const missing = collected.sources.filter((entry) => !entry.analyzed && entry.state !== 'not-configured');
+          vscode.window.showInformationMessage(
+            `Security Center : licences contrôlées sur les sources disponibles. ${missing.map((entry) => `${entry.label} : ${entry.stateLabel}`).join(' · ')}.`
+          );
+        }
       });
     } catch (error) {
       vscode.window.showErrorMessage(`Security Center : contrôle des licences impossible — ${error.message}`);
@@ -4256,7 +4767,8 @@ async function activate(context) {
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.compareScans', async () => {
     try {
-      const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+      await ensureBackendOnline();
+      const baseUrl = backendBaseUrl();
       // A comparison needs a baseline and a current: two scans, or nothing to do.
       const MINIMUM_COMPARABLE_SCANS = 2;
       // The backend stays the preferred source and is read exactly as before.
@@ -4322,15 +4834,15 @@ async function activate(context) {
         'securityCenter.scanComparison',
         'Security Center — Comparer les scans',
         vscode.ViewColumn.Active,
-        { enableScripts: true }
+        companionWebviewOptions({ enableScripts: true })
       );
 
       const nonce = crypto.randomBytes(16).toString('base64');
       const theme = themeController.getTheme ? themeController.getTheme() : 'light';
-      panel.webview.html = renderScanComparisonHtml(prunedScans, nonce, theme);
+      panel.webview.html = renderScanComparisonHtml(prunedScans, nonce, theme, companionAssetOptions(panel.webview));
 
       const themeSubscription = themeController.onDidChange(() => {
-        panel.webview.html = renderScanComparisonHtml(prunedScans, nonce, themeController.getTheme());
+        panel.webview.html = renderScanComparisonHtml(prunedScans, nonce, themeController.getTheme(), companionAssetOptions(panel.webview));
       });
       panel.onDidDispose(() => themeSubscription.dispose());
 
@@ -4400,7 +4912,8 @@ async function activate(context) {
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showScanHistoryPage', async () => {
     const localScans = context.workspaceState.get(LOCAL_SCAN_HISTORY_KEY, []);
-    const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+    await ensureBackendOnline();
+    const baseUrl = backendBaseUrl();
     let backendScans = [];
     let backendError = '';
     try {
@@ -4412,10 +4925,10 @@ async function activate(context) {
       'securityCenter.scanHistory',
       'Security Center — Historique des scans',
       vscode.ViewColumn.Active,
-      { enableScripts: true }
+      companionWebviewOptions({ enableScripts: true })
     );
     const nonce = crypto.randomBytes(16).toString('base64');
-    const renderHistory = () => { panel.webview.html = renderScanHistoryHtml(localScans, backendScans, backendError, nonce, themeController.getTheme()); };
+    const renderHistory = () => { panel.webview.html = renderScanHistoryHtml(localScans, backendScans, backendError, nonce, themeController.getTheme(), companionAssetOptions(panel.webview)); };
     renderHistory();
     const historyThemeSubscription = themeController.onDidChange(renderHistory);
     panel.onDidDispose(() => historyThemeSubscription.dispose());
@@ -4437,7 +4950,7 @@ async function activate(context) {
           stored = {
             findings: remote.result.findings,
             scanners: remote.result.scanners,
-            dashboardOptions: { workspace: remote.result.workspace, scanStatus: 'completed', backendStatus: 'online', correlations: remote.result.correlations },
+            dashboardOptions: { workspace: currentWorkspaceIdentity().label, scanStatus: 'completed', backendStatus: backendBadgeAfterSuccess(), correlations: remote.result.correlations },
             label: `#${remote.scan_id}`
           };
         }
@@ -4466,7 +4979,8 @@ async function activate(context) {
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.showScanHistory', async () => {
     try {
-      const baseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+      await ensureBackendOnline();
+      const baseUrl = backendBaseUrl();
       const scans = await listScans(baseUrl, 100);
       if (!scans.length) return vscode.window.showInformationMessage('Security Center : aucun scan enregistré.');
       const selected = await vscode.window.showQuickPick(scans.map((scan) => ({
@@ -4491,7 +5005,7 @@ async function activate(context) {
         currentScanId = stored.scan_id;
         currentFindings = stored.result.findings;
         currentScanStatuses = stored.result.scanners;
-        currentDashboardOptions = { workspace: stored.result.workspace, scanStatus: 'completed', backendStatus: 'online', correlations: stored.result.correlations };
+        currentDashboardOptions = { ...currentDashboardOptions, workspace: currentWorkspaceIdentity().label, scanStatus: 'completed', backendStatus: backendBadgeAfterSuccess(), correlations: stored.result.correlations };
         publishDiagnostics(diagnostics, currentFindings);
         provider.setFindings(currentFindings, currentScanStatuses);
         dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
@@ -4548,10 +5062,14 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.testBurpConnection', async () => {
-    const backendUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+    // Burp posts to the backend from its own process, so the backend has to be
+    // up before the connector is asked about it — and the address it was told
+    // to use is republished here, in case the port moved since Burp was loaded.
+    await ensureBackendOnline();
+    const backendUrl = backendBaseUrl();
     try {
       const burpStatus = await getBurpStatus(backendUrl);
-      currentDashboardOptions = { ...currentDashboardOptions, backendStatus: 'online', burpConnected: Boolean(burpStatus.connected), burpStatus, burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }), burpEndpoint: `${backendUrl.replace(/\/$/, '')}/api/v1/integrations/burp` };
+      currentDashboardOptions = { ...currentDashboardOptions, backendStatus: backendBadgeAfterSuccess(), burpConnected: Boolean(burpStatus.connected), burpStatus, burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }), burpEndpoint: `${backendUrl.replace(/\/$/, '')}/api/v1/integrations/burp` };
       // Burp traffic is what makes endpoints OBSERVED, so a refreshed session is
       // a real input change — rebuild rather than wait for the next scan.
       rebuildDynamicWorkspace();
@@ -4673,14 +5191,15 @@ async function activate(context) {
       const payload = JSON.parse(await fs.promises.readFile(selected[0].fsPath, 'utf8'));
       const { scenarios, rejected } = normalizeHar(payload);
       if (!scenarios.length) throw new Error('Aucune requête locale autorisée dans cette capture.');
-      const backendUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+      await ensureBackendOnline();
+      const backendUrl = backendBaseUrl();
       for (const scenario of scenarios) await saveHttpScenario(backendUrl, scenario);
       const storedScenarios = await listHttpScenarios(backendUrl);
       currentDashboardOptions = {
         ...currentDashboardOptions,
         httpScenarioCount: storedScenarios.length,
         httpScenarios: storedScenarios,
-        backendStatus: 'online'
+        backendStatus: backendBadgeAfterSuccess()
       };
       dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
       vscode.window.showInformationMessage(`Security Center : ${scenarios.length} scénario(s) HTTP importé(s), ${rejected.length} rejeté(s).`);
@@ -4691,7 +5210,7 @@ async function activate(context) {
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.replayHttpScenario', async (requestedScenario) => {
     try {
-      const backendUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+      const backendUrl = backendBaseUrl();
       const scenarios = requestedScenario ? [requestedScenario] : await listHttpScenarios(backendUrl);
       const replayableScenarios = scenarios.filter((scenario) => ['GET', 'HEAD', 'POST', 'PUT', 'PATCH'].includes(String(scenario.request.method).toUpperCase()));
       if (scenarios.length && !replayableScenarios.length) {
@@ -5012,7 +5531,7 @@ async function activate(context) {
     let projectPolicy;
     try {
       projectPolicy = await loadProjectPolicy(folder.uri.fsPath);
-      const backendBaseUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+      const backendAddress = backendBaseUrl();
       if (lastProjectPolicy) {
         const { redactAuditValue } = require('./audit-events');
         const prevClean = redactAuditValue(lastProjectPolicy);
@@ -5022,7 +5541,7 @@ async function activate(context) {
         
         if (prevHash !== newHash) {
           const actor = vscode.workspace.getConfiguration('securityCenter').get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-          await createAuditEvent(backendBaseUrl, {
+          await createAuditEvent(backendAddress, {
             scan_id: currentScanId || 0,
             action: 'policy.changed',
             actor,
@@ -5073,7 +5592,7 @@ async function activate(context) {
       : [];
     const analysisPath = scanRequest.scanRoot || folder.uri.fsPath;
     let activeExecution = null;
-    dashboardProvider.setData(currentFindings, currentScanStatuses, { ...currentDashboardOptions, workspace: folder.name, scanStatus: 'running', backendStatus: 'checking', previousResultsVisible: true, snapshotAvailable: currentFindings.length > 0 });
+    dashboardProvider.setData(currentFindings, currentScanStatuses, { ...currentDashboardOptions, workspace: currentWorkspaceIdentity().label, scanStatus: 'running', backendStatus: 'checking', previousResultsVisible: true, snapshotAvailable: currentFindings.length > 0 });
     try {
       await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Security Center : analyse multi-outils', cancellable: true }, async (progress, cancellationToken) => {
       try {
@@ -5194,8 +5713,8 @@ async function activate(context) {
         let zapMode = preflightZapMode;
         if (zapRequested && zapMode !== 'baseline' && zapAuthorizedByPreflight) {
           const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-          const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
-          await createAuditEvent(backendBaseUrl, {
+          const backendAddress = backendBaseUrl();
+          await createAuditEvent(backendAddress, {
             scan_id: currentScanId || 0,
             finding_id: `zap:${cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')}`,
             action: `zap:${zapMode}:authorized`,
@@ -5295,7 +5814,7 @@ async function activate(context) {
           currentScanStatuses = projection.scanners;
           dashboardProvider.setData(currentFindings, currentScanStatuses, {
             ...currentDashboardOptions,
-            workspace: folder.name,
+            workspace: currentWorkspaceIdentity().label,
             scanStatus: 'running',
             backendStatus: 'checking',
             snapshotAvailable: Object.keys(currentSecuritySnapshot.resultSets || {}).length > 0,
@@ -5321,7 +5840,7 @@ async function activate(context) {
         const runScanner = async (scan, index) => {
           const scannerStartedAt = Date.now();
           const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
-          const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
+          const backendAddress = backendBaseUrl();
           try {
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — démarrage`);
             liveStatuses[index] = { ...scannerIdentity(scan), status: 'running', startedAt: new Date(scannerStartedAt).toISOString() };
@@ -5331,7 +5850,7 @@ async function activate(context) {
             currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'running', { startedAt: new Date(scannerStartedAt).toISOString() });
             
             const isRetry = activeExecution && activeExecution.type === 'retry';
-            await createAuditEvent(backendBaseUrl, {
+            await createAuditEvent(backendAddress, {
               scan_id: currentScanId || 0,
               action: isRetry ? 'scanner.retry' : 'scanner.run.started',
               actor,
@@ -5380,7 +5899,7 @@ async function activate(context) {
             });
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — terminé en ${Math.round(durationMs / 1000)} s (${scanFindings.length} résultat(s))`);
 
-            await createAuditEvent(backendBaseUrl, {
+            await createAuditEvent(backendAddress, {
               scan_id: currentScanId || 0,
               action: 'scanner.run.completed',
               actor: 'System',
@@ -5416,7 +5935,7 @@ async function activate(context) {
             currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'failed', { error: error.message, durationMs });
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — ÉCHEC : ${error.message}`);
 
-            await createAuditEvent(backendBaseUrl, {
+            await createAuditEvent(backendAddress, {
               scan_id: currentScanId || 0,
               action: 'scanner.run.failed',
               actor: 'System',
@@ -5534,7 +6053,7 @@ async function activate(context) {
           );
           scanLog.appendLine(`Pipeline — ${analysis.clusters.length} corrélation(s), ${analysis.priority.distribution.P0} P0 / ${analysis.priority.distribution.P1} P1, Policy Gate ${analysis.policy.status}.`);
           if (analysis.policy.configured) {
-            await createAuditEvent(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+            await createAuditEvent(backendBaseUrl(), {
               scan_id: currentScanId || 0,
               action: analysis.policy.status === 'BLOCK' ? 'policy.gate.blocked' : 'policy.gate.evaluated',
               actor: 'System',
@@ -5578,7 +6097,7 @@ async function activate(context) {
         publishDiagnostics(diagnostics, currentFindings); provider.setFindings(currentFindings, currentScanStatuses);
         let backendStatus = 'online';
         try {
-          const storedScan = await saveScanResult(cfg.get('backend.url', 'http://127.0.0.1:8765'), {
+          const storedScan = await saveScanResult(backendBaseUrl(), {
             workspace: folder.uri.fsPath,
             findings: currentFindings,
             scanners: currentScanStatuses,
@@ -5587,14 +6106,14 @@ async function activate(context) {
           currentScanId = storedScan.scan_id;
           if (previousScanId && validatedFindings.length) {
             const validationUpdates = await Promise.allSettled(validatedFindings.map((finding) =>
-              updateFindingStatus(cfg.get('backend.url', 'http://127.0.0.1:8765'), previousScanId, finding.id, 'validated')
+              updateFindingStatus(backendBaseUrl(), previousScanId, finding.id, 'validated')
             ));
             const failedUpdates = validationUpdates.filter((result) => result.status === 'rejected').length;
             if (failedUpdates) scanLog.appendLine(`Revalidation : ${failedUpdates} preuve(s) non persistée(s) dans le scan précédent.`);
             
-            const backendBaseUrl = cfg.get('backend.url', 'http://127.0.0.1:8765');
+            const backendAddress = backendBaseUrl();
             for (const finding of validatedFindings) {
-              await createAuditEvent(backendBaseUrl, {
+              await createAuditEvent(backendAddress, {
                 scan_id: currentScanId || 0,
                 finding_id: finding.id,
                 action: 'finding.fixed',
@@ -5602,7 +6121,7 @@ async function activate(context) {
                 comment: `Alerte résolue détectée par le scanner ${finding.tool}.`,
                 metadata: { tool: finding.tool }
               }).catch(() => {});
-              await createAuditEvent(backendBaseUrl, {
+              await createAuditEvent(backendAddress, {
                 scan_id: currentScanId || 0,
                 finding_id: finding.id,
                 action: 'finding.fix.validated',
@@ -5618,7 +6137,7 @@ async function activate(context) {
         }
         const finalScanStatus = aggregateRunStatus(scanStatuses, { cancelled });
         currentDashboardOptions = {
-          workspace: folder.name,
+          workspace: currentWorkspaceIdentity().label,
           scanStatus: finalScanStatus,
           backendStatus,
           correlations: consolidatedCorrelated.correlations,
@@ -5686,9 +6205,9 @@ async function activate(context) {
         currentScanStatuses = projection.scanners;
         currentDashboardOptions = {
           ...currentDashboardOptions,
-          workspace: folder.name,
+          workspace: currentWorkspaceIdentity().label,
           scanStatus: 'failed',
-          backendStatus: 'unknown',
+          backendStatus: currentDashboardOptions.backendStatus || DASHBOARD_BACKEND_STATUS.UNKNOWN,
           snapshotAvailable: currentFindings.length > 0,
           activeExecution: null
         };
@@ -5703,12 +6222,34 @@ async function activate(context) {
     }
   }));
 
-  const configuredBackendUrl = vscode.workspace.getConfiguration('securityCenter').get('backend.url', 'http://127.0.0.1:8765');
+  // The dashboard shows captured traffic and the Burp connector state. The
+  // address is resolved on every poll rather than captured once: in Auto mode a
+  // restarted backend can come back on another port, and a cached URL would
+  // leave this surface permanently offline against a service that is running.
+  // Le badge est resolu par le gestionnaire, en demarrant le service local si le
+  // mode Auto l'exige. C'est la seule source de l'etat affiche.
+  refreshBackendBadge({ start: true }).then(async (badge) => {
+    // Un service local qui refuse de demarrer merite une phrase et deux actions,
+    // pas un badge rouge silencieux. On ne demande jamais une URL a l'utilisateur :
+    // le mode Auto n'en a pas besoin, et la saisie manuelle reste un reglage avance.
+    if (badge !== DASHBOARD_BACKEND_STATUS.ERROR) return;
+    if (backendManager.resolvedMode() !== RESOLVED_MODE.LOCAL) return;
+    const choice = await vscode.window.showWarningMessage(
+      'Security Center : le service local n’a pas démarré. L’historique, les tendances et le journal d’audit sont indisponibles ; les analyses restent utilisables.',
+      'Réessayer', 'Voir les journaux'
+    );
+    if (choice === 'Réessayer') await vscode.commands.executeCommand('securityCenter.restartBackend');
+    if (choice === 'Voir les journaux') await vscode.commands.executeCommand('securityCenter.showBackendLogs');
+  }).catch(() => {});
+
+  // Le trafic capture et l'etat du connecteur Burp sont des DONNEES du backend.
+  // Leur indisponibilite ne dit rien du workspace et ne doit rien decider du
+  // badge : en cas d'echec on redemande son etat au gestionnaire, au lieu de
+  // laisser l'interface sur « unknown » comme elle le faisait.
+  const configuredBackendUrl = backendBaseUrl();
   Promise.all([listHttpScenarios(configuredBackendUrl), getBurpStatus(configuredBackendUrl)]).then(([scenarios, burpStatus]) => {
     currentDashboardOptions = {
       ...currentDashboardOptions,
-      workspace: vscode.workspace.workspaceFolders?.[0]?.name || 'Aucun workspace',
-      backendStatus: 'online',
       httpScenarioCount: scenarios.length,
       httpScenarios: scenarios,
       burpConnected: Boolean(burpStatus.connected),
@@ -5716,30 +6257,35 @@ async function activate(context) {
       burpStatus,
       burpEndpoint: `${configuredBackendUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
     };
-    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+    publishDashboard();
   }).catch(() => {
-    // Le dashboard reste utilisable même si le backend local est arrêté.
+    // Le dashboard reste utilisable meme si le backend local est arrete : seul
+    // le badge est mis a jour, et il dit ce qui se passe reellement.
+    refreshBackendBadge().catch(() => {});
   });
 
   const burpPolling = setInterval(() => {
-    Promise.all([listHttpScenarios(configuredBackendUrl), getBurpStatus(configuredBackendUrl)]).then(([scenarios, burpStatus]) => {
+    const pollUrl = backendBaseUrl();
+    Promise.all([listHttpScenarios(pollUrl), getBurpStatus(pollUrl)]).then(([scenarios, burpStatus]) => {
       const previousCount = currentDashboardOptions.httpScenarioCount || 0;
       const previousBurpConnected = Boolean(currentDashboardOptions.burpConnected);
       currentDashboardOptions = {
         ...currentDashboardOptions,
-        backendStatus: 'online',
+        backendStatus: backendBadgeAfterSuccess(),
         httpScenarioCount: scenarios.length,
         httpScenarios: scenarios,
         burpConnected: Boolean(burpStatus.connected),
       burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }),
         burpStatus,
-        burpEndpoint: `${configuredBackendUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
+        burpEndpoint: `${pollUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
       };
       if (scenarios.length !== previousCount || Boolean(burpStatus.connected) !== previousBurpConnected) {
-        dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+        publishDashboard();
       }
     }).catch(() => {
-      // Une indisponibilité temporaire du backend ne doit pas interrompre VS Code.
+      // Une indisponibilite temporaire du backend ne doit pas interrompre VS Code,
+      // mais le badge doit cesser d'affirmer « online » : on redemande l'etat.
+      refreshBackendBadge().catch(() => {});
     });
   }, 5000);
   context.subscriptions.push({ dispose: () => clearInterval(burpPolling) });

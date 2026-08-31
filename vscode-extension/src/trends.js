@@ -161,19 +161,26 @@ function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
  *   repond pas, la page s'ouvre quand meme et le dit. Aucune serie n'est
  *   fabriquee — les compteurs restent ceux d'un rapport vide.
  */
-function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendError = '') {
+function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendError = '', assets = {}) {
   let reportsObj = reports;
   if (reports && (reports.points || reports.latest)) {
     reportsObj = { 7: reports, 30: reports, 90: reports };
   }
   const defaultReport = reportsObj[7] || { latest: { active: 0, critical: 0, high: 0, medium: 0, low: 0 }, change: null, mttrHours: null, resolvedCount: 0, points: [] };
-  const initialActive = defaultReport.latest.active;
-  const initialCritical = defaultReport.latest.critical;
-  const initialCritHigh = defaultReport.latest.critical + defaultReport.latest.high;
+  // Backend injoignable : aucune mesure n'a ete faite. Un « 0 » affirmerait
+  // qu'aucune alerte n'est active, ce que rien n'etablit. « — » est le seul
+  // rendu honnete, et c'est deja celui du MTTR juste en dessous. Un 0 sur
+  // cette page ne doit representer qu'un zero reellement observe.
+  const historyUnavailable = Boolean(backendError);
+  const initialActive = historyUnavailable ? '—' : defaultReport.latest.active;
+  const initialCritical = historyUnavailable ? '—' : defaultReport.latest.critical;
+  const initialCritHigh = historyUnavailable ? '—' : defaultReport.latest.critical + defaultReport.latest.high;
 
   let initialMttr = '—';
   let initialMttrSub = 'Temps moyen de résolution';
-  if (defaultReport.mttrHours !== null) {
+  if (historyUnavailable) {
+    initialMttrSub = 'Historique indisponible';
+  } else if (defaultReport.mttrHours !== null) {
     initialMttr = defaultReport.mttrHours < 24 ? `${defaultReport.mttrHours.toFixed(1)} h` : `${(defaultReport.mttrHours / 24).toFixed(1)} j`;
   } else {
     initialMttrSub = 'Aucune correction validée';
@@ -242,7 +249,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
   const initialSummary = getChartSummary(defaultReport.points);
 
   const content = `
-  ${backendError ? `<section class="backend-banner" role="alert"><strong>Tendances indisponibles</strong><p>${escapeHtml(backendError)}</p><p class="backend-hint">L’historique des scans provient du backend. Tant qu’il ne répond pas, aucune tendance ne peut être calculée : rien n’est estimé à sa place.</p></section>` : ''}
+  ${backendError ? `<section class="backend-banner" role="alert"><strong>Backend indisponible</strong><p>${escapeHtml(backendError)}</p><p class="backend-hint">Les tendances nécessitent l’historique persistant du backend. Tant qu’il ne répond pas, aucune tendance n’est calculée et aucun indicateur n’est estimé à sa place — les compteurs affichent «&nbsp;—&nbsp;» et non zéro.</p><div class="backend-actions"><button data-command="securityCenter.showTrends">Réessayer</button><button data-command="securityCenter.configureBackend">Configurer le backend</button></div></section>` : ''}
   <!-- KPI cards -->
   <div class="cards">
     <div class="card card-active">
@@ -1981,7 +1988,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       });
     }
     updateUI();`,
-    csp: `default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${assets.cspSource || "'none'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets.brandLogoUri || '',
+    cspSource: assets.cspSource || '',
   });
 }
 

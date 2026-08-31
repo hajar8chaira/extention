@@ -171,7 +171,13 @@ test('affiche la page Dynamic Security et conserve les actions ZAP/Burp', () => 
   assert.match(html, /Findings dynamiques/);
   assert.match(html, /Trafic HTTP/);
   assert.match(html, /Tests dynamiques récents/);
-  assert.match(html, /Requêtes capturées<\/span><strong>1<\/strong>/);
+  // La carte Burp distingue desormais l'etat de la connexion de l'historique
+  // capture : « Deconnecte » ne doit plus se lire « aucune donnee ». Le libelle
+  // du compteur suit ce decoupage — l'invariant teste reste que la requete
+  // capturee est bien decomptee.
+  assert.match(html, /Connexion actuelle<\/span><strong>(Connectée|Déconnectée)<\/strong>/);
+  assert.match(html, /Historique capturé/);
+  assert.match(html, /Requêtes conservées<\/span><strong>1<\/strong>/);
   assert.match(html, /Endpoints uniques<\/span><strong>1<\/strong>/);
   assert.match(html, /GET \/api\/users/);
   assert.match(html, /<h2>Burp<\/h2>[\s\S]*Connecté/);
@@ -233,6 +239,7 @@ test('affiche au plus cinq findings dynamiques prioritaires avec les corrélatio
     { id: 'runtime-1', tool: 'Semgrep', title: 'Runtime route', rawSeverity: 'HIGH', sourceContext: 'runtime', endpoint: '/api/runtime', triageStatus: 'new' },
     { id: 'replay-1', tool: 'HTTP Replay', title: 'Replay mismatch', rawSeverity: 'HIGH', source: 'http-replay', url: 'http://127.0.0.1:3000/api/replay', triageStatus: 'new' },
     { id: 'zap-2', tool: 'ZAP', title: 'Fifth priority', rawSeverity: 'HIGH', sourceContext: 'runtime', endpoint: '/five', triageStatus: 'new' },
+    { id: 'zap-2b', tool: 'ZAP', title: 'Fifth bis', rawSeverity: 'HIGH', sourceContext: 'runtime', endpoint: '/five-bis', triageStatus: 'new' },
     { id: 'zap-3', tool: 'ZAP', title: 'Sixth priority hidden', rawSeverity: 'HIGH', sourceContext: 'runtime', endpoint: '/six', triageStatus: 'new' },
     { id: 'zap-low', tool: 'ZAP', title: 'Low hidden', rawSeverity: 'LOW', sourceContext: 'runtime', endpoint: '/low', triageStatus: 'new' },
     { id: 'zap-fixed', tool: 'ZAP', title: 'Fixed hidden', rawSeverity: 'CRITICAL', sourceContext: 'runtime', endpoint: '/fixed', triageStatus: 'fixed' }
@@ -251,6 +258,10 @@ test('affiche au plus cinq findings dynamiques prioritaires avec les corrélatio
   assert.doesNotMatch(section, /Sixth priority hidden/);
   assert.doesNotMatch(section, /Low hidden/);
   assert.doesNotMatch(section, /Fixed hidden/);
+  // Dynamic Security n'agrege que ZAP et Burp. Un finding Semgrep marque
+  // « runtime » appartient au domaine de la supervision d'execution : il
+  // entrait ici auparavant, il en est desormais exclu.
+  assert.doesNotMatch(section, /Runtime route/);
   assert.match(section, /Voir tous les findings dynamiques/);
   assert.match(section, /securityCenter\.openFindingsPage/);
 });

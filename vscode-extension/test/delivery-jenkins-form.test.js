@@ -115,34 +115,35 @@ test('un jeton enregistré n’apparaît nulle part dans le HTML', () => {
   assert.ok(!/type="password"[^>]*value=/.test(html), 'aucun champ mot de passe prérempli');
 });
 
-test('le modèle envoyé à la page ne transporte pas le jeton', () => {
+test('le modèle générique envoyé à la page ne transporte pas le jeton', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
   const refresh = source.slice(source.indexOf('async function refreshDeliveryStatus'));
   const body = refresh.slice(0, refresh.indexOf('renderDeliveryPage();'));
-  // Seul le fait qu'un jeton existe entre dans le modèle.
-  assert.match(body, /tokenConfigured: Boolean\(token\)/);
-  assert.ok(!/\btoken,\s*$/m.test(body.slice(body.indexOf('deliveryStatus = {'))),
-    'le jeton lui-même ne doit pas être ajouté au modèle de présentation');
+  assert.match(body, /buildDeliveryModelFor\(active\.providerId\)/);
+  assert.doesNotMatch(body, /tokenConfigured|token,\s*$/m);
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'src', 'delivery-provider-view.js'), 'utf8');
+  assert.match(renderer, /secretsConfigured/);
+  assert.match(renderer, /placeholder/);
+  assert.doesNotMatch(renderer, /value=.*secret/i);
 });
 
-test('le jeton n’est écrit que dans SecretStorage', () => {
+test('le jeton n’est écrit que via le service SecretStorage provider-neutre', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
-  const apply = source.slice(source.indexOf('async function applyJenkinsConfiguration'));
-  const body = apply.slice(0, apply.indexOf('\n  }\n'));
-  assert.match(body, /context\.secrets\.store\(JENKINS_TOKEN_SECRET_KEY, trimmedToken\)/);
-  // Ni settings.json, ni workspaceState, ni journal, ni audit.
-  assert.ok(!/cfg\.update\([^)]*[Tt]oken/.test(body), 'aucun jeton dans la configuration');
-  assert.ok(!/workspaceState[\s\S]*trimmedToken/.test(body));
-  assert.ok(!/appendLine[\s\S]*trimmedToken/.test(body));
-  assert.match(body, /tokenStored: Boolean\(trimmedToken\)/, 'l’audit ne consigne que l’existence');
-  const audit = body.slice(body.indexOf('createAuditEvent'));
-  assert.ok(!/comment:[^\n]*trimmedToken/.test(audit), 'aucun jeton dans un événement d’audit');
+  const apply = source.slice(source.indexOf('async function applyDeliveryConfiguration'));
+  const body = apply.slice(0, apply.indexOf('async function applyJenkinsConfiguration'));
+  assert.match(body, /deliveryConfiguration\.saveProviderConfiguration\(requested, values\)/);
+  assert.ok(!/cfg\.update\([^)]*(token|password|secret)/i.test(body), 'aucun secret dans la configuration VS Code');
+  assert.ok(!/workspaceState[\s\S]*(token|password|secret)/i.test(body));
+  const shared = fs.readFileSync(path.join(__dirname, '..', 'src', 'integrations', 'provider-configuration.js'), 'utf8');
+  assert.match(shared, /secrets\.store\(secretKeyFor\(adapter\.id, field\.id\)/);
+  assert.match(shared, /String\(values\[field\.id\]\) !== ''/);
 });
 
 test('un jeton vide conserve celui déjà enregistré', () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
-  const apply = source.slice(source.indexOf('async function applyJenkinsConfiguration'));
-  assert.match(apply.slice(0, apply.indexOf('\n  }\n')), /if \(trimmedToken\) await context\.secrets\.store/);
+  const shared = fs.readFileSync(path.join(__dirname, '..', 'src', 'integrations', 'provider-configuration.js'), 'utf8');
+  assert.match(shared, /const storedSecrets = await getProviderSecrets\(adapter\.id\)/);
+  assert.match(shared, /const effectiveSecrets = \{ \.\.\.storedSecrets \}/);
+  assert.match(shared, /provided !== undefined && String\(provided\) !== ''/);
 });
 
 // ================================== la logique existante reste la référence
@@ -158,24 +159,27 @@ test('le formulaire n’embarque ni validation ni appel à Jenkins', () => {
 
 test('l’extension reste la frontière de confiance pour les deux actions', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
-  assert.match(source, /message\.action === 'saveConfig'/);
-  assert.match(source, /message\.action === 'testConfig'/);
-  // Le test de connexion passe par la fonction existante, pas par une nouvelle.
-  const testConfig = source.slice(source.indexOf("message.action === 'testConfig'"));
-  assert.match(testConfig.slice(0, 600), /testJenkinsConnection\(\{/);
-  // La sauvegarde passe par l'unique fonction de persistance.
-  const saveConfig = source.slice(source.indexOf("message.action === 'saveConfig'"));
-  assert.match(saveConfig.slice(0, 400), /applyJenkinsConfiguration\(\{/);
+  assert.match(source, /message\.action === 'deliverySave'/);
+  assert.match(source, /message\.action === 'deliveryTest'/);
+  const testConfig = source.slice(source.indexOf("message.action === 'deliveryTest'"));
+  assert.match(testConfig.slice(0, 900), /testDeliveryProviderConnection\(providerId, config\)/);
+  const saveConfig = source.slice(source.indexOf("message.action === 'deliverySave'"));
+  assert.match(saveConfig.slice(0, 500), /applyDeliveryConfiguration\(message\.provider/);
 });
 
 test('il n’existe qu’un seul chemin d’écriture de la configuration Jenkins', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
-  // La commande InputBox et le formulaire aboutissent au même endroit.
+  assert.equal((source.match(/async function applyDeliveryConfiguration/g) || []).length, 1);
+  assert.equal((source.match(/deliveryConfiguration\.saveProviderConfiguration/g) || []).length, 1);
+  // Les clés Jenkins legacy ne sont plus le stockage principal, mais restent
+  // synchronisées pour compatibilité avec les workspaces déjà configurés.
   assert.equal((source.match(/cfg\.update\('jenkins\.url'/g) || []).length, 1);
   assert.equal((source.match(/cfg\.update\('jenkins\.job'/g) || []).length, 1);
-  assert.equal((source.match(/context\.secrets\.store\(JENKINS_TOKEN_SECRET_KEY/g) || []).length, 1);
-  // Une définition et deux appels : la commande InputBox et le formulaire.
-  assert.equal((source.match(/applyJenkinsConfiguration\(\{/g) || []).length, 3, 'les deux entrées, une seule implémentation');
+  assert.equal((source.match(/cfg\.update\('jenkins\.user'/g) || []).length, 1);
+  assert.equal((source.match(/context\.secrets\.store\(JENKINS_TOKEN_SECRET_KEY/g) || []).length, 0);
+  // Une définition et un appel : la commande InputBox est un wrapper de
+  // compatibilité vers le domaine Delivery.
+  assert.equal((source.match(/applyJenkinsConfiguration\(\{/g) || []).length, 2);
   assert.equal((source.match(/async function applyJenkinsConfiguration/g) || []).length, 1);
 });
 

@@ -1,9 +1,10 @@
 'use strict';
 
 const { compactIcon, renderSecurityCenterShell } = require('./security-center-shell');
-const { DELIVERY_STATE } = require('./jenkins');
 const { PROMETHEUS_STATUS, buildPrometheusStatus, displaySecondsAgo } = require('./integrations/observability');
 const { RUNTIME_STATUS, buildRuntimeSecurityStatus } = require('./integrations/siem');
+const { DELIVERY_PROVIDERS, PROVIDER_STATUS } = require('./integrations/delivery');
+const { renderProviderForm } = require('./delivery-provider-view');
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => (
@@ -39,16 +40,23 @@ function statusLabel(status) {
 }
 
 function deliverySummary(delivery = {}) {
-  if (!delivery?.configured || delivery.state === DELIVERY_STATE.NOT_CONFIGURED) {
+  if (!delivery?.configured || delivery.status === PROVIDER_STATUS.NOT_CONFIGURED) {
     return { status: 'not-configured', label: 'Not configured', tone: 'muted', line: 'Optional CI/CD connector' };
   }
-  if (delivery.state === DELIVERY_STATE.SUCCESS) {
-    return { status: 'healthy', label: 'Connected', tone: 'ok', line: delivery.build?.number ? `Build #${delivery.build.number} · SUCCESS` : 'Last build successful' };
+  if (delivery.status === PROVIDER_STATUS.HEALTHY) {
+    return {
+      status: 'healthy',
+      label: 'Connected',
+      tone: 'ok',
+      line: delivery.run?.displayName || delivery.run?.id
+        ? `Run ${delivery.run.displayName || delivery.run.id} · ${delivery.run.outcome || 'reported'}`
+        : 'Provider responded'
+    };
   }
-  if ([DELIVERY_STATE.FAILED, DELIVERY_STATE.ERROR, DELIVERY_STATE.ABORTED].includes(delivery.state)) {
-    return { status: 'failed', label: 'Attention', tone: 'bad', line: delivery.error || (delivery.build?.number ? `Build #${delivery.build.number}` : 'Delivery unavailable') };
+  if ([PROVIDER_STATUS.OFFLINE, PROVIDER_STATUS.AUTH_ERROR, PROVIDER_STATUS.ERROR].includes(delivery.status)) {
+    return { status: 'failed', label: 'Attention', tone: 'bad', line: delivery.message || 'Delivery provider unavailable' };
   }
-  return { status: 'degraded', label: 'Connected', tone: 'warn', line: delivery.build?.number ? `Build #${delivery.build.number} · ${delivery.state}` : 'Delivery state available' };
+  return { status: 'degraded', label: 'Connected', tone: 'warn', line: delivery.message || 'Delivery state available' };
 }
 
 function metricTile(label, metric) {
@@ -137,24 +145,54 @@ function renderWazuhCard(runtime) {
   </article>`;
 }
 
-function renderJenkinsCard(delivery) {
-  const summary = deliverySummary(delivery);
-  return `<article class="integration-card ${summary.tone}" data-provider="jenkins">
+function renderDeliveryProviderCard(provider, delivery, selectedProvider) {
+  const active = delivery?.providerId === provider.id && delivery?.configured;
+  const selected = selectedProvider === provider.id;
+  const summary = active
+    ? deliverySummary(delivery)
+    : provider.implemented
+      ? { label: 'Implemented', tone: 'muted', line: provider.summary || 'Provider adapter available.' }
+      : { label: 'Catalogue only', tone: 'muted', line: 'Provider referenced, adapter unavailable in this version.' };
+  const run = active && delivery.run ? (delivery.run.displayName || delivery.run.id || 'Reported') : 'Unavailable';
+  const report = active && delivery.securityReport?.reported ? 'Reported' : 'Not reported';
+  return `<article class="integration-card ${summary.tone}${selected ? ' selected' : ''}" data-provider="${escapeHtml(provider.id)}">
     <div class="integration-card-head">
-      <div class="provider-title">${providerMark('cube', 'J')}<div><h3>Jenkins</h3><p>CI / Delivery</p></div></div>
+      <div class="provider-title">${providerMark('cube', provider.label.slice(0, 1))}<div><h3>${escapeHtml(provider.label)}</h3><p>${provider.implemented ? 'CI/CD adapter implemented' : 'CI/CD catalogue reference'}</p></div></div>
       <span class="state-chip ${summary.tone}">● ${escapeHtml(summary.label)}</span>
     </div>
     <div class="integration-facts">
-      <span>Job: <strong>${escapeHtml(delivery?.job || 'Not configured')}</strong></span>
-      <span>Build: <strong>${escapeHtml(delivery?.build?.number ? `#${delivery.build.number}` : 'Unavailable')}</strong></span>
-      <span>Policy: <strong>${escapeHtml(delivery?.policy?.status || 'Not reported')}</strong></span>
+      <span>Pipeline: <strong>${escapeHtml(active ? (delivery.pipeline || 'Not reported') : 'Not configured')}</strong></span>
+      <span>Run: <strong>${escapeHtml(run)}</strong></span>
+      <span>Security report: <strong>${escapeHtml(report)}</strong></span>
     </div>
     <p class="provider-message">${escapeHtml(summary.line)}</p>
     <div class="actions">
       <button data-command="securityCenter.openSecurityDelivery">Open delivery</button>
-      <button class="secondary" data-command="securityCenter.configureJenkins">Configure</button>
+      ${provider.implemented
+        ? `<button class="secondary" data-action="selectDeliveryProvider" data-provider-id="${escapeHtml(provider.id)}">${active || selected ? 'Configure' : 'Select'}</button>`
+        : `<button class="secondary" data-action="selectDeliveryProvider" data-provider-id="${escapeHtml(provider.id)}">View status</button>`}
+      ${active ? '<button class="secondary" data-action="disconnectDelivery">Disconnect</button>' : ''}
     </div>
   </article>`;
+}
+
+function renderDeliveryConfiguration(model) {
+  const providers = model.deliveryProviders || DELIVERY_PROVIDERS;
+  const selected = model.deliverySelectedProvider || model.delivery?.providerId || 'jenkins';
+  const provider = providers.find((entry) => entry.id === selected) || providers[0] || null;
+  return `<section id="delivery-config" class="config-card delivery-config"${model.openConfig === 'delivery' ? '' : ' hidden'}>
+    <div class="config-head"><h3>Security Delivery / CI-CD</h3><span>Provider configuration</span></div>
+    <label>CI/CD provider
+      <select id="delivery-provider">
+        ${providers.map((entry) => `<option value="${escapeHtml(entry.id)}"${entry.id === selected ? ' selected' : ''}>${escapeHtml(entry.label)}${entry.implemented ? '' : ' — catalogue only'}</option>`).join('')}
+      </select>
+    </label>
+    ${renderProviderForm(provider, {
+      configuration: model.deliveryProviderValues || {},
+      secretsConfigured: model.deliverySecretsConfigured || {}
+    })}
+    <div class="actions"><button class="secondary" data-action="cancelConfig">Cancel</button></div>
+  </section>`;
 }
 
 function renderPrometheusForm(prometheus, open = false) {
@@ -195,10 +233,75 @@ function renderTeamIntegrations(team = {}) {
   </section>`;
 }
 
+/**
+ * The Security Center backend, as the user sees it.
+ *
+ * Nothing on this card asks for a Docker path, a compose file or a container
+ * name: in the standard mode there is no container, and the only thing the user
+ * can usefully act on is the mode and — in Remote mode — the address. The
+ * resolved address is shown rather than the configured one, because in Auto
+ * mode the port is chosen at start time and the two can differ.
+ */
+function renderBackendCard(backend = {}) {
+  const state = String(backend.state || 'not-configured');
+  const tone = backend.online ? 'ok' : ['starting'].includes(state) ? 'warn' : 'bad';
+  const label = backend.label || statusLabel(state);
+  const detail = backend.online
+    ? 'Persistance, historique, tendances et ingestion Burp'
+    : escapeHtml(backend.hint || backend.message || 'Service indisponible');
+  return `<article class="integration-card ${tone}" data-card="backend">
+    <div class="card-head">${providerMark('server', 'Backend')}<span class="state-chip ${tone}">● ${escapeHtml(label)}</span></div>
+    <div><strong>Security Center Backend</strong><span class="card-line">${detail}</span></div>
+    <dl class="backend-facts">
+      <div><dt>Mode</dt><dd>${escapeHtml(backend.modeLabel || backend.mode || 'Auto')}</dd></div>
+      <div><dt>Resolved mode</dt><dd>${escapeHtml(backend.resolvedMode || 'local')}</dd></div>
+      <div><dt>Address</dt><dd>${escapeHtml(endpointLabel(backend.url))}</dd></div>
+      <div><dt>Version</dt><dd>${escapeHtml(backend.version || 'Unavailable')}</dd></div>
+    </dl>
+    ${capabilityList(['Scan history', 'Trends / MTTR', 'Audit journal', 'Burp ingestion'])}
+    <div class="actions">
+      <button data-action="testBackend">Test connection</button>
+      ${backend.managed ? '<button class="secondary" data-action="restartBackend">Restart backend</button>' : ''}
+      <button class="secondary" data-action="revealBackendConfig">Advanced configuration</button>
+    </div>
+  </article>`;
+}
+
+/** The advanced form. Closed by default: the standard mode needs no configuration. */
+function renderBackendForm(backend = {}, open = false) {
+  const mode = String(backend.mode || 'auto');
+  const option = (value, label, hint) => `<label class="radio-row">
+    <input type="radio" name="backend-mode" value="${value}"${mode === value ? ' checked' : ''}>
+    <span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(hint)}</small></span>
+  </label>`;
+  return `<details class="config-card" data-config="backend"${open ? ' open' : ''}>
+    <summary>Security Center Backend — advanced configuration</summary>
+    <div class="config-grid">
+      ${option('auto', 'Auto / Local', 'Le service local est démarré par l’extension. Aucune installation requise.')}
+      ${option('remote', 'Remote', 'Un backend opéré par votre organisation. L’extension ne démarre rien.')}
+      ${option('docker', 'Docker (développement)', 'docker-compose.backend.yml, pour le développement et les tests.')}
+      <label>Remote URL
+        <input type="url" id="backend-url" value="${escapeHtml(backend.remoteUrl || '')}" placeholder="https://security.company.internal">
+      </label>
+      <small class="config-note">Les données locales sont conservées dans le stockage global de VS Code : une mise à jour de l’extension ne supprime pas l’historique.</small>
+    </div>
+    <div class="actions">
+      <button data-action="saveBackendConfig">Save</button>
+      <button class="secondary" data-action="resetBackendConfig">Reset to defaults</button>
+    </div>
+  </details>`;
+}
+
 function renderOverview(model) {
+  const deliveryProviders = model.deliveryProviders || DELIVERY_PROVIDERS;
+  const deliverySelectedProvider = model.deliverySelectedProvider || model.delivery?.providerId || 'jenkins';
   return `<section class="integration-section">
-    <div class="section-title"><h2>CI / Delivery</h2><span>Existing pipeline evidence</span></div>
-    <div class="integration-grid">${renderJenkinsCard(model.delivery)}</div>
+    <div class="section-title"><h2>Security Center Backend</h2><span>Service local géré par l’extension</span></div>
+    <div class="integration-grid">${renderBackendCard(model.backend)}</div>
+  </section>
+  <section class="integration-section">
+    <div class="section-title"><h2>CI / Delivery</h2><span>Security Delivery / CI-CD providers</span></div>
+    <div class="integration-grid">${deliveryProviders.map((provider) => renderDeliveryProviderCard(provider, model.delivery, deliverySelectedProvider)).join('')}</div>
   </section>
   <section class="integration-section">
     <div class="section-title"><h2>Observability</h2><span>Infrastructure facts from external metrics</span></div>
@@ -208,8 +311,10 @@ function renderOverview(model) {
     <div class="section-title"><h2>SIEM / Runtime Security</h2><span>Normalized provider model; Wazuh is the first adapter</span></div>
     <div class="integration-grid">${renderWazuhCard(model.runtime)}</div>
   </section>
+  ${renderBackendForm(model.backend, model.openConfig === 'backend')}
   ${renderPrometheusForm(model.prometheus, model.openConfig === 'prometheus')}
   ${renderWazuhForm(model.runtime, model.openConfig === 'wazuh')}
+  ${renderDeliveryConfiguration(model)}
   ${renderTeamIntegrations(model.team)}`;
 }
 
@@ -274,8 +379,17 @@ function integrationsCss() {
   .integration-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
   .integration-card,.config-card,.team-card,.detail-page{border:1px solid var(--sc-border);border-radius:var(--sc-radius-lg);background:var(--sc-surface);box-shadow:var(--sc-shadow-sm);padding:15px}
   .integration-card{display:grid;gap:12px;border-top:2px solid var(--sc-border)}
+  .integration-card.selected{box-shadow:0 0 0 2px color-mix(in srgb,var(--sc-primary) 30%,transparent),var(--sc-shadow-sm)}
   .integration-card.ok{border-top-color:var(--sc-success)}
   .integration-card.warn{border-top-color:var(--sc-warning)}
+  .backend-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px;margin:0}
+  .backend-facts div{display:grid;gap:2px;min-width:0}
+  .backend-facts dt{font-size:10px;letter-spacing:.4px;text-transform:uppercase;color:var(--sc-muted)}
+  .backend-facts dd{margin:0;font-size:11px;overflow-wrap:anywhere}
+  .radio-row{display:flex;gap:8px;align-items:start;font-size:11px}
+  .radio-row span{display:grid;gap:2px}
+  .radio-row small{color:var(--sc-muted)}
+  .config-note{color:var(--sc-muted);font-size:10px}
   .integration-card.bad{border-top-color:var(--sc-danger)}
   .integration-card-head,.detail-hero,.config-head{display:flex;justify-content:space-between;align-items:start;gap:12px}
   .provider-title{display:grid;grid-template-columns:34px minmax(0,1fr);align-items:center;gap:10px;min-width:0}
@@ -306,7 +420,13 @@ function integrationsCss() {
   button:hover{background:var(--sc-primary-hover)}button.secondary:hover{background:var(--sc-surface-soft)}
   .config-card{display:grid;gap:11px;margin-bottom:18px}.config-card[hidden]{display:none}
   label{display:grid;gap:5px;font-size:11px;font-weight:700;color:var(--sc-text)}
-  input{min-width:0;padding:8px 10px;border-radius:var(--sc-radius-md);border:1px solid var(--sc-input-border,var(--sc-border));color:var(--sc-input-text,var(--sc-text));background:var(--sc-input-bg,var(--sc-surface))}
+  input,select{min-width:0;padding:8px 10px;border-radius:var(--sc-radius-md);border:1px solid var(--sc-input-border,var(--sc-border));color:var(--sc-input-text,var(--sc-text));background:var(--sc-input-bg,var(--sc-surface))}
+  .delivery-config .card{box-shadow:none;margin:0;padding:0;border:0;background:transparent}
+  .delivery-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 14px}
+  .field{margin-top:11px;display:flex;flex-direction:column;gap:5px;min-width:0}
+  .field label{display:flex;align-items:center;gap:8px}
+  .field input[type="checkbox"]{width:15px;height:15px;min-width:15px;padding:0}
+  .field small,summary{font-size:10px;color:var(--sc-muted)}
   .team-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
   .team-card{display:grid;grid-template-columns:34px minmax(0,1fr) auto;align-items:center;gap:12px}.team-card div{display:grid;gap:4px}
   .detail-page{display:grid;gap:14px}.detail-hero{padding-bottom:12px;border-bottom:1px solid var(--sc-border)}
@@ -322,6 +442,9 @@ function renderIntegrationPageHtml(model = {}, nonce = '', theme = 'light') {
   const view = model.view === 'prometheus' || model.view === 'runtime' ? model.view : 'overview';
   const prometheus = model.prometheus || buildPrometheusStatus();
   const runtime = model.runtime || buildRuntimeSecurityStatus();
+  const deliveryFields = (model.deliveryProviderDefinition?.configurationFields || []).map((field) => ({
+    id: field.id, type: field.type, secret: Boolean(field.secret)
+  }));
   const content = view === 'prometheus'
     ? renderPrometheusDetail(prometheus)
     : view === 'runtime'
@@ -329,6 +452,8 @@ function renderIntegrationPageHtml(model = {}, nonce = '', theme = 'light') {
       : renderOverview({ ...model, prometheus, runtime });
   return renderSecurityCenterShell({
     surface: 'integrations',
+    brandLogoUri: model.brandLogoUri || '',
+    cspSource: model.cspSource || '',
     nonce,
     theme,
     title: 'Integrations',
@@ -338,26 +463,43 @@ function renderIntegrationPageHtml(model = {}, nonce = '', theme = 'light') {
     styles: integrationsCss(),
     script: `const vscode=window.__scShellApi||acquireVsCodeApi();
       const value=id=>{const el=document.getElementById(id);return el?el.value.trim():'';};
+      const deliveryFields=${JSON.stringify(deliveryFields)};
+      const deliveryProvider=()=>{const el=document.getElementById('delivery-provider');return el?el.value:'';};
+      const deliveryConfig=()=>Object.fromEntries(deliveryFields.map(entry=>{
+        const el=document.getElementById('delivery-'+entry.id);
+        return [entry.id,entry.type==='boolean'?Boolean(el&&el.checked):(el?el.value.trim():'')];
+      }));
+      const backendConfig=()=>({mode:(document.querySelector('input[name="backend-mode"]:checked')||{}).value||'auto',url:value('backend-url')});
       const prometheusConfig=()=>({url:value('prometheus-url')});
       const wazuhConfig=()=>({url:value('wazuh-url'),username:value('wazuh-user'),password:value('wazuh-password')});
       const reveal=id=>{const el=document.getElementById(id);if(el){el.hidden=false;el.scrollIntoView({block:'nearest'});const input=el.querySelector('input');if(input)input.focus();}};
       document.querySelectorAll('[data-command]:not(.sc-nav-item)').forEach(b=>b.onclick=()=>vscode.postMessage({type:'command',command:b.dataset.command}));
       document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>{
         const action=b.dataset.action;
+        if(action==='selectDeliveryProvider')return vscode.postMessage({type:'action',action,provider:b.dataset.providerId});
+        if(action==='revealBackendConfig'){const el=document.querySelector('[data-config="backend"]');if(el){el.open=true;el.scrollIntoView({block:'nearest'});}return;}
+        if(action==='saveBackendConfig')return vscode.postMessage({type:'action',action,config:backendConfig()});
         if(action==='revealPrometheusConfig')return reveal('prometheus-config');
         if(action==='revealWazuhConfig')return reveal('wazuh-config');
         if(action==='cancelConfig'){document.querySelectorAll('.config-card').forEach(el=>el.hidden=true);return;}
+        if(action==='deliverySave'||action==='deliveryTest')return vscode.postMessage({type:'action',action,provider:deliveryProvider(),config:deliveryConfig()});
+        if(action==='disconnectDelivery')return vscode.postMessage({type:'action',action});
         if(action==='savePrometheusConfig'||action==='testPrometheusConfig')return vscode.postMessage({type:'action',action,config:prometheusConfig()});
         if(action==='saveWazuhConfig'||action==='testWazuhConfig')return vscode.postMessage({type:'action',action,config:wazuhConfig()});
         vscode.postMessage({type:'action',action});
-      });`
+      });
+      const deliverySelect=document.getElementById('delivery-provider');
+      if(deliverySelect)deliverySelect.onchange=()=>vscode.postMessage({type:'action',action:'selectDeliveryProvider',provider:deliveryProvider()});`
   });
 }
 
 module.exports = {
+  renderBackendCard,
+  renderBackendForm,
   renderIntegrationPageHtml,
   renderPrometheusCard,
   renderWazuhCard,
+  renderDeliveryProviderCard,
   renderPrometheusDetail,
   renderRuntimeDetail,
   deliverySummary,

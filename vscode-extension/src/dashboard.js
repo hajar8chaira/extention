@@ -578,6 +578,17 @@ function endpointPath(value) {
   catch { return String(value || '').split('?')[0].replace(/\/+$/, '') || '/'; }
 }
 
+/**
+ * L'origine d'un endpoint : schema, hote et port.
+ *
+ * Renvoie la chaine vide pour une URL relative — une origine inconnue ne
+ * refute rien et ne doit donc pas servir a rejeter une association.
+ */
+function endpointOrigin(value) {
+  try { return new URL(String(value)).origin.toLowerCase(); }
+  catch { return ''; }
+}
+
 function isUsefulHttpScenario(scenario) {
   const pathname = endpointPath(scenario.request?.url).toLowerCase();
   if (/\.(?:css|js|map|png|jpe?g|gif|svg|ico|woff2?|ttf)$/i.test(pathname)) return false;
@@ -655,6 +666,15 @@ function transactionParameters(scenario) {
  */
 function associationFor(scenario, finding) {
   if (!finding?.endpoint) return { confidence: null, reasons: [] };
+  // L'origine d'abord. Sans elle, `/` d'un hote et `/` d'un autre etaient le
+  // meme endpoint : c'est ainsi qu'une requete Burp capturee sur une cible
+  // heritait des findings ZAP d'une cible differente. Un hote inconnu des deux
+  // cotes (URL relative) ne peut rien refuter et ne bloque donc pas.
+  const scenarioOrigin = endpointOrigin(scenario?.request?.url);
+  const findingOrigin = endpointOrigin(finding.endpoint);
+  if (scenarioOrigin && findingOrigin && scenarioOrigin !== findingOrigin) {
+    return { confidence: null, reasons: [] };
+  }
   const path = endpointPath(scenario?.request?.url);
   const findingPath = endpointPath(finding.endpoint);
   if (findingPath !== path) return { confidence: null, reasons: [] };
@@ -1395,15 +1415,24 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       const tool = String(finding.tool || '').toLowerCase();
       const context = String(finding.sourceContext || finding.context || '').toLowerCase();
       const source = String(finding.source || finding.evidenceSource || '').toLowerCase();
+      // Le domaine Dynamic Security, ce sont ses deux sources : ZAP et Burp.
+      // `context === 'runtime'` faisait entrer ici des findings de supervision
+      // d'execution, qui appartiennent a un autre domaine et a une autre page.
       return !inactiveStatuses.has(finding.triageStatus)
         && ['CRITICAL', 'ERROR', 'HIGH'].includes(String(finding.rawSeverity || finding.severity || '').toUpperCase())
-        && (tool === 'zap' || tool === 'burp' || context === 'runtime' || context === 'dynamic' || source.includes('replay'));
+        && (tool === 'zap' || tool === 'burp' || context === 'dynamic' || source.includes('replay'));
     })
     .sort((left, right) => {
       const rank = { CRITICAL: 0, ERROR: 0, HIGH: 1 };
       return (rank[String(left.finding.rawSeverity || left.finding.severity || '').toUpperCase()] ?? 2)
         - (rank[String(right.finding.rawSeverity || right.finding.severity || '').toUpperCase()] ?? 2);
     });
+  // Compteurs par source : la carte ZAP et le filtre de section lisent la meme
+  // valeur, ce qui evite qu'un compteur annonce un ensemble et qu'un bouton en
+  // ouvre un autre.
+  const dynamicZapCount = dynamicFindings.filter(({ finding }) => String(finding.tool || '').toLowerCase() === 'zap').length;
+  const dynamicBurpCount = dynamicFindings.filter(({ finding }) => String(finding.tool || '').toLowerCase() === 'burp'
+    || burpScenarios.some((scenario) => linkedFindingsForScenario(scenario, [finding]).length > 0)).length;
   const dynamicFindingRows = dynamicFindings
     .slice(0, 5)
     .map(({ finding, index }) => {
@@ -1429,7 +1458,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         ? `${sourceCorrelation.finding.file || sourceCorrelation.finding.absolutePath}${sourceCorrelation.finding.startLine ? `:${sourceCorrelation.finding.startLine}` : ''}`
         : '';
       const sourceEvidence = sourceCorrelation ? `<div class="dynamic-source ${sourceCorrelation.confidence}"><span>${sourceCorrelation.label}</span><code>${escapeHtml(sourceLocation)}</code><button class="quiet-action" data-finding-code-index="${sourceCorrelation.index}">Ouvrir le code</button></div>` : '';
-      return `<article class="dynamic-finding-row">
+      // La provenance porte le filtre de la section : elle est lue du finding,
+      // jamais deduite de sa position dans la liste.
+      const originTool = String(finding.tool || '').toLowerCase() === 'zap'
+        ? 'zap'
+        : (String(finding.tool || '').toLowerCase() === 'burp' || matchingBurpScenario) ? 'burp' : 'other';
+      return `<article class="dynamic-finding-row" data-dynamic-source="${originTool}">
+        <span class="dynamic-source-chip ${originTool}">${escapeHtml(originTool === 'zap' ? 'ZAP' : originTool === 'burp' ? 'Burp' : 'Dynamique')}</span>
         <span class="dynamic-severity ${semanticClass(severity)}">${escapeHtml(severity)}</span>
         <div class="dynamic-finding-copy"><strong>${escapeHtml(finding.title || finding.ruleId || 'Alerte dynamique')}</strong><small>${escapeHtml(method + endpoint)}</small><span>${escapeHtml(sourceLabel)}${correlationLabel}</span>${sourceEvidence}</div>
         <span class="triage-badge">${escapeHtml(statusLabels[status] || status)}</span>
@@ -1666,7 +1701,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const scanChronoBadge = scanRunning
     ? `<span id="scan-chrono" class="scan-chrono" data-started-at="${escapeHtml(model.scanStartedAt)}" data-elapsed="${model.scanDurationMs}">◷ ${escapeHtml(formatDuration(model.scanDurationMs))}</span>`
     : '';
-  const backendTone = model.backendStatus === 'online' ? 'online' : ['offline', 'error', 'unreachable'].includes(String(model.backendStatus)) ? 'offline' : 'unknown';
+  // Un backend distant EST en ligne : le badge doit le montrer comme tel, tout
+  // en gardant le mot « remote », qui dit que ce service n'est pas gere ici.
+  // « starting » et « unknown » restent neutres : ni affirmation ni panne.
+  const backendStatusText = String(model.backendStatus || 'unknown');
+  const backendTone = ['online', 'remote'].includes(backendStatusText)
+    ? 'online'
+    : ['offline', 'error', 'unreachable'].includes(backendStatusText) ? 'offline' : 'unknown';
   // Le dashboard complet porte deja son nom dans la barre laterale interne : le
   // haut de page nomme la vue, pas le produit. Les autres surfaces gardent leur
   // en-tete d'origine, inchange.
@@ -1684,7 +1725,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       <div class="sc-topbar-title"><h1>${escapeHtml(surfaceTitle)}</h1><p>${shellSubtitle}</p></div>
       <div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend ${backendTone}">Backend ${escapeHtml(model.backendStatus)}</span></div></div>
     </header>`
-    : `<div class="header"><div><h2>Security Center</h2><div class="workspace">${escapeHtml(model.workspace)}</div></div><div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend">Backend ${escapeHtml(model.backendStatus)}</span></div></div></div>`;
+    : `<div class="header"><div><h2>Secenter</h2><div class="workspace">${escapeHtml(model.workspace)}</div></div><div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend ${backendTone}">Backend ${escapeHtml(model.backendStatus)}</span></div></div></div>`;
 
   // Zones les plus exposees : un regroupement de `currentActiveFindings`, la
   // liste que la page affiche deja. Aucune analyse supplementaire.
@@ -1710,15 +1751,27 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const delivery = enterprise?.delivery || {};
   const prometheus = enterprise?.prometheus || {};
   const runtime = enterprise?.runtime || {};
-  const deliveryState = delivery.state === 'SUCCESS' ? 'success' : delivery.state === 'ERROR' || delivery.state === 'FAILED' ? 'error' : delivery.configured ? 'degraded' : 'not-configured';
+  const deliveryStatusValue = delivery.status || (
+    delivery.state === 'SUCCESS' ? 'healthy'
+      : delivery.state === 'ERROR' || delivery.state === 'FAILED' ? 'error'
+        : delivery.configured ? 'degraded' : 'not-configured'
+  );
   const COMPANION_STATE_LABELS = { idle: 'En veille', analyzing: 'Analyse en cours', clean: 'Aucun problème', findings: 'Problèmes détectés', degraded: 'Mode réduit', disabled: 'Désactivé', error: 'Erreur' };
   const companionVisual = model.companionEnabled === false ? null : model.companion;
   const companionStateLabel = model.companionEnabled === false ? 'Disabled' : model.companion ? (COMPANION_STATE_LABELS[model.companion.state] || String(model.companion.state || 'Active')) : 'Not reporting';
   const appTone = criticalCount || highCount ? 'bad' : model.total ? 'warn' : 'ok';
   const appState = criticalCount ? 'At risk' : highCount ? 'Attention' : model.total ? 'Review' : 'Healthy';
+  // Le nom du fournisseur vient du modele normalise, jamais du markup : c'est
+  // ce qui permet a la carte de suivre un changement de fournisseur CI/CD sans
+  // que le dashboard soit modifie. Meme mecanique que `runtime.label` et
+  // `prometheus.label` juste en dessous.
+  const deliveryProviderLabel = delivery.providerLabel || (delivery.configured ? 'CI/CD provider' : 'None');
+  const deliveryRunLabel = delivery.run?.displayName || delivery.run?.id || (delivery.build?.number ? `#${delivery.build.number}` : '');
   const deliveryLabel = delivery.configured
-    ? (delivery.build?.number ? `Jenkins build #${delivery.build.number} · ${delivery.state}` : `Jenkins · ${delivery.state || 'Connected'}`)
-    : 'Jenkins not configured';
+    ? (deliveryRunLabel
+      ? `${deliveryProviderLabel} · ${deliveryRunLabel} · ${delivery.run?.outcome || delivery.state || deliveryStatusValue}`
+      : `${deliveryProviderLabel} · ${deliveryStatusValue || 'Connected'}`)
+    : 'Not configured';
   const infrastructureLabel = prometheus.configured
     ? `Prometheus · CPU ${prometheus.metrics?.cpu?.display || 'Unavailable'} · RAM ${prometheus.metrics?.memory?.display || 'Unavailable'}`
     : 'Connect observability';
@@ -1736,7 +1789,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     <div class="enterprise-domain-grid">
       ${domainCard({ title: 'Application Security', icon: 'shield', tone: appTone, status: appState, metric: `${model.activeTotal} active findings`, detail: `${criticalCount} Critical · ${highCount} High`, command: 'securityCenter.openFindingsPage', action: 'View findings' })}
       ${domainCard({ title: 'Runtime Security', icon: 'pulse', tone: enterpriseTone(runtime.status), status: runtime.configured ? String(runtime.status || 'Configured') : 'Not configured', metric: runtime.configured ? (runtime.label || 'SIEM') : 'SIEM provider', detail: runtimeLabel, command: runtime.configured ? 'securityCenter.openRuntimeSecurity' : 'securityCenter.configureSiem', action: runtime.configured ? 'Open runtime' : 'Configure' })}
-      ${domainCard({ title: 'Delivery Security', icon: 'play', tone: enterpriseTone(deliveryState), status: delivery.configured ? String(delivery.state || 'Connected') : 'Not configured', metric: 'Jenkins', detail: deliveryLabel, command: 'securityCenter.openSecurityDelivery', action: 'View delivery' })}
+      ${domainCard({ title: 'Delivery Security', icon: 'play', tone: enterpriseTone(deliveryStatusValue), status: delivery.configured ? String(deliveryStatusValue || 'Connected') : 'Not configured', metric: delivery.configured ? deliveryProviderLabel : 'CI/CD provider', detail: deliveryLabel, command: 'securityCenter.openSecurityDelivery', action: 'View delivery' })}
       ${domainCard({ title: 'Infrastructure', icon: 'cube', tone: enterpriseTone(prometheus.status), status: prometheus.configured ? String(prometheus.status || 'Configured') : 'Not configured', metric: prometheus.configured ? (prometheus.label || 'Observability') : 'Observability', detail: infrastructureLabel, command: prometheus.configured ? 'securityCenter.openInfrastructure' : 'securityCenter.configureObservability', action: prometheus.configured ? 'Open infrastructure' : 'Configure' })}
       ${domainCard({ title: 'AI Companion', icon: 'shield', tone: companionTone, status: companionStateLabel, metric: model.companionEnabled === false ? 'Disabled' : 'Active context', detail: companionVisual ? (companionVisual.shortMessage || 'Security context is available') : 'Open Live Security for context', command: 'securityCenter.openLiveSecurityPage', action: 'Open Companion' })}
     </div>
@@ -1766,12 +1819,14 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     </div>
     <div class="hero security-hero-copy ${riskClass}">
       <div class="security-product-mark">
-        <div class="security-shield">${compactIcon('shield')}</div>
+        <div class="security-shield${assets?.brandLogoUri ? ' security-shield-logo' : ''}">${assets?.brandLogoUri
+          ? `<img src="${escapeHtml(assets.brandLogoUri)}" alt="Secenter" decoding="async">`
+          : compactIcon('shield')}</div>
         <div class="risk-ring"><svg viewBox="0 0 100 100" aria-hidden="true"><circle class="risk-track" cx="50" cy="50" r="42"></circle><circle class="risk-progress" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${displayedRiskScore} 100"></circle></svg><strong>${displayedRiskScore}</strong></div>
       </div>
       <div class="risk-copy">
-        <div class="security-product-badge">DevSecOps Security</div>
-        <h2>Security Center</h2>
+        <div class="security-product-badge">Security Center DevSecOps</div>
+        <h2>Secenter</h2>
         <p class="security-workspace">Vue de sécurité du workspace <strong>${escapeHtml(model.workspace)}</strong></p>
         <span class="risk-explanation">Surveillez, analysez et corrigez les risques de sécurité en continu.</span>
         <span class="risk-calculation-note">${riskExplanation}</span>
@@ -2004,6 +2059,12 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .header-scan:hover { background: var(--vscode-button-hoverBackground); }
     .scan-chrono { display: inline-flex; align-items: center; gap: 5px; min-width: 78px; padding: 5px 9px; border: 1px solid var(--vscode-widget-border); border-radius: 999px; color: var(--vscode-foreground); background: var(--vscode-editor-background); font: 600 10px var(--vscode-font-family); }
     .backend { color: var(--vscode-descriptionForeground); font-size: 10px; }
+    /* Le ton du badge existait deja pour la surface complete, mais pas pour
+       l'en-tete compact : la barre laterale affichait l'etat en gris, quel qu'il
+       soit. Meme vocabulaire de couleur, meme signification. */
+    .backend.online { color: var(--sc-success, #28a745); }
+    .backend.offline { color: var(--sc-critical, #d94b40); }
+    .backend.unknown { color: var(--vscode-descriptionForeground); }
     .workspace { color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; margin-top: 5px; }
     ${shellLayoutCss()}
     body.surface-full .sc-main > .operational-banner,
@@ -2209,6 +2270,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .traffic-finding > small { color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; }
     .traffic-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
     .traffic-actions button { width: auto; padding: 4px 7px; }
+    .dynamic-source-controls { margin: 0 0 10px; }
+    .dynamic-source-chip { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--sc-border); color: var(--sc-muted); align-self: start; }
+    .dynamic-source-chip.zap { border-color: var(--sc-accent, #6c5ce7); color: var(--sc-accent, #6c5ce7); }
+    .dynamic-source-chip.burp { border-color: var(--sc-medium, #d29922); color: var(--sc-medium, #d29922); }
     .traffic-empty-filter { padding: 14px; color: var(--vscode-descriptionForeground); font-style: italic; }
     @media (max-width: 900px) { .traffic-layout { grid-template-columns: 1fr; } .traffic-preview { position: static; } }
     @media (max-width: 560px) { .dynamic-page-header, .dynamic-section-head { align-items: stretch; flex-direction: column; } .dynamic-facts { grid-template-columns: 1fr; } .dynamic-finding-row { grid-template-columns: auto minmax(0,1fr); } .dynamic-finding-row > .triage-badge, .dynamic-finding-row > button { grid-column: 2; justify-self: start; } .settings-row { grid-template-columns: 1fr; gap: 3px; } .traffic-controls input { min-width: 100%; } }
@@ -2761,6 +2826,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .security-product-mark::after { content: ''; position: absolute; left: 24%; right: 24%; bottom: 7px; height: 13px; border-radius: 50%; background: color-mix(in srgb, var(--sc-primary) 20%, transparent); filter: blur(10px); opacity: .64; }
     .security-shield { display: grid; place-items: center; width: clamp(100px, 9vw, 124px); height: clamp(100px, 9vw, 124px); border: 1px solid color-mix(in srgb, var(--sc-primary) 28%, var(--sc-border)); border-radius: 28px; color: var(--sc-primary); background: linear-gradient(145deg, color-mix(in srgb, var(--sc-primary) 14%, var(--sc-surface)), color-mix(in srgb, var(--sc-surface) 94%, var(--sc-primary))); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--sc-primary) 10%, transparent), 0 14px 28px color-mix(in srgb, var(--sc-primary) 15%, transparent); z-index: 1; }
     .security-shield .compact-icon { width: clamp(52px, 4.8vw, 66px); height: clamp(52px, 4.8vw, 66px); stroke-width: 1.55; }
+    /* Le logo remplace le pictogramme dans la meme case : le degre et la bordure
+       de la pastille disparaissent, le hibou porte deja son propre fond. */
+    .security-shield-logo { border-color: transparent; background: none; box-shadow: none; }
+    .security-shield-logo img { display: block; width: clamp(88px, 8vw, 112px); height: clamp(88px, 8vw, 112px); object-fit: contain; border-radius: 24px; }
     body.surface-full .risk-ring { position: absolute; right: 0; bottom: 0; z-index: 2; width: 68px; padding: 5px; border: 1px solid color-mix(in srgb, var(--sc-primary) 24%, var(--sc-border)); border-radius: 50%; background: color-mix(in srgb, var(--sc-surface) 94%, transparent); box-shadow: 0 8px 20px color-mix(in srgb, var(--sc-primary) 12%, transparent); }
     body.surface-full .risk-ring strong { color: var(--sc-text); font-size: 21px; font-weight: 850; line-height: 1; font-variant-numeric: tabular-nums; }
     body.surface-full .risk-track, body.surface-full .risk-progress { stroke-width: 8.5; }
@@ -3485,6 +3554,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       .security-product-mark { width: 128px; }
       .security-shield { width: 104px; height: 104px; border-radius: 28px; }
       .security-shield .compact-icon { width: 54px; height: 54px; }
+      .security-shield-logo img { width: 92px; height: 92px; }
       body.surface-full .risk-ring { width: 62px; }
       body.surface-full .hero-metric-panel { padding: 14px; }
       body.surface-full .posture-header { align-items: flex-start; flex-direction: column; gap: 8px; }
@@ -4103,10 +4173,14 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   <section class="page-dynamic">
     <section class="dynamic-section dynamic-target"><div class="dynamic-section-head"><h2>Cible</h2><span class="target-state ${escapeHtml(targetState)}">${escapeHtml(targetStatus)}</span></div><div class="dynamic-status-copy"><strong>${escapeHtml(targetOrigin || 'Aucune cible configurée')}</strong>${targetState === 'unreachable' ? '<span>Démarrez l’application avant de lancer une analyse dynamique.</span>' : targetState === 'unknown' && targetOrigin ? '<span>La cible n’a pas encore été vérifiée.</span>' : targetEvidenceLabel ? `<span>${escapeHtml(targetEvidenceLabel)}</span>` : ''}</div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.checkDynamicTarget" ${targetOrigin ? '' : 'disabled'}>Vérifier</button><button class="secondary" data-command="securityCenter.changeDynamicTarget">Modifier la cible</button></div></section>
     <div class="dynamic-status-grid">
-      <section class="dynamic-section"><div class="dynamic-section-head"><h2>ZAP</h2><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span></div><p class="dynamic-purpose">Analyse dynamique automatisée</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Dernière analyse</span><strong>${zapScanner ? escapeHtml(zapState) : 'Jamais exécutée'}</strong></div><div class="dynamic-fact"><span>URL testées</span><strong>${zapTestedUrls || 'Non disponible'}</strong></div><div class="dynamic-fact"><span>Findings</span><strong>${zapFindingCount}</strong></div><div class="dynamic-fact"><span>Durée</span><strong>${zapScanner?.durationMs ? escapeHtml(formatDuration(zapScanner.durationMs)) : 'Non disponible'}</strong></div></div>${zapScanner?.error ? `<div class="dynamic-status-copy" role="alert"><span>${escapeHtml(summarizeScannerError(zapScanner.error))}</span></div>` : ''}<div class="dynamic-actions">${zapAuthenticationFailed ? '<button class="primary" data-command="securityCenter.configureZapCredentials">Configurer le compte ZAP</button><button class="quiet-action" data-command="securityCenter.configureZap">Paramètres ZAP</button>' : zapScanner?.status === 'failed' ? '<button class="primary" data-command="securityCenter.configureZap">Configurer ZAP</button>' : `<button class="primary" data-command="securityCenter.scanZap" ${zapScanner?.status === 'running' ? 'disabled aria-busy="true"' : ''}>${zapScanner?.status === 'running' ? 'Analyse ZAP en cours…' : 'Lancer ZAP'}</button>`}<button class="quiet-action anchor-action" data-target="dynamic-findings">Voir les findings</button></div></section>
-      <section class="dynamic-section"><div class="dynamic-section-head"><h2>Burp</h2><span class="burp-connection ${model.burpConnected ? 'connected' : 'disconnected'}">${model.burpConnected ? '● Connecté' : '○ Déconnecté'}</span></div><p class="dynamic-purpose">Capture et investigation du trafic HTTP</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Requêtes capturées</span><strong>${burpScenarios.length}</strong></div><div class="dynamic-fact"><span>Endpoints uniques</span><strong>${burpUniqueEndpoints || 'Aucun'}</strong></div><div class="dynamic-fact"><span>Findings liés</span><strong>${burpLinkedFindings}</strong></div></div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.openBurpSettingsPage">Paramètres</button></div></section>
+      <section class="dynamic-section"><div class="dynamic-section-head"><h2>ZAP</h2><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span></div><p class="dynamic-purpose">Analyse dynamique automatisée</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Dernière analyse</span><strong>${zapScanner ? escapeHtml(zapState) : 'Jamais exécutée'}</strong></div><div class="dynamic-fact"><span>URL testées</span><strong>${zapTestedUrls || 'Non disponible'}</strong></div><div class="dynamic-fact"><span>Findings ZAP</span><strong>${zapFindingCount}</strong></div><div class="dynamic-fact"><span>Durée</span><strong>${zapScanner?.durationMs ? escapeHtml(formatDuration(zapScanner.durationMs)) : 'Non disponible'}</strong></div></div>${zapScanner?.error ? `<div class="dynamic-status-copy" role="alert"><span>${escapeHtml(summarizeScannerError(zapScanner.error))}</span></div>` : ''}<div class="dynamic-actions">${zapAuthenticationFailed ? '<button class="primary" data-command="securityCenter.configureZapCredentials">Configurer le compte ZAP</button><button class="quiet-action" data-command="securityCenter.configureZap">Paramètres ZAP</button>' : zapScanner?.status === 'failed' ? '<button class="primary" data-command="securityCenter.configureZap">Configurer ZAP</button>' : `<button class="primary" data-command="securityCenter.scanZap" ${zapScanner?.status === 'running' ? 'disabled aria-busy="true"' : ''}>${zapScanner?.status === 'running' ? 'Analyse ZAP en cours…' : 'Lancer ZAP'}</button>`}<button class="quiet-action anchor-action" data-target="dynamic-findings" data-dynamic-filter-target="zap">Voir les findings ZAP</button></div></section>
+      <section class="dynamic-section"><div class="dynamic-section-head"><h2>Burp</h2><span class="burp-connection ${model.burpConnected ? 'connected' : 'disconnected'}">${model.burpConnected ? '● Connecté' : '○ Déconnecté'}</span></div><p class="dynamic-purpose">Capture et investigation du trafic HTTP</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Connexion actuelle</span><strong>${model.burpConnected ? 'Connectée' : 'Déconnectée'}</strong></div></div><p class="dynamic-purpose">Historique capturé — conservé indépendamment de la connexion</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Requêtes conservées</span><strong>${burpScenarios.length}</strong></div><div class="dynamic-fact"><span>Endpoints uniques</span><strong>${burpUniqueEndpoints || 'Aucun'}</strong></div><div class="dynamic-fact"><span>Findings liés</span><strong>${burpLinkedFindings}</strong></div></div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.openBurpSettingsPage">Paramètres</button></div></section>
     </div>
-    <section id="dynamic-findings" class="dynamic-section"><div class="dynamic-section-head"><h2>Findings dynamiques</h2><span>${dynamicFindings.length} prioritaire(s)</span></div><div class="dynamic-list">${dynamicFindingRows}</div><div class="dynamic-actions"><button class="quiet-action" data-command="securityCenter.openFindingsPage">Voir tous les findings dynamiques →</button></div></section>
+    <section id="dynamic-findings" class="dynamic-section"><div class="dynamic-section-head"><h2>Findings dynamiques</h2><span><strong id="dynamic-visible-count">${dynamicFindings.length}</strong> prioritaire(s) · ZAP ${dynamicZapCount} · Burp ${dynamicBurpCount}</span></div>
+      <div class="traffic-controls dynamic-source-controls"><button class="traffic-filter active" data-dynamic-filter="all">Tous</button><button class="traffic-filter" data-dynamic-filter="zap">ZAP</button><button class="traffic-filter" data-dynamic-filter="burp">Burp</button></div>
+      <div class="dynamic-list">${dynamicFindingRows}</div>
+      <div id="dynamic-findings-empty" class="traffic-empty-filter" hidden>Aucun finding dynamique pour cette source.</div>
+      <div class="dynamic-actions"><button class="quiet-action" data-command="securityCenter.openFindingsPage">Voir tous les findings dynamiques →</button></div></section>
     <section id="http-traffic" class="dynamic-section dynamic-traffic"><div class="dynamic-section-head"><h2>Trafic HTTP</h2><span><strong id="visible-traffic">${trafficScenarios.length}</strong> / ${model.httpScenarios.length} requête(s)</span></div>
       <div class="traffic-controls"><input id="traffic-search" type="search" placeholder="Rechercher un endpoint ou chemin…" aria-label="Rechercher dans le trafic HTTP"><button class="traffic-filter active" data-traffic-filter="all">Toutes</button><button class="traffic-filter" data-traffic-filter="GET">GET</button><button class="traffic-filter" data-traffic-filter="POST">POST</button><button class="traffic-filter" data-traffic-filter="authenticated">Authentifiées</button><button class="traffic-filter" data-traffic-filter="findings">Avec findings</button></div>
       <div class="traffic-layout"><div class="traffic-scroll"><div class="traffic-table"><div class="traffic-head"><span>Méthode</span><span>Endpoint</span><span>Statut</span><span>Source</span><span>Findings</span><span>Horodatage</span></div>${trafficRows}<div id="traffic-empty-filter" class="traffic-empty-filter" hidden>Aucune requête ne correspond aux filtres.</div></div></div><aside class="traffic-preview" aria-live="polite" aria-busy="false"><h3>Détails de la requête</h3><div id="traffic-preview-content"><strong>Sélectionnez une requête</strong><span>Les détails assainis seront chargés à la demande.</span></div></aside></div>
@@ -4379,7 +4453,29 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       stage.addEventListener('mouseenter', () => placePipelinePopover(stage));
       stage.addEventListener('focusin', () => placePipelinePopover(stage));
     });
+    // Filtre de provenance des findings dynamiques. La carte ZAP l'active pour
+    // que sa destination corresponde exactement au compteur qu'elle affiche :
+    // un bouton « Voir les findings ZAP » qui ouvre l'ensemble ZAP + Burp est
+    // une incoherence entre ce qui est annonce et ce qui est montre.
+    const dynamicRows = [...document.querySelectorAll('.dynamic-finding-row')];
+    const dynamicFilters = [...document.querySelectorAll('[data-dynamic-filter]')];
+    const dynamicVisibleCount = document.getElementById('dynamic-visible-count');
+    const dynamicEmpty = document.getElementById('dynamic-findings-empty');
+    function applyDynamicFilter(source) {
+      let visible = 0;
+      dynamicRows.forEach((row) => {
+        const matches = source === 'all' || row.dataset.dynamicSource === source;
+        row.hidden = !matches;
+        if (matches) visible += 1;
+      });
+      if (dynamicVisibleCount) dynamicVisibleCount.textContent = String(visible);
+      if (dynamicEmpty) dynamicEmpty.hidden = visible !== 0;
+      dynamicFilters.forEach((button) => button.classList.toggle('active', button.dataset.dynamicFilter === source));
+    }
+    dynamicFilters.forEach((button) => button.addEventListener('click', () => applyDynamicFilter(button.dataset.dynamicFilter)));
+
     document.querySelectorAll('.anchor-action').forEach((button) => button.addEventListener('click', () => {
+      if (button.dataset.dynamicFilterTarget) applyDynamicFilter(button.dataset.dynamicFilterTarget);
       document.getElementById(button.dataset.target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }));
     const trafficRows = [...document.querySelectorAll('.traffic-row')];

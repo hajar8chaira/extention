@@ -1239,7 +1239,8 @@ function renderRuntimeSecurityPageHtml(model = {}, nonce = '', theme = 'light', 
     content,
     styles: domainCss(),
     script: pageScript('runtime'),
-    csp: `default-src 'none'; img-src ${assets?.cspSource || "'self'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${assets?.cspSource || "'self'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets?.brandLogoUri || ''
   });
 }
 
@@ -1267,7 +1268,8 @@ function renderInfrastructurePageHtml(model = {}, nonce = '', theme = 'light', a
     content,
     styles: domainCss(),
     script: pageScript('infrastructure'),
-    csp: `default-src 'none'; img-src ${assets?.cspSource || "'self'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${assets?.cspSource || "'self'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets?.brandLogoUri || ''
   });
 }
 

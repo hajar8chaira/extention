@@ -97,7 +97,8 @@ test('dashboard webview roots and CSP include scanner media assets', () => {
   const extensionSource = fs.readFileSync(path.join(repoRoot, 'src', 'extension.js'), 'utf8');
   assert.match(extensionSource, /scannerAssetRoot = vscode\.Uri\.joinPath\(context\.extensionUri, 'media', 'scanners'\)/);
   assert.match(extensionSource, /providerAssetRoot = vscode\.Uri\.joinPath\(context\.extensionUri, 'media', 'providers'\)/);
-  assert.match(extensionSource, /localResourceRoots: \[companionAssetRoot, scannerAssetRoot, providerAssetRoot\]/);
+  assert.match(extensionSource, /brandingAssetRoot = vscode\.Uri\.joinPath\(context\.extensionUri, 'media', 'branding'\)/);
+  assert.match(extensionSource, /localResourceRoots: \[companionAssetRoot, scannerAssetRoot, providerAssetRoot, brandingAssetRoot\]/);
   assert.match(extensionSource, /new DashboardProvider\([\s\S]*context\.extensionUri/);
   const html = renderDashboardHtml(buildDashboardModel([], []), 'nonce', 'full', 'light', {}, { cspSource: 'https://*.vscode-cdn.net', scannerLogoUris: {} });
   assert.match(html, /img-src https:\/\/\*\.vscode-cdn\.net/);

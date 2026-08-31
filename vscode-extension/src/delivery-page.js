@@ -688,7 +688,8 @@ function renderDeliveryPageHtml(status, nonce = '', theme = 'light', assets = {}
     vscode.postMessage({type:'action',action});
   });
   ${assistantCard ? assistantCardScript() : ''}`,
-    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets?.brandLogoUri || ''
   });
 }
 

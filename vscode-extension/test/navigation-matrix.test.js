@@ -129,7 +129,10 @@ test('chaque webview du cadre relaie la navigation partagee', () => {
     'securityCenter.findingDetails'
   ];
   for (const panelId of scripted) {
-    const at = extension.indexOf(panelId);
+    const panelCreation = `createWebviewPanel('${panelId}'`;
+    const at = extension.includes(panelCreation)
+      ? extension.indexOf(panelCreation)
+      : extension.indexOf(panelId);
     assert.ok(at > 0, `panneau ${panelId} introuvable`);
     const region = extension.slice(at, at + 6000);
     assert.ok(region.includes('handleShellNavMessage'),
@@ -155,7 +158,11 @@ test('Live Security garde ses ressources locales et sa CSP d images', () => {
   const live = fs.readFileSync(path.join(__dirname, '..', 'src', 'live', 'livePage.js'), 'utf8');
   // Le compagnon est servi depuis media/live : sans localResourceRoots ni
   // img-src, l image serait bloquee par la CSP du webview.
-  assert.match(live, /localResourceRoots:\s*\[assetRoot\]/, 'localResourceRoots perdu');
+  assert.match(live, /localResourceRoots:\s*\[assetRoot, brandingRoot\]/, 'localResourceRoots perdu');
+  // La marque Secenter est servie depuis media/branding : sa racine doit etre
+  // declaree au meme titre que celle du compagnon, sinon l URI est rejetee.
+  assert.match(live, /brandingRoot = this\.api\.Uri\.joinPath\(this\.extensionUri, 'media', 'branding'\)/,
+    'la racine de marque doit etre declaree');
   assert.match(live, /img-src \$\{cspSource/, 'img-src doit garder la source du webview');
   assert.match(live, /asWebviewUri/, 'l URI de ressource du compagnon a disparu');
   // La delegation de clic de la page ne doit pas doubler le relais du rail.

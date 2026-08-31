@@ -192,8 +192,11 @@ test('le jeton Jenkins n’est jamais un réglage', () => {
   assert.deepEqual(jenkins.sort(), ['securityCenter.jenkins.job', 'securityCenter.jenkins.url', 'securityCenter.jenkins.user']);
   assert.ok(!jenkins.some((key) => /token|password|secret/i.test(key)), 'aucun secret dans les réglages');
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
-  // Le jeton passe par SecretStorage, jamais par la configuration.
-  assert.match(source, /context\.secrets\.store\(JENKINS_TOKEN_SECRET_KEY/);
+  // Le jeton passe par le SecretStorage provider-neutre, jamais par la configuration.
+  const shared = fs.readFileSync(path.join(__dirname, '..', 'src', 'integrations', 'provider-configuration.js'), 'utf8');
+  assert.match(shared, /secrets\.store\(secretKeyFor\(adapter\.id, field\.id\)/);
+  assert.match(source, /secretPrefix: 'securityCenter\.delivery'/);
+  assert.match(source, /secrets: \{ token: JENKINS_TOKEN_SECRET_KEY \}/, 'l ancienne cle reste lue en migration seulement');
   assert.ok(!/update\('jenkins\.(token|apiToken)'/.test(source));
 });
 

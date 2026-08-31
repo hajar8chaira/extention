@@ -550,7 +550,8 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
       sections.forEach((section) => observer.observe(section));
     }
     ${assistantCard ? assistantCardScript() : ''}`,
-    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: navigation.brandLogoUri || ''
   });
 }
 

@@ -191,6 +191,10 @@ function launcherCss() {
       background: linear-gradient(135deg, var(--sc-primary), var(--sc-primary-hover));
     }
     .brand-mark .compact-icon { width: 16px; height: 16px; }
+    /* Le logo porte deja son fond : le degrade de la pastille disparait pour
+       ne pas encadrer le hibou dans un second aplat de couleur. */
+    .brand-mark-logo { background: none; overflow: hidden; }
+    .brand-mark-logo img { display: block; width: 28px; height: 28px; object-fit: contain; }
     .brand-copy { min-width: 0; }
     .brand-copy strong { display: block; font-size: 12.5px; line-height: 1.2; }
     .brand-copy small {
@@ -388,6 +392,12 @@ function renderSidebarLauncherHtml(model = {}, nonce = '', theme = 'light', uiSt
   const backend = String(model.backendStatus || 'unknown').toLowerCase();
   const live = liveState(model);
   const mascotImageUri = assets.companionImageUri || assets.mascotImageUri || '';
+  // L'identite Secenter. Sans URI resolue, la marque vectorielle reste : une
+  // barre laterale ne doit jamais afficher d'image cassee.
+  const brandLogoUri = assets.brandLogoUri || '';
+  const brandMark = brandLogoUri
+    ? `<span class="brand-mark brand-mark-logo" aria-hidden="true"><img src="${escapeHtml(brandLogoUri)}" alt="" width="28" height="28" decoding="async"></span>`
+    : `<span class="brand-mark" aria-hidden="true">${compactIcon('shield')}</span>`;
   const cspSource = assets.cspSource || "'none'";
 
   return `<!doctype html>
@@ -401,8 +411,8 @@ function renderSidebarLauncherHtml(model = {}, nonce = '', theme = 'light', uiSt
 <body class="theme-${appliedTheme}">
   <div class="launcher">
     <header class="brand">
-      <span class="brand-mark" aria-hidden="true">${compactIcon('shield')}</span>
-      <span class="brand-copy"><strong>Security Center</strong><small>DEVSECOPS</small></span>
+      ${brandMark}
+      <span class="brand-copy"><strong>Secenter</strong><small>SECURITY CENTER</small></span>
     </header>
 
     <section class="project" aria-label="État du workspace">
@@ -412,8 +422,8 @@ function renderSidebarLauncherHtml(model = {}, nonce = '', theme = 'light', uiSt
       ${backendPill(backend)}
     </section>
 
-    <button class="cta" data-open-security-center aria-label="Ouvrir Security Center">
-      Ouvrir Security Center<span class="cta-arrow" aria-hidden="true">→</span>
+    <button class="cta" data-open-security-center aria-label="Ouvrir Secenter">
+      Ouvrir Secenter<span class="cta-arrow" aria-hidden="true">→</span>
     </button>
 
     <section aria-label="Posture de sécurité">

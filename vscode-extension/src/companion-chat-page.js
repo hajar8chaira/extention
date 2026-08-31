@@ -113,6 +113,8 @@ function renderCompanionChatHtml(model = {}, nonce = '', theme = 'light') {
 
   return renderSecurityCenterShell({
     surface: 'companion-chat',
+    brandLogoUri: model.brandLogoUri || '',
+    cspSource: model.cspSource || '',
     nonce,
     theme,
     title: 'Security Companion',

@@ -1,12 +1,34 @@
 .vscode/**
 .gitignore
+.git/**
+.github/**
 test/**
 scripts/**
 coverage/**
+logs/**
+tmp/**
+temp/**
+.cache/**
+.pytest_cache/**
+.runtime-python/**
 *.log
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.pdf
+*.sqlite
+*.sqlite3
+*.db
+*.dump
 security-reports/**
 outputs/**
 work/**
+rapport-pfa/**
+RAPPORT_PROJET_SECURITY_CENTER.*
+screenshots/**
+benchmark-results/**
+benchmarks/**
 
 # Anciennes copies complètes des sources, conservées hors du paquet : elles
 # doublent le code livré et exposeraient des versions non maintenues.
@@ -18,15 +40,23 @@ work/**
 # Jamais empaqueté : secrets, clés de signature, paquets déjà construits.
 .env
 .env.*
+*.env
 *.vsix
 *.key
 *.pem
 *.p12
 *.pfx
+*.crt
+*.cer
+*.der
+id_rsa
+id_ed25519
 cosign.key
 cosign.password
 
 # Fixtures et sorties temporaires de développement.
 **/*.tmp
 **/*.sc-tmp
+**/*.bak
+**/*.backup
 .codex/**

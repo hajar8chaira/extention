@@ -175,8 +175,8 @@ test('aucune page ne duplique l en-tête global Security Center', () => {
     const html = render('light');
     const body = html.slice(html.indexOf('<body'));
     // Le nom du produit vit dans le rail : une seule occurrence, la marque.
-    const brands = (body.match(/Security Center<\/strong>/g) || []).length;
-    assert.equal(brands, 1, `${name} affiche ${brands} en-tetes Security Center`);
+    const brands = (body.match(/Secenter<\/strong>/g) || []).length;
+    assert.equal(brands, 1, `${name} affiche ${brands} en-tetes Secenter`);
     assert.doesNotMatch(body, /← Dashboard/, `${name} garde un lien de retour duplique`);
     assert.equal((html.match(/class="sc-topbar"/g) || []).length, 1,
       `${name} doit avoir exactement une barre superieure`);

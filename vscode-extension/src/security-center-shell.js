@@ -133,10 +133,17 @@ function navCommands() {
  *   scripts pour obtenir une navigation, on utilise les URI de commande, que
  *   l'hote restreint a une liste explicite. La page reste sans script.
  */
-function renderInternalSidebar(surface, { asLinks = false } = {}) {
+function renderInternalSidebar(surface, { asLinks = false, brandLogoUri = '' } = {}) {
   const activeCommand = SURFACE_NAV_COMMAND[surface] || null;
-  return `<aside class="sc-internal-nav" aria-label="Navigation Security Center">
-    <div class="sc-nav-brand"><span class="sc-nav-mark">${compactIcon('shield')}</span><div><strong>Security Center</strong><small>DevSecOps</small></div></div>
+  // Le hibou n'est rendu que si une URI de webview a ete resolue ET que la page
+  // autorise les images dans sa CSP. Les pages de rapport (licences, journal
+  // d'audit) sont volontairement servies sous `default-src 'none'` : elles
+  // gardent le bouclier plutot que d'elargir leur CSP pour une decoration.
+  const brandMark = brandLogoUri
+    ? `<img class="sc-nav-logo" src="${escapeHtml(brandLogoUri)}" alt="" width="28" height="28" decoding="async">`
+    : compactIcon('shield');
+  return `<aside class="sc-internal-nav" aria-label="Navigation Secenter">
+    <div class="sc-nav-brand"><span class="sc-nav-mark">${brandMark}</span><div><strong>Secenter</strong><small>Security Center</small></div></div>
     <nav class="sc-nav-groups">
       ${NAV_GROUPS.map(([group, items]) => `<section class="sc-nav-group"><h2>${escapeHtml(group)}</h2>${items.map(([label, command, icon]) => {
         const active = command && command === activeCommand ? ' active' : '';
@@ -205,6 +212,7 @@ function shellLayoutCss() {
     .sc-nav-brand { display: grid; grid-template-columns: 28px minmax(0,1fr); gap: 9px; align-items: center; margin: 0 4px 20px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
     .sc-nav-brand strong, .sc-nav-brand small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .sc-nav-brand strong { color: var(--sc-text); font-size: 12px; font-weight: 700; letter-spacing: -.1px; }
+    .sc-nav-logo { display: block; width: 28px; height: 28px; object-fit: contain; border-radius: 6px; }
     .sc-nav-brand small { margin-top: 1px; color: var(--sc-muted); font-size: 9px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; }
     .sc-nav-mark { display: grid; place-items: center; width: 28px; height: 28px; border-radius: var(--sc-radius-md); color: var(--sc-primary); background: var(--sc-primary-soft); }
     .sc-nav-mark .compact-icon { width: 15px; height: 15px; }
@@ -374,7 +382,7 @@ function shellNavScript() {
     })();`;
 }
 
-const DEFAULT_CSP = (nonce) => `default-src 'none'; img-src 'self'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+const DEFAULT_CSP = (nonce, cspSource = '') => `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`;
 
 /**
  * Compose une page complete dans le cadre partage.
@@ -402,7 +410,11 @@ function renderSecurityCenterShell({
   csp = null,
   lang = 'fr',
   bodyClass = '',
-  navAsLinks = false
+  navAsLinks = false,
+  // L'identite produit, resolue par l'hote via `webview.asWebviewUri`. Vide =
+  // la page retombe sur la marque vectorielle, sans image cassee.
+  brandLogoUri = '',
+  cspSource = ''
 } = {}) {
   const appliedTheme = theme === 'dark' ? 'dark' : 'light';
   const railMarkup = contextRail
@@ -414,7 +426,7 @@ function renderSecurityCenterShell({
 <html lang="${escapeHtml(lang)}" data-theme="${appliedTheme}">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="${csp || DEFAULT_CSP(nonce)}">
+  <meta http-equiv="Content-Security-Policy" content="${csp || DEFAULT_CSP(nonce, cspSource)}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style nonce="${escapeHtml(nonce)}">
     * { box-sizing: border-box; }
@@ -429,7 +441,7 @@ function renderSecurityCenterShell({
 </head>
 <body class="${escapeHtml(classes)}">
   <div class="${shellClass}">
-    ${renderInternalSidebar(surface, { asLinks: navAsLinks })}
+    ${renderInternalSidebar(surface, { asLinks: navAsLinks, brandLogoUri })}
     <main class="sc-main" data-page-kind="${escapeHtml(pageAtmosphereKind(surface))}">
       ${renderSecurityCenterAtmosphere(surface)}
       <header class="sc-topbar">

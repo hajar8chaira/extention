@@ -207,7 +207,12 @@ test('Audit et Tendances créent leur panneau avant d appeler le backend', () =>
   ]) {
     const start = source.indexOf(`registerCommand('${command}'`);
     assert.ok(start > 0, `${command} introuvable`);
-    const body = source.slice(start, source.indexOf('}));', start));
+    // La borne s'arrete a la commande suivante plutot qu'a la premiere
+    // sequence `}));` : depuis que les panneaux declarent leurs racines de
+    // ressources, cette sequence apparait avant l'appel au backend et
+    // tronquait le corps analyse.
+    const nextCommand = source.indexOf("registerCommand('securityCenter.", start + 1);
+    const body = source.slice(start, nextCommand > start ? nextCommand : undefined);
     const panelAt = body.indexOf(panelId);
     const fetchAt = body.indexOf(fetchCall);
     assert.ok(panelAt > 0 && fetchAt > 0, `${command} : panneau ou appel backend introuvable`);

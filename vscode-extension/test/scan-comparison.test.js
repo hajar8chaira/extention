@@ -776,7 +776,7 @@ test('compare : la page Historique des scans conserve son comportement', () => {
 
 test('compare : aucune refonte visuelle de la page de comparaison', () => {
   const source = ck5ExtensionSource();
-  const command = source.match(/registerCommand\('securityCenter\.compareScans'[\s\S]*?renderScanComparisonHtml\(prunedScans, nonce, theme\)/);
+  const command = source.match(/registerCommand\('securityCenter\.compareScans'[\s\S]*?renderScanComparisonHtml\(prunedScans, nonce, theme[^)]*\)/);
   assert.ok(command, 'le rendu de la comparaison est inchange');
   assert.match(command[0], /createWebviewPanel\(\s*'securityCenter\.scanComparison'/);
   // Aucun libelle de debogage de source n a ete ajoute a la page.

@@ -1,10 +1,21 @@
 {
   "name": "security-center-vscode",
-  "displayName": "Security Center",
-  "description": "Plateforme DevSecOps locale pour SAST, secrets, SCA, DAST, triage, audit et rapports SARIF.",
-  "version": "0.3.0",
-  "publisher": "pfa-security-center",
+  "displayName": "Secenter — Security Center DevSecOps",
+  "icon": "media/branding/secenter-icon-128.png",
+  "description": "Unified developer security workspace for SAST, secrets, SCA, DAST, runtime context, delivery evidence and audit workflows.",
+  "version": "0.9.0",
+  "publisher": "ChairaHajar",
+  "preview": true,
+  "pricing": "Free",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hajar8chaira/extention.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hajar8chaira/extention/issues"
+  },
+  "homepage": "https://github.com/hajar8chaira/extention#readme",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -21,7 +32,11 @@
     "sast",
     "sca",
     "secrets",
-    "devsecops"
+    "devsecops",
+    "sbom",
+    "license-compliance",
+    "ci-cd",
+    "runtime-security"
   ],
   "activationEvents": [
     "onCommand:securityCenter.scanWorkspace",
@@ -59,6 +74,10 @@
     "onCommand:securityCenter.generateSbom",
     "onCommand:securityCenter.checkLicenses",
     "onCommand:securityCenter.configureBackendApiKey",
+    "onCommand:securityCenter.configureBackend",
+    "onCommand:securityCenter.testBackendConnection",
+    "onCommand:securityCenter.restartBackend",
+    "onCommand:securityCenter.showBackendLogs",
     "onCommand:securityCenter.installPreCommitHook",
     "onCommand:securityCenter.showTrends",
     "onCommand:securityCenter.openDashboard",
@@ -339,6 +358,26 @@
         "icon": "$(key)"
       },
       {
+        "command": "securityCenter.configureBackend",
+        "title": "Security Center: Configurer le backend",
+        "icon": "$(server)"
+      },
+      {
+        "command": "securityCenter.testBackendConnection",
+        "title": "Security Center: Tester la connexion au backend",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "securityCenter.restartBackend",
+        "title": "Security Center: Redémarrer le backend local",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "securityCenter.showBackendLogs",
+        "title": "Security Center: Afficher les journaux du service local",
+        "icon": "$(output)"
+      },
+      {
         "command": "securityCenter.configureSonarToken",
         "title": "Security Center: Configurer le jeton SonarQube",
         "icon": "$(key)"
@@ -428,8 +467,8 @@
       "activitybar": [
         {
           "id": "securityCenter",
-          "title": "Security Center",
-          "icon": "media/shield.svg"
+          "title": "Secenter",
+          "icon": "media/branding/secenter-icon-128.png"
         }
       ]
     },
@@ -713,10 +752,21 @@
           "maximum": 1800,
           "description": "Durée maximale d’un scanner avant arrêt explicite (5 minutes par défaut)."
         },
+        "securityCenter.backend.mode": {
+          "type": "string",
+          "enum": ["auto", "remote", "docker"],
+          "enumDescriptions": [
+            "Le service local est démarré, surveillé et arrêté par l'extension. Aucune installation requise.",
+            "Un backend Security Center opéré par votre organisation, à l'adresse configurée. L'extension ne démarre rien.",
+            "docker-compose.backend.yml, pour le développement et les tests d'intégration. L'extension ne démarre rien."
+          ],
+          "default": "auto",
+          "description": "Mode du backend Security Center. En mode Auto, le service local est géré par l'extension : ni Docker ni Python ne sont nécessaires."
+        },
         "securityCenter.backend.url": {
           "type": "string",
           "default": "http://127.0.0.1:8765",
-          "description": "URL du backend local Security Center."
+          "description": "Adresse du backend en mode Remote ou Docker. En mode Auto, l'adresse réelle est publiée par le service local et cette valeur n'est pas utilisée."
         },
         "securityCenter.jenkins.url": {
           "type": "string",
@@ -732,6 +782,26 @@
           "type": "string",
           "default": "",
           "description": "Utilisateur Jenkins associé au jeton d'API. Le jeton lui-même n'est jamais stocké ici."
+        },
+        "securityCenter.delivery.provider": {
+          "type": "string",
+          "default": "",
+          "description": "Identifiant du fournisseur CI/CD actif pour Security Delivery, par exemple « jenkins ». Vide signifie qu'aucun fournisseur n'est connecte. Les identifiants de connexion ne sont jamais stockes dans ce parametre : ils restent dans VS Code SecretStorage."
+        },
+        "securityCenter.delivery.providers": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "description": "Configuration NON SECRETE d'un fournisseur CI/CD.",
+            "additionalProperties": {
+              "type": [
+                "string",
+                "boolean"
+              ]
+            }
+          },
+          "markdownDescription": "Configuration **non secrete** de chaque fournisseur CI/CD, indexee par identifiant de fournisseur (par exemple `jenkins`). Conserve la configuration d'un fournisseur meme lorsqu'il n'est plus actif, afin de pouvoir revenir a lui sans tout ressaisir.\n\n**Aucun mot de passe, jeton, cle d'API ou secret client ne doit figurer ici.** Les identifiants de connexion sont stockes exclusivement dans VS Code SecretStorage, sous `securityCenter.delivery.<fournisseur>.<secret>`, et ne sont jamais reecrits dans les parametres ni renvoyes a une webview."
         },
         "securityCenter.prometheus.url": {
           "type": "string",
@@ -909,7 +979,8 @@
     "scan:headless": "node src/cli.js scan",
     "benchmark:ai": "node scripts/ai-remediation-benchmark.js",
     "scan:real": "node scripts/run-real-scan.js ../test-application/juice-shop ../security-reports",
-    "package:vsix": "npx --yes @vscode/vsce package --out ../security-center-vscode.vsix",
-    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/policy-config.js && node --check src/license-compliance.js && node --check src/security-center-shell.js && node --check src/companion-assistant-card.js && node --check src/sidebar-launcher.js && node --check src/dashboard.js && node --check src/scanner-presentation.js && node --check src/integrations/http.js && node --check src/integrations/observability.js && node --check src/integrations/observability-contract.js && node --check src/integrations/observability-catalogue.js && node --check src/integrations/observability-prometheus.js && node --check src/integrations/observability-zabbix.js && node --check src/integrations/observability-datadog.js && node --check src/integrations/provider-configuration.js && node --check src/integrations/siem.js && node --check src/integrations/siem-contract.js && node --check src/integrations/siem-catalogue.js && node --check src/integrations/siem-wazuh.js && node --check src/integrations/siem-elastic.js && node --check src/integrations/siem-splunk.js && node --check src/integrations/siem-configuration.js && node --check src/integrations/siem-navigation.js && node --check src/integrations/siem-alerts.js && node --check src/integrations/siem-indexer.js && node --check src/integrations/siem-vulnerabilities.js && node --check src/integrations-page.js && node --check src/enterprise-domain-pages.js && node --check src/dynamic-campaign.js && node --check src/dynamic-inventory.js && node --check src/dynamic-retest.js && node --check src/dynamic-auth.js && node --check src/dynamic-workspace.js && node --check src/jenkins.js && node --check src/ci-report.js && node --check src/delivery-page.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/snyk.js && node --check src/snyk-api.js && node --check src/pipeline.js && node --check src/pipeline-page.js && node --check src/intelligence/finding-model.js && node --check src/intelligence/route-map.js && node --check src/intelligence/correlation-v2.js && node --check src/intelligence/reachability.js && node --check src/intelligence/prioritization.js && node --check src/intelligence/policy-gate.js && node --check src/supply-chain/sbom.js && node --check src/supply-chain/cosign.js && node --check src/supply-chain/provenance.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/fix-verification.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/ollama-health.js && node --check src/ai/secret-redaction.js && node --check src/ai/remediation-result.js && node --check src/live/companionMascot.js && node --check src/live/companionMessages.js && node --check src/live/liveCompanion.js && node --check src/live/companionWidget.js && node --check src/live/livePage.js"
+    "branding:assets": "python scripts/build-branding-assets.py",
+    "package:vsix": "npx --yes @vscode/vsce package --baseImagesUrl https://github.com/hajar8chaira/extention/raw/HEAD/vscode-extension --out ../security-center-vscode.vsix",
+    "check": "node --check src/extension.js && node --check src/autofix.js && node --check src/orchestrator.js && node --check src/cli.js && node --check src/sarif.js && node --check src/backend.js && node --check src/precommit.js && node --check src/trends.js && node --check src/scheduler.js && node --check src/correlation.js && node --check src/scan-comparison.js && node --check src/incremental.js && node --check src/audit.js && node --check src/project-policy.js && node --check src/policy-config.js && node --check src/license-compliance.js && node --check src/backend-config.js && node --check src/backend-manager.js && node --check src/workspace-identity.js && node --check backend/contract.js && node --check backend/store.js && node --check backend/service.js && node --check backend/server.js && node --check backend/discovery.js && node --check src/supply-chain/license-sources.js && node --check src/integrations/delivery-catalogue.js && node --check src/integrations/delivery-contract.js && node --check src/integrations/delivery-jenkins.js && node --check src/integrations/delivery.js && node --check src/delivery-provider-view.js && node --check src/security-center-shell.js && node --check src/companion-assistant-card.js && node --check src/sidebar-launcher.js && node --check src/dashboard.js && node --check src/scanner-presentation.js && node --check src/integrations/http.js && node --check src/integrations/observability.js && node --check src/integrations/observability-contract.js && node --check src/integrations/observability-catalogue.js && node --check src/integrations/observability-prometheus.js && node --check src/integrations/observability-zabbix.js && node --check src/integrations/observability-datadog.js && node --check src/integrations/provider-configuration.js && node --check src/integrations/siem.js && node --check src/integrations/siem-contract.js && node --check src/integrations/siem-catalogue.js && node --check src/integrations/siem-wazuh.js && node --check src/integrations/siem-elastic.js && node --check src/integrations/siem-splunk.js && node --check src/integrations/siem-configuration.js && node --check src/integrations/siem-navigation.js && node --check src/integrations/siem-alerts.js && node --check src/integrations/siem-indexer.js && node --check src/integrations/siem-vulnerabilities.js && node --check src/integrations-page.js && node --check src/enterprise-domain-pages.js && node --check src/dynamic-campaign.js && node --check src/dynamic-inventory.js && node --check src/dynamic-retest.js && node --check src/dynamic-auth.js && node --check src/dynamic-workspace.js && node --check src/jenkins.js && node --check src/ci-report.js && node --check src/delivery-page.js && node --check src/scanner-tool-manager.js && node --check src/scanner-setup-page.js && node --check src/scanner-diagnostics.js && node --check src/finding-details.js && node --check src/http-details.js && node --check src/http-scenarios.js && node --check src/docker.js && node --check src/semgrep.js && node --check src/gitleaks.js && node --check src/trivy.js && node --check src/osv.js && node --check src/zap.js && node --check src/zap-local.js && node --check src/sonarqube-server.js && node --check src/sonarqube.js && node --check src/sonarqube-api.js && node --check src/snyk.js && node --check src/snyk-api.js && node --check src/pipeline.js && node --check src/pipeline-page.js && node --check src/intelligence/finding-model.js && node --check src/intelligence/route-map.js && node --check src/intelligence/correlation-v2.js && node --check src/intelligence/reachability.js && node --check src/intelligence/prioritization.js && node --check src/intelligence/policy-gate.js && node --check src/supply-chain/sbom.js && node --check src/supply-chain/cosign.js && node --check src/supply-chain/provenance.js && node --check src/findings.js && node --check src/tree.js && node --check src/triage.js && node --check src/fix-verification.js && node --check src/ai/model-roles.js && node --check src/ai/provider-registry.js && node --check src/ai/model-configuration.js && node --check src/ai/model-discovery.js && node --check src/ai/ollama-health.js && node --check src/ai/secret-redaction.js && node --check src/ai/remediation-result.js && node --check src/live/companionMascot.js && node --check src/live/companionMessages.js && node --check src/live/liveCompanion.js && node --check src/live/companionWidget.js && node --check src/live/livePage.js"
   }
 }

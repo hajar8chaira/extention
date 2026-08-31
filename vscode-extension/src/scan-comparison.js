@@ -114,7 +114,7 @@ function escapeHtml(value) {
   })[character]);
 }
 
-function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
+function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light', assets = {}) {
   const content = `
   <!-- Selection Cards -->
   <section class="selection-cards">
@@ -2023,7 +2023,9 @@ function renderScanComparisonHtml(scans, nonce, selectedTheme = 'light') {
     }
 
     preselectDefaultScans();`,
-    csp: `default-src 'none'; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${assets.cspSource || "'none'"}; style-src 'nonce-${nonce}' 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets.brandLogoUri || '',
+    cspSource: assets.cspSource || '',
   });
 }
 

@@ -57,7 +57,7 @@ class LiveSessionActivity {
  * `companionImageUri` is kept for the callers that pass it positionally before
  * `cspSource`; the image itself is no longer rendered.
  */
-function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource = '', selectedTheme = 'light') {
+function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource = '', selectedTheme = 'light', brandLogoUri = '') {
   const active = model.state !== 'disabled' && model.state !== 'paused';
   const stateLabel = active ? 'Active' : model.state === 'paused' ? 'Paused' : 'Off';
   // Texte BRUT : le cadre applique escapeHtml au sous-titre. Pre-echapper ici
@@ -121,6 +121,7 @@ function renderLiveSecurityPage(model, nonce, companionImageUri = '', cspSource 
     script: `const vscode=window.__scShellApi||acquireVsCodeApi();document.addEventListener('click',e=>{const button=e.target.closest('button');if(!button||button.classList.contains('sc-nav-item'))return;if(button.closest('.sc-assistant'))return;if(button.dataset.command)return vscode.postMessage({type:'command',command:button.dataset.command});vscode.postMessage({type:button.dataset.action,ref:JSON.parse(button.dataset.ref||'[]')});});
 ${assistantCard ? assistantCardScript() : ''}`,
     csp: `default-src 'none'; img-src ${cspSource || "'none'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri,
     bodyClass: `${active ? 'active' : 'disabled'} ${escapeHtml(model.state)}`
   });
 }
@@ -138,8 +139,13 @@ class LiveSecurityPageProvider {
   open() {
     if (this.panel) return this.panel.reveal(this.api.ViewColumn.Active);
     const assetRoot = this.api.Uri.joinPath(this.extensionUri, 'media', 'live');
-    this.panel = this.api.window.createWebviewPanel('securityCenter.liveSecurity', 'Security Center â€” Live Security', this.api.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetRoot] });
+    // Cette page possede son propre panneau : la racine de marque doit y etre
+    // declaree explicitement, sinon `asWebviewUri` produit une URI que le
+    // webview refuse de charger.
+    const brandingRoot = this.api.Uri.joinPath(this.extensionUri, 'media', 'branding');
+    this.panel = this.api.window.createWebviewPanel('securityCenter.liveSecurity', 'Security Center â€” Live Security', this.api.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetRoot, brandingRoot] });
     this.companionImageUri = this.panel.webview.asWebviewUri(this.api.Uri.joinPath(assetRoot, 'security-companion.png')).toString();
+    this.brandLogoUri = this.panel.webview.asWebviewUri(this.api.Uri.joinPath(brandingRoot, 'secenter-icon-256.png')).toString();
     this.panel.webview.onDidReceiveMessage((message) => this.handleMessage(message));
     this.panel.onDidDispose(() => { this.panel = undefined; });
     this.render();
@@ -159,7 +165,7 @@ class LiveSecurityPageProvider {
       companionEnabled: this.api.workspace?.getConfiguration?.('securityCenter')?.get?.('live.companion.enabled', true) !== false
     };
   }
-  render() { if (this.panel) this.panel.webview.html = renderLiveSecurityPage(this.model(), 'live-security-page', this.companionImageUri, this.panel.webview.cspSource, this.themeController?.getTheme() || 'light'); }
+  render() { if (this.panel) this.panel.webview.html = renderLiveSecurityPage(this.model(), 'live-security-page', this.companionImageUri, this.panel.webview.cspSource, this.themeController?.getTheme() || 'light', this.brandLogoUri || ''); }
   handleMessage(message) {
     // A webview message is untrusted input. Only the two commands this page's
     // own buttons can emit are forwarded; the name is never passed through

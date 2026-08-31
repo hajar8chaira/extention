@@ -1894,7 +1894,8 @@ function renderPipelinePageHtml(model = {}, nonce = '', theme = 'light', assets 
   document.querySelectorAll('[data-remediation-verify]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'remediation',action:'verify',index:Number(b.dataset.remediationVerify)}));
   document.querySelectorAll('[data-cluster-index]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'clusterSource',cluster:Number(b.dataset.clusterIndex),source:Number(b.dataset.sourceIndex)}));
   ${assistantCard ? assistantCardScript() : ''}`,
-    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`
+    csp: `default-src 'none'; img-src ${cspSource || "'self'"}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`,
+    brandLogoUri: assets?.brandLogoUri || ''
   });
 }
 
