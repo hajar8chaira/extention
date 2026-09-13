@@ -1,4 +1,6 @@
-const path = require('path');
+// Scanner paths are resolved against the workspace with host-independent rules:
+// a Windows workspace stays a Windows path even when Security Center runs on Linux.
+const { resolveScannerPath } = require('./scanner-paths');
 
 const severityMap = Object.freeze({ ERROR: 'error', WARNING: 'warning', INFO: 'information' });
 const commonSeverityMap = Object.freeze({
@@ -93,7 +95,7 @@ function normalizeSemgrepResult(result, workspacePath) {
   const extra = result.extra || {};
   const metadata = extra.metadata || {};
   const relativePath = normalizePath(result.path);
-  const absolutePath = path.resolve(workspacePath, relativePath);
+  const absolutePath = resolveScannerPath(workspacePath,relativePath);
   const start = result.start || {};
   const end = result.end || start;
   const rawSeverity = String(extra.severity || 'WARNING').toUpperCase();
@@ -138,7 +140,7 @@ function normalizeGitleaksResult(result, workspacePath) {
     title: result.Description || 'Secret potentiel détecté',
     severity: risk.severity, rawSeverity: risk.rawSeverity,
     category: 'secret', cwe: 'CWE-798', file: relativePath,
-    absolutePath: path.resolve(workspacePath, relativePath), startLine, startColumn,
+    absolutePath: resolveScannerPath(workspacePath,relativePath), startLine, startColumn,
     endLine: Math.max(startLine, (result.EndLine || result.StartLine || 1) - 1),
     endColumn: Math.max(startColumn + 1, (result.EndColumn || result.StartColumn || 1) - 1),
     helpUri: 'https://github.com/gitleaks/gitleaks', fingerprint: result.Fingerprint || '',
@@ -172,7 +174,7 @@ function normalizeTrivyVulnerability(result, target, workspacePath) {
     title: `${result.VulnerabilityID || 'CVE'} — ${result.PkgName || 'dépendance'} (${version})`,
     severity: commonSeverityMap[rawSeverity] || 'warning', rawSeverity,
     category: 'dependency', cwe: Array.isArray(result.CweIDs) ? result.CweIDs.join(', ') : '',
-    ...location, absolutePath: path.resolve(workspacePath, location.file),
+    ...location, absolutePath: resolveScannerPath(workspacePath,location.file),
     helpUri: result.PrimaryURL || result.References?.[0] || '',
     sourceContext: classifySourceContext(location.file),
     confidence: 'high',
@@ -238,7 +240,7 @@ function normalizeOsvOutput(payload, workspacePath) {
           category: 'dependency',
           cwe: '',
           file: sourcePath,
-          absolutePath: path.resolve(workspacePath, sourcePath),
+          absolutePath: resolveScannerPath(workspacePath,sourcePath),
           startLine: 0,
           startColumn: 0,
           endLine: 0,
@@ -271,7 +273,7 @@ function normalizeTrivyMisconfiguration(result, target, workspacePath) {
     title: result.Title || result.Message || 'Mauvaise configuration',
     severity: commonSeverityMap[rawSeverity] || 'warning', rawSeverity,
     category: 'misconfiguration', cwe: '',
-    ...location, absolutePath: path.resolve(workspacePath, location.file),
+    ...location, absolutePath: resolveScannerPath(workspacePath,location.file),
     helpUri: result.PrimaryURL || result.References?.[0] || '',
     sourceContext: classifySourceContext(location.file),
     confidence: 'high',
@@ -531,7 +533,7 @@ function sonarQubeLocation(item, relativePath, workspacePath) {
   const startLine = Math.max(0, line - 1);
   return {
     file: relativePath,
-    absolutePath: relativePath ? path.resolve(workspacePath, relativePath) : '',
+    absolutePath: relativePath ? resolveScannerPath(workspacePath,relativePath) : '',
     startLine,
     startColumn,
     endLine: Math.max(startLine, endLine - 1),
@@ -721,7 +723,7 @@ function normalizeSnykVulnerability(vulnerability, project, workspacePath) {
     category: 'dependency',
     cwe: cwes.join(', '),
     file: manifest,
-    absolutePath: manifest ? path.resolve(workspacePath, manifest) : '',
+    absolutePath: manifest ? resolveScannerPath(workspacePath,manifest) : '',
     startLine: 0,
     startColumn: 0,
     endLine: 0,
@@ -819,7 +821,7 @@ function normalizeSnykCodeResult(result, { rules, workspacePath }) {
     category: 'security',
     cwe: snykCodeCwe(rule),
     file: relativePath,
-    absolutePath: relativePath ? path.resolve(workspacePath, relativePath) : '',
+    absolutePath: relativePath ? resolveScannerPath(workspacePath,relativePath) : '',
     startLine,
     startColumn,
     endLine: Math.max(startLine, Number(region.endLine || region.startLine || 0) - 1),
@@ -868,7 +870,7 @@ function normalizeSnykIaCIssue(issue, project, workspacePath) {
     category: 'misconfiguration',
     cwe: '',
     file: relativePath,
-    absolutePath: relativePath ? path.resolve(workspacePath, relativePath) : '',
+    absolutePath: relativePath ? resolveScannerPath(workspacePath,relativePath) : '',
     startLine,
     startColumn: 0,
     endLine: startLine,
