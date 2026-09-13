@@ -9,7 +9,10 @@
 #   installed with the expected SHA-256  -> use it, no reinstall
 #   installed with another build         -> download, verify, upgrade
 #   absent                               -> download, verify, install
-#   any failure                          -> exit 2 (ERROR): the scan must not run
+#   any failure or timeout               -> exit 2 (ERROR): the scan must not run
+#
+# Every phase is logged before it starts and every wait is bounded: the
+# bootstrap never leaves Jenkins waiting silently.
 #
 # Jenkins-level configuration (never in the application repository), either:
 #   SCENTER_ENGINE_MANIFEST_URL  one stable URL of security-center-latest.json,
@@ -24,6 +27,14 @@
 #   SCENTER_TOOLS_DIR (default /var/jenkins_home/tools), SCENTER_NODE_HOME,
 #   SCENTER_ENGINE_PREFIX, SCENTER_ENGINE_PACKAGES,
 #   SCENTER_BOOTSTRAP_FAILURE_REPORT (CI report written when the engine is unavailable)
+# Bounds, in seconds:
+#   SCENTER_BOOTSTRAP_LOCK_TIMEOUT (300)       wait for another bootstrap's install lock
+#   SCENTER_BOOTSTRAP_LOCK_STALE_AFTER (900)   a lock older than this is abandoned
+#   SCENTER_BOOTSTRAP_CONNECT_TIMEOUT (20)     TCP/TLS connection, per attempt
+#   SCENTER_BOOTSTRAP_MANIFEST_TIMEOUT (60)    whole manifest download, redirects included
+#   SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT (300)   whole engine package download
+#   SCENTER_BOOTSTRAP_INSTALL_TIMEOUT (300)    npm install of the engine
+#   SCENTER_BOOTSTRAP_VERIFY_TIMEOUT (60)      each run of security-center --help
 #
 # This file is embedded verbatim in templates/Jenkinsfile. Keep it free of
 # backslashes and triple quotes so the Groovy string stays byte-identical.
@@ -42,10 +53,18 @@ DOWNLOAD_TOKEN="${SCENTER_ENGINE_DOWNLOAD_TOKEN:-}"
 ENGINE_URL="${SCENTER_ENGINE_TGZ_URL:-}"
 EXPECTED_SHA=''
 FAILURE_REPORT="${SCENTER_BOOTSTRAP_FAILURE_REPORT:-}"
-LOCK_TIMEOUT="${SCENTER_BOOTSTRAP_LOCK_TIMEOUT:-600}"
+LOCK_TIMEOUT="${SCENTER_BOOTSTRAP_LOCK_TIMEOUT:-300}"
+LOCK_STALE_AFTER="${SCENTER_BOOTSTRAP_LOCK_STALE_AFTER:-900}"
+CONNECT_TIMEOUT="${SCENTER_BOOTSTRAP_CONNECT_TIMEOUT:-20}"
+MANIFEST_TIMEOUT="${SCENTER_BOOTSTRAP_MANIFEST_TIMEOUT:-60}"
+DOWNLOAD_TIMEOUT="${SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT:-300}"
+INSTALL_TIMEOUT="${SCENTER_BOOTSTRAP_INSTALL_TIMEOUT:-300}"
+VERIFY_TIMEOUT="${SCENTER_BOOTSTRAP_VERIFY_TIMEOUT:-60}"
 MARKER="$PREFIX/scenter-ci-engine.json"
 LOCK_DIR="$PACKAGES/.bootstrap.lock"
+LOCK_OWNER_FILE="$LOCK_DIR/owner"
 
+PHASE='starting'
 LOCK_HELD=0
 NODE_BIN=''
 NPM_BIN=''
@@ -59,8 +78,17 @@ ENGINE_SOURCE='direct'
 BUILD_COMMIT=''
 BUILD_TIMESTAMP=''
 MANIFEST_VERSION=''
+DOWNLOAD_ERROR=''
+TEMP_FILES=''
 
 log() { echo "[scenter-engine] $*"; }
+
+# The current phase, logged before the work starts: the last line in the build
+# log always names what the bootstrap is doing.
+phase() {
+  PHASE="$1"
+  log "$1"
+}
 
 # Printable, quote-free, bounded: safe inside the JSON written below.
 clean_text() {
@@ -92,6 +120,14 @@ json_or_null() {
   if [ -n "$1" ]; then printf '"%s"' "$(clean_text "$1")"; else printf 'null'; fi
 }
 
+# Temporary files removed on success, failure and interruption alike.
+track_temp() { TEMP_FILES="$TEMP_FILES $1"; }
+cleanup_temp() {
+  local file
+  for file in $TEMP_FILES; do rm -f "$file" 2>/dev/null || true; done
+  TEMP_FILES=''
+}
+
 # The CI report Security Delivery reads when the engine never ran: verdict
 # ERROR, engine not available, and nothing else claimed.
 write_failure_report() {
@@ -117,9 +153,27 @@ write_failure_report() {
 REPORT
 }
 
+current_host() {
+  hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown
+}
+
+# One key=value field of the lock owner record.
+lock_owner_field() {
+  local owner entry
+  owner="$(tr -cd 'A-Za-z0-9=._: -' < "$LOCK_OWNER_FILE" 2>/dev/null || true)"
+  for entry in $owner; do
+    case "$entry" in "$1="*) printf '%s' "${entry#*=}"; return 0 ;; esac
+  done
+  return 0
+}
+
+# Releases the lock only if this process still owns it.
 release_lock() {
   if [ "$LOCK_HELD" = 1 ]; then
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+    if [ "$(lock_owner_field pid)" = "$$" ]; then
+      rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
     LOCK_HELD=0
   fi
 }
@@ -127,16 +181,61 @@ release_lock() {
 fail() {
   local reason
   reason="$(clean_text "$*")"
-  trap - ERR
-  echo "[scenter-engine] ERROR: $reason" >&2
+  trap - ERR INT TERM HUP
+  # A bounded download or install still running is stopped with the bootstrap.
+  if [ -n "${CHILD_PID:-}" ]; then kill "$CHILD_PID" 2>/dev/null || true; CHILD_PID=''; fi
+  echo "[scenter-engine] ERROR during '$PHASE': $reason" >&2
   echo 'SCENTER_ENGINE_STATUS=ERROR'
-  write_failure_report "$reason" || true
+  cleanup_temp
+  write_failure_report "$PHASE: $reason" || true
   release_lock
   exit 2
 }
 
+on_signal() {
+  fail "interrupted by signal $1 (build aborted or agent stopping); the installed engine was not modified by this phase unless it was installing"
+}
+
 trap 'fail "unexpected bootstrap error (line $LINENO)"' ERR
-trap release_lock EXIT
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+trap 'cleanup_temp; release_lock' EXIT
+
+# Runs "$@" for at most $1 seconds when the timeout command exists; exit 124 or
+# 137 means the limit was hit. The command runs in the background and is waited
+# for, so an abort (TERM/INT) interrupts the wait at once instead of being
+# deferred until a hanging download or install ends.
+run_bounded() {
+  local limit="$1" status=0
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 10 "$limit" "$@" &
+  else
+    "$@" &
+  fi
+  CHILD_PID=$!
+  wait "$CHILD_PID" || status=$?
+  CHILD_PID=''
+  return "$status"
+}
+
+is_timeout_status() {
+  [ "$1" = 124 ] || [ "$1" = 137 ] || [ "$1" = 143 ]
+}
+
+check_bounds() {
+  local name value
+  for name in LOCK_TIMEOUT LOCK_STALE_AFTER CONNECT_TIMEOUT MANIFEST_TIMEOUT DOWNLOAD_TIMEOUT INSTALL_TIMEOUT VERIFY_TIMEOUT; do
+    value="${!name}"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ]; then
+      fail "invalid SCENTER_BOOTSTRAP_$name value '$value' (expected a number of seconds)"
+    fi
+  done
+  if ! command -v timeout >/dev/null 2>&1; then
+    log 'note: the timeout command is not available; downloads stay bounded by curl, npm install and the CLI check are bounded only by the Jenkins stage'
+  fi
+}
 
 sha_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -148,6 +247,7 @@ sha_of() {
 
 resolve_toolchain() {
   local candidate
+  phase 'resolving Node.js and npm'
   NODE_BIN="${SCENTER_NODE:-}"
   if [ -z "$NODE_BIN" ]; then
     for candidate in "$NODE_HOME/bin/node" "$NODE_HOME/node"; do
@@ -155,7 +255,7 @@ resolve_toolchain() {
     done
   fi
   [ -n "$NODE_BIN" ] || fail "Node.js not found in $NODE_HOME (one-time Jenkins prerequisite: install Node.js 22 there)"
-  NODE_VERSION="$("$NODE_BIN" --version 2>/dev/null)" || fail "Node.js at $NODE_BIN does not run"
+  NODE_VERSION="$(run_bounded "$VERIFY_TIMEOUT" "$NODE_BIN" --version 2>/dev/null)" || fail "Node.js at $NODE_BIN does not run"
   NPM_BIN="${SCENTER_NPM:-}"
   if [ -z "$NPM_BIN" ]; then
     for candidate in "$NODE_HOME/bin/npm" "$NODE_HOME/npm"; do
@@ -165,7 +265,7 @@ resolve_toolchain() {
   [ -n "$NPM_BIN" ] || fail "npm not found next to Node.js in $NODE_HOME"
   PATH="$(dirname "$NODE_BIN"):$PATH"
   export PATH
-  NPM_VERSION="$("$NPM_BIN" --version 2>/dev/null)" || fail "npm at $NPM_BIN does not run"
+  NPM_VERSION="$(npm_config_update_notifier=false run_bounded "$VERIFY_TIMEOUT" "$NPM_BIN" --version 2>/dev/null)" || fail "npm at $NPM_BIN does not run"
 }
 
 # Prints one string field of a JSON file, nothing when absent or unreadable.
@@ -189,46 +289,114 @@ installed_command() {
   return 1
 }
 
-acquire_lock() {
-  local waited=0
-  mkdir -p "$PACKAGES" "$PREFIX" 2>/dev/null || fail "cannot create $PREFIX and $PACKAGES (the Jenkins user must own $TOOLS_DIR)"
-  until mkdir "$LOCK_DIR" 2>/dev/null; do
-    if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
-      log 'removing a stale bootstrap lock older than 30 minutes'
-      rmdir "$LOCK_DIR" 2>/dev/null || true
-      continue
+# Why the existing install lock can be taken over, or nothing when it may still
+# be held by a running bootstrap.
+lock_stale_reason() {
+  local pid host started now age mtime probe
+  [ -d "$LOCK_DIR" ] || return 0
+  pid="$(lock_owner_field pid)"
+  host="$(lock_owner_field host)"
+  started="$(lock_owner_field started)"
+  now="$(date +%s)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$host" = "$(current_host)" ]; then
+    if ! kill -0 "$pid" 2>/dev/null; then
+      probe="$(kill -0 "$pid" 2>&1 || true)"
+      case "$probe" in
+        *ermitted*) ;;
+        *) printf 'its owner process %s on %s is no longer running' "$pid" "$host"; return 0 ;;
+      esac
     fi
-    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
-      fail "another build has held the CI Engine bootstrap lock for more than ${LOCK_TIMEOUT}s ($LOCK_DIR)"
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  LOCK_HELD=1
+  fi
+  if [[ "$started" =~ ^[0-9]+$ ]]; then
+    age=$((now - started))
+  else
+    mtime="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
+    if [[ "$mtime" =~ ^[0-9]+$ ]]; then age=$((now - mtime)); else age=''; fi
+  fi
+  if [ -n "$age" ] && [ "$age" -ge "$LOCK_STALE_AFTER" ]; then
+    printf 'it is %ss old (abandoned after %ss)' "$age" "$LOCK_STALE_AFTER"
+  fi
+  return 0
 }
 
-# Downloads $1 to $2. With $3=yes and a token configured, the token travels in a
-# private header file, never on the command line or in the log.
+lock_holder() {
+  local pid host build
+  pid="$(lock_owner_field pid)"
+  host="$(lock_owner_field host)"
+  build="$(lock_owner_field build)"
+  if [ -n "$pid" ]; then
+    printf 'pid %s on %s, build %s' "$pid" "${host:-unknown host}" "${build:-unknown}"
+  else
+    printf 'no owner record (lock left by an older bootstrap or a killed process)'
+  fi
+}
+
+acquire_lock() {
+  local waited=0 next_report=0 reason
+  phase "acquiring install lock ($LOCK_DIR, timeout ${LOCK_TIMEOUT}s)"
+  mkdir -p "$PACKAGES" "$PREFIX" 2>/dev/null || fail "cannot create $PREFIX and $PACKAGES (the Jenkins user must own $TOOLS_DIR)"
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    reason="$(lock_stale_reason)"
+    if [ -n "$reason" ]; then
+      log "removing abandoned install lock: $reason"
+      rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true
+      if rmdir "$LOCK_DIR" 2>/dev/null; then continue; fi
+    fi
+    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
+      fail "install lock still held after ${LOCK_TIMEOUT}s: $LOCK_DIR ($(lock_holder)). If no Security Center build is running, remove that directory."
+    fi
+    if [ "$waited" -ge "$next_report" ]; then
+      log "waiting for install lock held by $(lock_holder) (${waited}s of ${LOCK_TIMEOUT}s)"
+      next_report=$((waited + 10))
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  LOCK_HELD=1
+  printf 'pid=%s host=%s started=%s build=%s' "$$" "$(current_host)" "$(date +%s)" "$(printf '%s' "${BUILD_TAG:-manual}" | tr -cd 'A-Za-z0-9._-' | cut -c1-120)" > "$LOCK_OWNER_FILE"
+  log 'install lock acquired'
+}
+
+# Downloads $1 to $2 within $4 seconds (connection, redirects, retries and
+# transfer included). With $3=yes and a token configured, the token travels in a
+# private header file, never on the command line or in the log. On failure,
+# DOWNLOAD_ERROR explains what happened, without the URL.
 download() {
-  local url="$1" destination="$2" with_token="${3:-no}" header_file status
+  local url="$1" destination="$2" with_token="${3:-no}" limit="$4" label="$5" header_file='' status=0
+  local -a arguments
   rm -f "$destination"
+  track_temp "$destination"
+  DOWNLOAD_ERROR=''
   if command -v curl >/dev/null 2>&1; then
+    arguments=(-fsSL --max-redirs 10 --proto '=https,http,file' --proto-redir '=https,http' --connect-timeout "$CONNECT_TIMEOUT" --max-time "$limit" --retry 2 --retry-delay 2 --retry-max-time "$limit" -o "$destination")
     if [ "$with_token" = yes ] && [ -n "$DOWNLOAD_TOKEN" ]; then
       header_file="$PACKAGES/.auth-$$.header"
+      track_temp "$header_file"
       ( umask 077; printf 'Authorization: Bearer %s' "$DOWNLOAD_TOKEN" > "$header_file" )
-      if curl -fsSL --retry 2 -H "@$header_file" -o "$destination" "$url" 2>/dev/null; then status=0; else status=1; fi
-      rm -f "$header_file"
-      return "$status"
+      arguments+=(-H "@$header_file")
     fi
-    if curl -fsSL --retry 2 -o "$destination" "$url" 2>/dev/null; then return 0; fi
+    run_bounded "$((limit + 15))" curl "${arguments[@]}" "$url" 2>/dev/null || status=$?
+    if [ -n "$header_file" ]; then rm -f "$header_file"; fi
+    case "$status" in
+      0) return 0 ;;
+      28|124|137|143) DOWNLOAD_ERROR="$label timed out after ${limit}s" ;;
+      5|6) DOWNLOAD_ERROR="$label failed: host could not be resolved" ;;
+      7) DOWNLOAD_ERROR="$label failed: connection refused or host unreachable" ;;
+      22) DOWNLOAD_ERROR="$label failed: the server answered with an HTTP error" ;;
+      47) DOWNLOAD_ERROR="$label failed: too many redirects" ;;
+      35|51|58|60) DOWNLOAD_ERROR="$label failed: TLS error (curl exit $status)" ;;
+      *) DOWNLOAD_ERROR="$label failed (curl exit $status)" ;;
+    esac
     return 1
   fi
   if command -v wget >/dev/null 2>&1; then
     if [ "$with_token" = yes ] && [ -n "$DOWNLOAD_TOKEN" ]; then
-      if wget -q --header="Authorization: Bearer $DOWNLOAD_TOKEN" -O "$destination" "$url"; then return 0; fi
-      return 1
+      run_bounded "$limit" wget -q --tries=2 --timeout="$CONNECT_TIMEOUT" --max-redirect=10 --header="Authorization: Bearer $DOWNLOAD_TOKEN" -O "$destination" "$url" || status=$?
+    else
+      run_bounded "$limit" wget -q --tries=2 --timeout="$CONNECT_TIMEOUT" --max-redirect=10 -O "$destination" "$url" || status=$?
     fi
-    if wget -q -O "$destination" "$url"; then return 0; fi
+    if [ "$status" = 0 ]; then return 0; fi
+    if is_timeout_status "$status"; then DOWNLOAD_ERROR="$label timed out after ${limit}s"; else DOWNLOAD_ERROR="$label failed (wget exit $status)"; fi
     return 1
   fi
   fail 'neither curl nor wget is available on the Jenkins agent'
@@ -240,6 +408,7 @@ resolve_expected_build() {
   local manifest fields key value
   if [ -z "$MANIFEST_URL" ]; then
     ENGINE_SOURCE='direct'
+    phase 'reading direct engine configuration (SCENTER_ENGINE_TGZ_URL, SCENTER_ENGINE_SHA256)'
     EXPECTED_SHA="$(printf '%s' "${SCENTER_ENGINE_SHA256:-}" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
     [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || fail 'SCENTER_ENGINE_SHA256 is not configured on Jenkins, and no SCENTER_ENGINE_MANIFEST_URL is set (one of them is required)'
     return 0
@@ -249,11 +418,12 @@ resolve_expected_build() {
     log 'SCENTER_ENGINE_MANIFEST_URL is set: the direct SCENTER_ENGINE_TGZ_URL and SCENTER_ENGINE_SHA256 values are ignored'
   fi
   manifest="$PACKAGES/.manifest-latest-$$.json"
-  log "reading the CI Engine manifest from $(safe_url "$MANIFEST_URL")"
-  if ! download "$MANIFEST_URL" "$manifest" yes; then
+  phase "fetching engine manifest ($(safe_url "$MANIFEST_URL"), timeout ${MANIFEST_TIMEOUT}s)"
+  if ! download "$MANIFEST_URL" "$manifest" yes "$MANIFEST_TIMEOUT" 'manifest download'; then
     rm -f "$manifest"
-    fail "CI Engine manifest unreachable: $(safe_url "$MANIFEST_URL")"
+    fail "CI Engine manifest unreachable: $(safe_url "$MANIFEST_URL") ($DOWNLOAD_ERROR)"
   fi
+  phase 'validating engine manifest'
   if ! fields="$("$NODE_BIN" -e '
     const fs = require("fs");
     let m;
@@ -290,21 +460,28 @@ resolve_expected_build() {
 $fields
 FIELDS
   [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid CI Engine manifest: no valid tgz.sha256'
-  log "manifest build: $PACKAGE_NAME@$MANIFEST_VERSION, commit $BUILD_COMMIT, built $BUILD_TIMESTAMP"
+  log "manifest received: $PACKAGE_NAME@$MANIFEST_VERSION, commit $BUILD_COMMIT, built $BUILD_TIMESTAMP"
+}
+
+# Runs the installed command's --help within the verify bound.
+run_help() {
+  run_bounded "$VERIFY_TIMEOUT" "$1" --help 2>&1
 }
 
 # The expected build is installed, verified by its recorded SHA-256 and by
 # actually running the command.
 engine_is_expected() {
   local package_json command help marker_sha
+  phase 'checking installed engine'
   [ -f "$MARKER" ] || return 1
   marker_sha="$(json_field "$MARKER" sha256)"
   [ "$marker_sha" = "$EXPECTED_SHA" ] || return 1
   package_json="$(installed_package_json)" || return 1
   command="$(installed_command)" || return 1
-  help="$("$command" --help 2>&1)" || return 1
+  help="$(run_help "$command")" || return 1
   case "$help" in *"$HELP_MARKER"*) ;; *) return 1 ;; esac
   ENGINE_VERSION="$(json_field "$package_json" version)"
+  [ "$ENGINE_VERSION" = "$(json_field "$MARKER" version)" ] || return 1
   ENGINE_COMMAND="$command"
   if [ -z "$BUILD_COMMIT" ]; then BUILD_COMMIT="$(json_field "$MARKER" commit)"; fi
   return 0
@@ -324,11 +501,12 @@ fetch_package() {
     token_mode=yes
   fi
   download_file="$PACKAGES/.download-$$.tgz"
-  log "downloading the CI Engine package from $source"
-  if ! download "$ENGINE_URL" "$download_file" "$token_mode"; then
+  phase "downloading engine package ($source, timeout ${DOWNLOAD_TIMEOUT}s)"
+  if ! download "$ENGINE_URL" "$download_file" "$token_mode" "$DOWNLOAD_TIMEOUT" 'engine package download'; then
     rm -f "$download_file"
-    fail "download failed from $source"
+    fail "download failed from $source ($DOWNLOAD_ERROR)"
   fi
+  phase 'verifying SHA-256'
   actual="$(sha_of "$download_file")"
   if [ "$actual" != "$EXPECTED_SHA" ]; then
     rm -f "$download_file"
@@ -340,10 +518,12 @@ fetch_package() {
 
 validate_package() {
   local package="$1" manifest name version entry
+  phase 'validating engine package'
   if ! tar -tzf "$package" package/package.json package/src/cli.js >/dev/null 2>&1; then
     fail 'the configured package is not a Security Center CI Engine package'
   fi
   manifest="$PACKAGES/.manifest-$$.json"
+  track_temp "$manifest"
   if ! tar -xOzf "$package" package/package.json > "$manifest" 2>/dev/null; then
     rm -f "$manifest"
     fail 'cannot read package.json from the CI Engine package'
@@ -359,6 +539,7 @@ validate_package() {
   # Byte-level check: some shells strip a trailing carriage return in command
   # substitution, which would let a CRLF entrypoint pass a plain string compare.
   entry="$PACKAGES/.entry-$$.js"
+  track_temp "$entry"
   if ! tar -xOzf "$package" package/src/cli.js > "$entry" 2>/dev/null; then
     rm -f "$entry"
     fail 'cannot read the CI Engine entrypoint from the package'
@@ -372,17 +553,28 @@ validate_package() {
 }
 
 install_package() {
-  log "installing $PACKAGE_NAME@$PACKAGE_VERSION into $PREFIX"
-  if ! "$NPM_BIN" install --global --prefix "$PREFIX" "$CACHED_PACKAGE" --no-audit --no-fund --loglevel=error >/dev/null; then
-    fail 'npm install of the CI Engine failed'
+  local status=0
+  # From here the installed files change: the previous record no longer vouches
+  # for them until the new install is verified.
+  if [ -f "$MARKER" ]; then mv -f "$MARKER" "$MARKER.previous" 2>/dev/null || true; fi
+  phase "installing engine ($PACKAGE_NAME@$PACKAGE_VERSION into $PREFIX, timeout ${INSTALL_TIMEOUT}s)"
+  npm_config_update_notifier=false run_bounded "$INSTALL_TIMEOUT" "$NPM_BIN" install --global --prefix "$PREFIX" "$CACHED_PACKAGE" --offline --no-audit --no-fund --loglevel=error >/dev/null || status=$?
+  if is_timeout_status "$status"; then
+    fail "npm install of the CI Engine timed out after ${INSTALL_TIMEOUT}s"
+  fi
+  if [ "$status" != 0 ]; then
+    fail "npm install of the CI Engine failed (exit $status)"
   fi
 }
 
 verify_install() {
-  local package_json command help
+  local package_json command help status=0
+  phase 'verifying installed CLI'
   package_json="$(installed_package_json)" || fail "installed package not found under $PREFIX after npm install"
   command="$(installed_command)" || fail "security-center command not created under $PREFIX"
-  help="$("$command" --help 2>&1)" || fail 'security-center --help failed after install'
+  help="$(run_help "$command")" || status=$?
+  if is_timeout_status "$status"; then fail "security-center --help timed out after ${VERIFY_TIMEOUT}s"; fi
+  [ "$status" = 0 ] || fail 'security-center --help failed after install'
   case "$help" in *"$HELP_MARKER"*) ;; *) fail 'security-center --help did not print the Security Center help' ;; esac
   ENGINE_VERSION="$(json_field "$package_json" version)"
   [ "$ENGINE_VERSION" = "$PACKAGE_VERSION" ] || fail "installed version $ENGINE_VERSION differs from the package version $PACKAGE_VERSION"
@@ -391,7 +583,9 @@ verify_install() {
 
 write_marker() {
   local previous="$1" temporary="$MARKER.tmp.$$" source
+  phase 'recording installed engine'
   if [ "$ENGINE_SOURCE" = manifest ]; then source="$(safe_url "$MANIFEST_URL")"; else source="$(safe_url "$ENGINE_URL")"; fi
+  track_temp "$temporary"
   cat > "$temporary" <<MARKER_JSON
 {
   "engine": "security-center",
@@ -411,6 +605,7 @@ write_marker() {
 }
 MARKER_JSON
   mv -f "$temporary" "$MARKER"
+  rm -f "$MARKER.previous" 2>/dev/null || true
 }
 
 emit() {
@@ -425,6 +620,7 @@ emit() {
 
 main() {
   local previous='' action='installed'
+  check_bounds
   resolve_toolchain
   log "node $NODE_VERSION, npm $NPM_VERSION"
   acquire_lock
@@ -435,10 +631,14 @@ main() {
     release_lock
     return 0
   fi
-  if [ -f "$MARKER" ]; then
-    previous="$(json_field "$MARKER" sha256)"
-    [[ "$previous" =~ ^[0-9a-f]{64}$ ]] || previous=''
-  fi
+  for previous in "$MARKER" "$MARKER.previous"; do
+    if [ -f "$previous" ]; then
+      previous="$(json_field "$previous" sha256)"
+      break
+    fi
+    previous=''
+  done
+  [[ "$previous" =~ ^[0-9a-f]{64}$ ]] || previous=''
   if [ -n "$previous" ] || installed_package_json >/dev/null; then action='updated'; fi
   fetch_package
   validate_package "$CACHED_PACKAGE"
