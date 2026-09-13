@@ -291,6 +291,52 @@ function sshFailure(errors, config, pin) {
   return { summary: 'Host unreachable', detail: `Jenkins cannot reach ${config.host}:${config.port} over SSH.` };
 }
 
+/**
+ * Jenkins reads a POSTed config.xml through the servlet reader, whose charset
+ * comes from the Content-Type and defaults to ISO-8859-1. A UTF-8 "→" sent
+ * without a charset then reaches its XML 1.1 parser as C1 control characters
+ * (0x86), which it refuses: HTTP 500. The charset is declared, and every
+ * non-ASCII character travels as a numeric character reference, so the body
+ * decodes identically whatever charset Jenkins assumes.
+ */
+const XML_CONTENT_TYPE = 'application/xml; charset=utf-8';
+
+function asciiXml(value) {
+  return String(value ?? '').replace(/[^\x00-\x7F]/gu, (character) => `&#${character.codePointAt(0)};`);
+}
+
+/**
+ * Why Jenkins refused a request, read from its error page: the root exception
+ * message, or the Logging ID when Jenkins hides stack traces. Secrets are
+ * redacted and the result is bounded; an empty string means nothing useful.
+ */
+function jenkinsFailureReason(response, secrets = []) {
+  const page = String(response?.text || '')
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<br\s*\/?>|<\/(p|div|pre|h\d|li|title)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, '&');
+  const lines = page.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const exceptions = lines
+    .map((line) => /^(?:Caused by:\s*)?((?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*(?:Exception|Error))[:;]\s*(\S.*)$/.exec(line))
+    .filter(Boolean);
+  let reason = '';
+  if (exceptions.length) {
+    const [, type, message] = exceptions[exceptions.length - 1];
+    reason = `${type}: ${message}`;
+  } else {
+    const logging = /Logging ID=([\w-]+)/.exec(page)?.[1];
+    if (logging) reason = `Jenkins logged the error with Logging ID=${logging}`;
+  }
+  // Nothing useful on the page: no reason at all, never scrubJenkinsError's generic fallback text.
+  if (!reason) return '';
+  for (const secret of secrets.filter((value) => typeof value === 'string' && value.length >= 6)) reason = reason.split(secret).join('[REDACTED]');
+  reason = scrubJenkinsError(reason)
+    .replace(/-----BEGIN[\s\S]*?(?:-----END[^-]*-----|$)/g, '[REDACTED]')
+    .replace(/\b(password|passphrase|token|secret|apiToken)(\s*[=:]\s*)\S+/gi, '$1$2[REDACTED]');
+  return safeFact(reason);
+}
+
 const json = (response) => { try { return JSON.parse(response?.text || ''); } catch { return null; } };
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -341,6 +387,12 @@ async function configureDeployment({
   const attempt = async (action) => {
     try { return await action(); } catch (error) { return { status: 0, headers: {}, text: '', error: scrubJenkinsError(error.message) }; }
   };
+  const refused = (response, what) => {
+    const problem = httpProblem(response, what);
+    if ([401, 403].includes(response.status)) return problem;
+    const reason = jenkinsFailureReason(response, [token, `${user}:${token}`]);
+    return reason ? `${problem.replace(/\.$/, '')}: ${reason}` : problem;
+  };
 
   // ------------------------------------------------------------ 1. Jenkins
   const checked = normalizeDeploymentConfig(input);
@@ -361,10 +413,10 @@ async function configureDeployment({
   const client = createJenkinsClient({ baseUrl, user, token, call, timeoutMs: limits.requestMs });
   const root = await attempt(() => client.get('api/json?tree=mode'));
   if (root.error) return stop('jenkins', 'Unreachable', `Cannot reach Jenkins at ${baseUrl}: ${root.error}`);
-  if (root.status !== 200) return stop('jenkins', [401, 403].includes(root.status) ? 'Not authenticated' : 'Error', httpProblem(root, 'read Jenkins'));
+  if (root.status !== 200) return stop('jenkins', [401, 403].includes(root.status) ? 'Not authenticated' : 'Error', refused(root, 'read Jenkins'));
   const jobConfig = await attempt(() => client.get(`${jobPath}/config.xml`));
   if (jobConfig.status === 404) return stop('jenkins', 'Job not found', `Jenkins has no job "${integration.job}".`);
-  if (jobConfig.error || jobConfig.status !== 200) return stop('jenkins', 'Error', jobConfig.error || httpProblem(jobConfig, 'read the job configuration (Job/Configure)'));
+  if (jobConfig.error || jobConfig.status !== 200) return stop('jenkins', 'Error', jobConfig.error || refused(jobConfig, 'read the job configuration (Job/Configure)'));
   const plugins = await attempt(() => client.get('pluginManager/api/json?tree=plugins[shortName,active]'));
   const pluginList = plugins.status === 200 ? (json(plugins)?.plugins || []) : null;
   const pluginActive = (name) => !pluginList || pluginList.some((plugin) => plugin.shortName === name && plugin.active);
@@ -378,7 +430,7 @@ async function configureDeployment({
   if (credential.status === 404) {
     return stop('credential', 'Credential not found', `Jenkins has no global credential "${config.credentialId}". Create an "SSH Username with private key" credential in Jenkins Credentials, then enter its ID.`);
   }
-  if (credential.error || credential.status !== 200) return stop('credential', 'Credential unavailable', credential.error || httpProblem(credential, 'view credentials'));
+  if (credential.error || credential.status !== 200) return stop('credential', 'Credential unavailable', credential.error || refused(credential, 'view credentials'));
   const credentialType = safeFact(json(credential)?.typeName);
   if (!/ssh/i.test(credentialType)) {
     return stop('credential', 'Wrong credential type', `Credential "${config.credentialId}" is "${credentialType || 'unknown'}", not an SSH private key credential.`);
@@ -424,15 +476,15 @@ async function configureDeployment({
   let saved;
   if (current.status === 200) {
     if (!current.text.includes(MANAGED_MARKER)) return stop('ssh', 'Check job name in use', `A Jenkins job named "${CHECK_JOB}" exists but was not created by Security Center. It is never overwritten.`);
-    saved = await attempt(() => client.post(`${checkPath}/config.xml`, { body, contentType: 'application/xml' }));
+    saved = await attempt(() => client.post(`${checkPath}/config.xml`, { body: asciiXml(body), contentType: XML_CONTENT_TYPE }));
   } else if (current.status === 404) {
-    saved = await attempt(() => client.post(`createItem?name=${encodeURIComponent(CHECK_JOB)}`, { body, contentType: 'application/xml' }));
+    saved = await attempt(() => client.post(`createItem?name=${encodeURIComponent(CHECK_JOB)}`, { body: asciiXml(body), contentType: XML_CONTENT_TYPE }));
   } else {
     saved = current;
   }
-  if (saved.error || saved.status >= 400) return stop('ssh', 'Check not started', saved.error || httpProblem(saved, 'create or configure jobs (Job/Create, Job/Configure)'));
+  if (saved.error || saved.status >= 400) return stop('ssh', 'Check not started', saved.error || refused(saved, 'create or configure jobs (Job/Create, Job/Configure)'));
   const queued = await attempt(() => client.post(`${checkPath}/build?delay=0sec`));
-  if (queued.error || queued.status >= 400) return stop('ssh', 'Check not started', queued.error || httpProblem(queued, 'build jobs (Job/Build)'));
+  if (queued.error || queued.status >= 400) return stop('ssh', 'Check not started', queued.error || refused(queued, 'build jobs (Job/Build)'));
   const queueId = /\/queue\/item\/(\d+)\/?$/.exec(String(queued.headers?.location || ''))?.[1];
   if (!queueId) return stop('ssh', 'Check not started', 'Jenkins did not return the queue item of the deployment check build.');
   const item = await poll(async () => json(await attempt(() => client.get(`queue/item/${queueId}/api/json?tree=cancelled,why,executable[number]`))) || {},
@@ -480,8 +532,8 @@ async function configureDeployment({
   const values = jobParameterValues(config, pin);
   let updated;
   try { updated = withDeploymentParameters(jobConfig.text, values); } catch (error) { return stop('job', 'Unsupported job', error.message); }
-  const written = await attempt(() => client.post(`${jobPath}/config.xml`, { body: updated, contentType: 'application/xml' }));
-  if (written.error || written.status >= 400) return stop('job', 'Not configured', written.error || httpProblem(written, 'configure the job (Job/Configure)'));
+  const written = await attempt(() => client.post(`${jobPath}/config.xml`, { body: asciiXml(updated), contentType: XML_CONTENT_TYPE }));
+  if (written.error || written.status >= 400) return stop('job', 'Not configured', written.error || refused(written, 'configure the job (Job/Configure)'));
   const reread = await attempt(() => client.get(`${jobPath}/config.xml`));
   const stored = readJobParameters(reread.text);
   if (reread.status !== 200 || MANAGED_NAMES.some((name) => stored[name] !== values[name])) {
@@ -494,5 +546,6 @@ async function configureDeployment({
 module.exports = {
   DEPLOYMENT_TYPE, DEPLOYMENT_TYPE_LABEL, CHECK_JOB, MANAGED_MARKER, CONTAINER_LABEL, STEP_STATE, DEPLOYMENT_STEPS, JOB_PARAMETERS, FIELDS,
   normalizeDeploymentConfig, jobParameterValues, readJobParameters, withDeploymentParameters, pinnedHostKey,
-  checkScript, checkJobConfigXml, parseCheckOutput, configureDeployment
+  checkScript, checkJobConfigXml, parseCheckOutput, configureDeployment,
+  XML_CONTENT_TYPE, asciiXml, jenkinsFailureReason
 };
