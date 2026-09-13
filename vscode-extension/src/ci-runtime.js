@@ -727,5 +727,5 @@ async function configureCiRuntime({
 module.exports = {
   RUNTIME_LABEL, AGENT_NAME, CHECK_JOB, MANAGED_MARKER, MIN_NODE_MAJOR, STEP_STATE, CI_RUNTIME_STEPS,
   normalizeCiRuntimeConfig, agentConfigXml, checkJobConfigXml, parseCheckOutput, sshConnectionFailure, pinnedHostKey,
-  configureCiRuntime, jenkinsCall
+  configureCiRuntime, jenkinsCall, createJenkinsClient, httpProblem
 };

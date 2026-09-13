@@ -23,8 +23,13 @@
 //   SCENTER_PROJECT_REPO_URL        dépôt applicatif analysé (sinon `checkout scm`)
 //   SCENTER_PROJECT_BRANCH          branche analysée (défaut : master)
 //   SCENTER_PROJECT_CREDENTIALS_ID  credential Git du dépôt, s'il est privé
-//   SCENTER_DEPLOY_COMMAND          commande de déploiement, exécutée seulement sur PASS
-//   SCENTER_HEALTHCHECK_URL         URL vérifiée après un déploiement réussi
+//   Déploiement : aucune variable à écrire. Security Center → Security Delivery → Jenkins →
+//                                   « Deployment » vérifie l'hôte (credential, SSH, Docker) puis
+//                                   écrit le profil dans ce job, en paramètres non secrets gérés :
+//                                   SCENTER_DEPLOY_* et SCENTER_HEALTHCHECK_URL. La clé SSH reste
+//                                   dans Jenkins Credentials, référencée par son seul ID.
+//   SCENTER_DEPLOY_COMMAND          (hérité) commande de déploiement libre, utilisée seulement
+//                                   sans profil Security Center
 //   SCENTER_CI_RUNTIME_LABEL        (optionnel) label du runtime CI géré, défaut scenter-ci-runtime.
 //                                   Security Center → Security Delivery → Jenkins → « Configure CI Runtime »
 //                                   crée et vérifie cet agent SSH : aucun nœud à créer à la main.
@@ -836,6 +841,108 @@ main() {
 main "$@"
 '''
 
+// Déploiement « Docker on remote SSH host », profil écrit dans ce job par
+// Security Center. Aucune commande libre : chaque valeur est validée ici avant
+// usage. Jenkins lie la clé SSH (SCENTER_DEPLOY_KEY, un fichier), ssh n'accepte
+// que la clé d'hôte approuvée, l'image est construite sur l'hôte à partir du
+// commit analysé, et seul un conteneur étiqueté par Security Center est remplacé.
+// Jamais --privileged, jamais de socket Docker monté.
+def SCENTER_DOCKER_SSH_DEPLOY = '''set +x
+set +e
+reason_file=.scenter-deploy-reason
+known_hosts=.scenter-deploy-known-hosts
+context_tar=.scenter-deploy-context.tar
+ssh_err=.scenter-deploy-ssh.err
+rm -f "$reason_file"
+cleanup() { rm -f "$known_hosts" "$context_tar" "$ssh_err"; }
+trap cleanup EXIT
+fail() {
+  printf '%s' "$1" > "$reason_file"
+  echo "Security Center : $1" >&2
+  exit 1
+}
+matches() { printf '%s' "$2" | grep -Eqx "$1"; }
+port_ok() { matches '[0-9]{1,5}' "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# Longueurs vérifiées à part : de grandes répétitions bornées rendent grep très lent.
+host="${SCENTER_DEPLOY_HOST:-}"
+host_key="${SCENTER_DEPLOY_HOST_KEY:-}"
+[ "${#host}" -le 253 ] && matches '[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f:]{2,39}' "$host" || fail 'Profil de déploiement invalide : hôte.'
+port_ok "${SCENTER_DEPLOY_PORT:-}" || fail 'Profil de déploiement invalide : port SSH.'
+matches '[A-Za-z_][A-Za-z0-9_.-]{0,31}' "${SCENTER_DEPLOY_USER:-}" || fail 'Profil de déploiement invalide : utilisateur SSH.'
+[ "${#host_key}" -le 8300 ] && matches '(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) [A-Za-z0-9+/=]{16,}' "$host_key" || fail 'Profil de déploiement invalide : clé d’hôte SSH approuvée absente.'
+matches '[A-Za-z0-9][A-Za-z0-9_.-]{0,62}' "${SCENTER_DEPLOY_CONTAINER:-}" || fail 'Profil de déploiement invalide : nom du conteneur.'
+port_ok "${SCENTER_DEPLOY_CONTAINER_PORT:-}" || fail 'Profil de déploiement invalide : port du conteneur.'
+port_ok "${SCENTER_DEPLOY_PUBLISHED_PORT:-}" || fail 'Profil de déploiement invalide : port publié.'
+matches '[0-9a-f]{40}' "${SC_SOURCE_COMMIT:-}" || fail 'Commit analysé inconnu : rien à déployer.'
+[ -n "${SCENTER_DEPLOY_KEY:-}" ] && [ -f "$SCENTER_DEPLOY_KEY" ] || fail "Credential SSH ${SCENTER_DEPLOY_CREDENTIALS_ID:-} non lié par Jenkins."
+command -v ssh >/dev/null 2>&1 || fail "Aucun client ssh sur l'agent Jenkins qui déploie : un administrateur doit installer openssh-client."
+git cat-file -e "$SC_SOURCE_COMMIT:Dockerfile" 2>/dev/null || fail "Aucun Dockerfile à la racine du commit $SC_SOURCE_COMMIT : l'image ne peut pas être construite."
+
+if [ "$SCENTER_DEPLOY_PORT" = 22 ]; then target="$SCENTER_DEPLOY_HOST"; else target="[$SCENTER_DEPLOY_HOST]:$SCENTER_DEPLOY_PORT"; fi
+echo "$target $SCENTER_DEPLOY_HOST_KEY" > "$known_hosts"
+remote() {
+  ssh -i "$SCENTER_DEPLOY_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=20 -p "$SCENTER_DEPLOY_PORT" "$SCENTER_DEPLOY_USER@$SCENTER_DEPLOY_HOST" "$1" 2> "$ssh_err"
+}
+last_error() { tail -n 1 "$ssh_err" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200; }
+ssh_failed() {
+  if grep -Eqi 'host key verification failed|remote host identification has changed' "$ssh_err"; then
+    fail "Clé d'hôte SSH de $SCENTER_DEPLOY_HOST différente de la clé approuvée : déploiement refusé. Relancez Configure Deployment dans Security Center."
+  fi
+  if grep -Eqi 'permission denied|authentication' "$ssh_err"; then
+    fail "Authentification SSH refusée pour $SCENTER_DEPLOY_USER@$SCENTER_DEPLOY_HOST avec le credential $SCENTER_DEPLOY_CREDENTIALS_ID."
+  fi
+  fail "Hôte de déploiement $SCENTER_DEPLOY_HOST:$SCENTER_DEPLOY_PORT injoignable en SSH."
+}
+
+echo "Security Center : vérification de Docker sur $SCENTER_DEPLOY_HOST."
+remote 'docker info --format "{{.ServerVersion}}"' > /dev/null
+status=$?
+[ "$status" = 255 ] && ssh_failed
+if [ "$status" != 0 ]; then
+  if [ "$status" = 127 ] || grep -qi 'not found' "$ssh_err"; then
+    fail "Docker n'est pas installé sur $SCENTER_DEPLOY_HOST : un administrateur doit installer Docker Engine."
+  fi
+  if grep -qi 'permission denied' "$ssh_err"; then
+    fail "L'utilisateur $SCENTER_DEPLOY_USER ne peut pas utiliser Docker sur $SCENTER_DEPLOY_HOST : un administrateur doit l'ajouter au groupe docker."
+  fi
+  fail "Le démon Docker de $SCENTER_DEPLOY_HOST ne répond pas : $(last_error)"
+fi
+
+image="scenter/$(printf '%s' "$SCENTER_DEPLOY_CONTAINER" | tr 'A-Z' 'a-z'):$(printf '%s' "$SC_SOURCE_COMMIT" | cut -c1-12)"
+git archive --format=tar -o "$context_tar" "$SC_SOURCE_COMMIT" || fail "Archive du commit $SC_SOURCE_COMMIT impossible."
+echo "Security Center : construction de $image sur $SCENTER_DEPLOY_HOST."
+remote "docker build -t $image -" < "$context_tar"
+status=$?
+[ "$status" = 255 ] && ssh_failed
+if [ "$status" != 0 ]; then
+  tail -n 20 "$ssh_err" >&2
+  fail "Construction de l'image $image en échec sur $SCENTER_DEPLOY_HOST : $(last_error)"
+fi
+
+echo "Security Center : remplacement du conteneur $SCENTER_DEPLOY_CONTAINER sur $SCENTER_DEPLOY_HOST."
+remote "sh -s -- $SCENTER_DEPLOY_CONTAINER $SCENTER_DEPLOY_PUBLISHED_PORT $SCENTER_DEPLOY_CONTAINER_PORT $image" <<'SCENTER_REMOTE'
+name="$1"; published="$2"; port="$3"; image="$4"
+owner="$(docker ps --filter "publish=$published" --format '{{.Names}}' | grep -vx "$name" | head -n 1)"
+[ -z "$owner" ] || exit 5
+if docker container inspect "$name" >/dev/null 2>&1; then
+  docker ps -a --filter label=security-center.managed=true --format '{{.Names}}' | grep -qx "$name" || exit 3
+  docker rm -f "$name" >/dev/null || exit 4
+fi
+docker run -d --name "$name" --label security-center.managed=true --restart unless-stopped --security-opt no-new-privileges -p "$published:$port" "$image"
+SCENTER_REMOTE
+status=$?
+case "$status" in
+  0) ;;
+  255) ssh_failed ;;
+  3) fail "Un conteneur $SCENTER_DEPLOY_CONTAINER non déployé par Security Center existe sur $SCENTER_DEPLOY_HOST : il n'est jamais remplacé." ;;
+  5) fail "Le port $SCENTER_DEPLOY_PUBLISHED_PORT de $SCENTER_DEPLOY_HOST est déjà publié par un autre conteneur." ;;
+  *) fail "Démarrage du conteneur $SCENTER_DEPLOY_CONTAINER en échec sur $SCENTER_DEPLOY_HOST : $(last_error)" ;;
+esac
+echo "Security Center : conteneur $SCENTER_DEPLOY_CONTAINER déployé ($image, port publié $SCENTER_DEPLOY_PUBLISHED_PORT)."
+exit 0
+'''
+
 // Le dépôt applicatif sur l'agent principal. Renvoie les variables Git du checkout
 // (GIT_URL, GIT_BRANCH) pour que le runtime CI extraie ce même commit sans refaire
 // un clone complet.
@@ -1167,9 +1274,33 @@ pipeline {
       }
       steps {
         script {
+          if (env.SCENTER_DEPLOY_TYPE == 'docker-ssh') {
+            // Profil géré par Security Center : jamais de commande libre. Les valeurs
+            // passent au script par l'environnement et y sont validées ; la clé est
+            // liée par Jenkins, et seule la clé d'hôte approuvée est acceptée.
+            env.SC_DEPLOY_STATUS = 'FAILED'
+            env.SC_DEPLOY_REASON = 'Profil de déploiement invalide : credential Jenkins.'
+            if (!(env.SCENTER_DEPLOY_CREDENTIALS_ID ==~ /[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/)) {
+              error(env.SC_DEPLOY_REASON)
+            }
+            env.SC_DEPLOY_REASON = "Credential Jenkins ${env.SCENTER_DEPLOY_CREDENTIALS_ID} indisponible."
+            def status = 1
+            withCredentials([sshUserPrivateKey(credentialsId: env.SCENTER_DEPLOY_CREDENTIALS_ID, keyFileVariable: 'SCENTER_DEPLOY_KEY')]) {
+              status = sh(returnStatus: true, label: 'Deploy (Docker on remote SSH host)', script: SCENTER_DOCKER_SSH_DEPLOY)
+            }
+            def reason = fileExists('.scenter-deploy-reason') ? readFile('.scenter-deploy-reason').trim() : ''
+            env.SC_DEPLOY_STATUS = status == 0 ? 'SUCCEEDED' : 'FAILED'
+            env.SC_DEPLOY_REASON = status == 0
+              ? "Déployé après PASS du Policy Gate : conteneur ${env.SCENTER_DEPLOY_CONTAINER} sur ${env.SCENTER_DEPLOY_HOST}:${env.SCENTER_DEPLOY_PUBLISHED_PORT}."
+              : (reason ?: "Déploiement Docker en échec (code ${status}).")
+            if (status != 0) {
+              error(env.SC_DEPLOY_REASON)
+            }
+            return
+          }
           if (!env.SCENTER_DEPLOY_COMMAND) {
             env.SC_DEPLOY_STATUS = 'NOT_CONFIGURED'
-            env.SC_DEPLOY_REASON = 'PASS, mais SCENTER_DEPLOY_COMMAND n’est pas configuré sur ce job.'
+            env.SC_DEPLOY_REASON = 'PASS, mais aucun déploiement n’est configuré : Security Delivery → Jenkins → Deployment.'
             env.SC_HEALTH_DETAIL = 'Aucun déploiement exécuté.'
             echo env.SC_DEPLOY_REASON
             return
@@ -1192,7 +1323,7 @@ pipeline {
         script {
           if (!env.SCENTER_HEALTHCHECK_URL) {
             env.SC_HEALTH_STATUS = 'NOT_CONFIGURED'
-            env.SC_HEALTH_DETAIL = 'SCENTER_HEALTHCHECK_URL n’est pas configuré.'
+            env.SC_HEALTH_DETAIL = 'Aucune URL de health check configurée : Security Delivery → Jenkins → Deployment.'
             echo env.SC_HEALTH_DETAIL
             return
           }

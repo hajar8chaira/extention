@@ -771,5 +771,7 @@ test('le Jenkinsfile exécute l’analyse sur le label du runtime géré, le dé
   assert.match(jenkinsfile, /env\.SC_SOURCE_COMMIT = sh\(returnStdout: true, label: 'Source commit', script: 'git rev-parse HEAD'\)\.trim\(\)/);
   assert.match(jenkinsfile, /try \{\s*unstash 'scenter-ci-report'\s*\} catch \(ignored\)/);
   assert.equal(MANAGED_MARKER.length > 0, true);
-  assert.doesNotMatch(jenkinsfile, /PRIVATE KEY|sshUserPrivateKey|credentialId: 'scenter-runtime-ssh'/, 'aucune clé ni credential SSH dans le pipeline');
+  assert.doesNotMatch(runtime, /sshUserPrivateKey/, 'aucun credential SSH lié par l’analyse sur le runtime');
+  // Seul le Deploy lie un credential SSH : celui du profil de déploiement, par son ID.
+  assert.doesNotMatch(jenkinsfile, /PRIVATE KEY|sshUserPrivateKey\(credentialsId: '|credentialId: 'scenter-runtime-ssh'/, 'aucune clé ni ID de credential SSH écrit dans le pipeline');
 });

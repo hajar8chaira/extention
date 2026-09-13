@@ -48,6 +48,8 @@ const {
 const { renderDeliveryProviderPageHtml } = require('./delivery-provider-view');
 const { configureCiRuntime, normalizeCiRuntimeConfig } = require('./ci-runtime');
 const { renderCiRuntimeCard } = require('./ci-runtime-view');
+const { configureDeployment, normalizeDeploymentConfig, FIELDS: DEPLOYMENT_FIELDS } = require('./deployment');
+const { renderDeploymentCard } = require('./deployment-view');
 const {
   fetchPrometheusStatus, buildPrometheusStatus, normalizePrometheusUrl,
   DEFAULT_OBSERVABILITY_PROVIDER, isSupportedObservabilityProvider, observabilityProvider, observabilityAdapter
@@ -4823,6 +4825,80 @@ async function activate(context) {
     return status;
   }
 
+  // ---------------------------------------------------------------- Deployment
+  // Un profil distinct du runtime CI, même quand l'hôte ou le credential sont
+  // les mêmes : « Docker on remote SSH host ». Seul l'ID du credential Jenkins
+  // est conservé ; le profil est écrit dans le job, jamais une clé ni un jeton.
+  let deploymentStatus = context.workspaceState.get('securityCenter.deployment.status', null);
+  let deploymentRunning = false;
+
+  function deploymentConfiguration() {
+    const stored = vscode.workspace.getConfiguration('securityCenter').get('deployment', {});
+    return stored && typeof stored === 'object' ? stored : {};
+  }
+
+  async function saveDeploymentConfiguration(values = {}) {
+    const checked = normalizeDeploymentConfig(values);
+    if (!checked.valid) return { ok: false, message: checked.errors.join(' ') };
+    const stored = Object.fromEntries([['type', checked.config.type], ...DEPLOYMENT_FIELDS.map((field) => [field, checked.config[field]])]);
+    await vscode.workspace.getConfiguration('securityCenter').update('deployment', stored, vscode.ConfigurationTarget.Workspace);
+    return { ok: true, config: checked.config };
+  }
+
+  /** Validation and job configuration, with an explicit approval of the deployment host key. */
+  async function runDeploymentConfiguration(config) {
+    // L'URL, le job et le jeton d'API viennent de Security Delivery → Jenkins.
+    const jenkinsAuth = await mergedDeliveryConfiguration('jenkins');
+    let approvedHostKey = null;
+    const run = () => vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: 'Security Center — Configure Deployment'
+    }, (progress) => configureDeployment({
+      config,
+      jenkins: { url: jenkinsAuth.url || '', job: jenkinsAuth.job || '' },
+      user: jenkinsAuth.user || '',
+      token: jenkinsAuth.token || '',
+      approvedHostKey,
+      onProgress: (report) => {
+        const current = report.steps.find((step) => step.state === 'pending');
+        if (current) progress.report({ message: `${current.label}…` });
+        deploymentStatus = report;
+        renderDeliveryPage();
+      }
+    }));
+    let status = await run();
+    const approval = status.hostKeyApproval;
+    if (!approval) return status;
+    const changed = approval.change === 'changed';
+    const trust = changed ? 'Trust the new host key' : 'Trust this host key';
+    const decision = await vscode.window.showWarningMessage(
+      changed
+        ? `Security warning: the SSH host key of deployment host ${approval.host} has changed.`
+        : `Trust the SSH host key of deployment host ${approval.host}?`,
+      {
+        modal: true,
+        detail: changed
+          ? [
+            `Previously trusted: ${approval.previousFingerprint}`,
+            `Now presented: ${approval.algorithm} ${approval.fingerprint}`,
+            '',
+            'A reinstalled host or rotated keys explain this, and so does an intercepted connection. Trust the new key only after verifying this fingerprint with the host administrator.'
+          ].join('\n')
+          : [
+            `First SSH connection to ${approval.host}:${approval.port} for deployment.`,
+            `${approval.algorithm} ${approval.fingerprint}`,
+            '',
+            'Jenkins will only deploy to a host presenting exactly this key.'
+          ].join('\n')
+      },
+      trust
+    );
+    if (decision !== trust) return status;
+    approvedHostKey = { algorithm: approval.algorithm, key: approval.key, replaces: approval.previousFingerprint || '' };
+    status = await run();
+    return status;
+  }
+
   function renderDeliveryPage() {
     if (!deliveryPanel) return;
     const selectedProvider = deliveryFormProvider();
@@ -4853,6 +4929,10 @@ async function activate(context) {
         },
         status: ciRuntimeStatus,
         running: ciRuntimeRunning
+      }) + renderDeploymentCard({
+        configuration: deploymentConfiguration(),
+        status: deploymentStatus,
+        running: deploymentRunning
       }) : ''
     }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview)), 'delivery');
   }
@@ -4990,6 +5070,35 @@ async function activate(context) {
             vscode.window.showErrorMessage(`Security Center : CI Runtime — ${error.message}`);
           } finally {
             ciRuntimeRunning = false;
+            renderDeliveryPage();
+          }
+          return;
+        }
+        if (message.action === 'deploymentSave' || message.action === 'deploymentConfigure') {
+          if (deploymentRunning) return;
+          const saved = await saveDeploymentConfiguration(message.values || {});
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          if (message.action === 'deploymentSave') {
+            vscode.window.showInformationMessage('Security Center : Deployment configuration saved.');
+            return void renderDeliveryPage();
+          }
+          deploymentRunning = true;
+          renderDeliveryPage();
+          try {
+            deploymentStatus = await runDeploymentConfiguration(saved.config);
+            await context.workspaceState.update('securityCenter.deployment.status', deploymentStatus);
+            await createAuditEvent(backendBaseUrl(), {
+              scan_id: currentScanId || 0, action: 'scanner.configuration.changed', actor: 'System',
+              comment: `Deployment ${deploymentStatus.ready ? 'configured' : 'not configured'} : ${deploymentStatus.lines.join(' · ')}`,
+              metadata: { integration: 'jenkins-deployment', ready: deploymentStatus.ready }
+            }).catch(() => {});
+            const summary = deploymentStatus.lines.join(' · ');
+            if (deploymentStatus.ready) vscode.window.showInformationMessage(`Security Center : ${summary}`);
+            else vscode.window.showErrorMessage(`Security Center : ${summary}`);
+          } catch (error) {
+            vscode.window.showErrorMessage(`Security Center : Deployment — ${error.message}`);
+          } finally {
+            deploymentRunning = false;
             renderDeliveryPage();
           }
           return;
