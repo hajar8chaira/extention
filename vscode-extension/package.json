@@ -3,7 +3,7 @@
   "displayName": "SCenter — Security Center DevSecOps",
   "icon": "media/branding/secenter-icon-128.png",
   "description": "Unified developer security workspace for SAST, secrets, SCA, DAST, runtime context, delivery evidence and audit workflows.",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "publisher": "ChairaHajar",
   "preview": true,
   "pricing": "Free",
