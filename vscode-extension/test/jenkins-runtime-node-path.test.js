@@ -25,10 +25,17 @@ const PREPARE = JENKINSFILE.slice(JENKINSFILE.indexOf("stage('Prepare CI Runtime
 const ANALYSIS = JENKINSFILE.slice(JENKINSFILE.indexOf("stage('Security Center Analysis')"), JENKINSFILE.indexOf("stage('Policy Gate')"));
 const RESOLVE = /env\.SC_NODE_BIN = sh\(returnStdout: true, label: 'Resolve Node\.js for Security Center', script: '''([\s\S]*?)'''\)\.trim\(\)/.exec(PREPARE)?.[1];
 
+/**
+ * An absolute bash path. The scripts below run with a deliberately minimal PATH,
+ * and spawnSync looks a bare command name up in the *child's* PATH on Linux: a
+ * bare "bash" would not even start there.
+ */
 function bashPath() {
   const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
   if (process.platform === 'win32') return fs.existsSync(gitBash) ? gitBash : null;
-  return 'bash';
+  const found = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' });
+  const located = found.status === 0 ? found.stdout.trim() : '';
+  return path.isAbsolute(located) ? located : null;
 }
 const BASH = bashPath();
 const SKIP = !BASH && 'bash indisponible';
@@ -55,7 +62,10 @@ function managedNodeHome(name) {
 
 /** Runs a script in Git Bash / bash with exactly the given environment (PATH included). */
 function runBash(script, env) {
-  return spawnSync(BASH, ['-c', script], { encoding: 'utf8', env: { SYSTEMROOT: process.env.SYSTEMROOT || '', ...env } });
+  const result = spawnSync(BASH, ['-c', script], { encoding: 'utf8', env: { SYSTEMROOT: process.env.SYSTEMROOT || '', ...env } });
+  // A harness that could not start bash must fail as such, never as "undefined" output.
+  if (result.error) throw new Error(`bash could not start (${BASH}): ${result.error.message}`);
+  return result;
 }
 
 /** Jenkins withEnv PATH+XYZ: each entry is prepended to the inherited PATH. */
