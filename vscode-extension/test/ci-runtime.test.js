@@ -20,6 +20,22 @@ const {
 } = require('../src/ci-runtime');
 const { renderProviderWorkspace, renderDeliveryProviderPageHtml } = require('../src/delivery-provider-view');
 const { renderCiRuntimeCard } = require('../src/ci-runtime-view');
+const crypto = require('crypto');
+const { describeHostKey } = require('../src/ssh-host-key');
+
+const sshString = (value) => {
+  const data = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  return Buffer.concat([length, data]);
+};
+/** A real ed25519 SSH host key, as the runtime host would present it. */
+const ed25519HostKey = () => describeHostKey(Buffer.concat([
+  sshString('ssh-ed25519'),
+  sshString(Buffer.from(crypto.generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }).x, 'base64url'))
+]));
+const HOST_KEY = ed25519HostKey();
+const OTHER_HOST_KEY = ed25519HostKey();
 
 const BASE = 'http://jenkins.internal:8080';
 const TOKEN = '11aabbccddeeff00112233445566778899';
@@ -99,6 +115,9 @@ function run(jenkins, overrides = {}) {
   const progress = [];
   return configureCiRuntime({
     config: CONFIG, user: 'scenter-admin', token: TOKEN, call: jenkins.call,
+    // The host presents HOST_KEY, and the person running onboarding approved it.
+    scanHostKey: async () => HOST_KEY,
+    approvedHostKey: { algorithm: HOST_KEY.algorithm, key: HOST_KEY.key },
     sleep: async (ms) => { clock += ms; }, now: () => clock,
     onProgress: (report) => progress.push(report),
     ...overrides
@@ -147,18 +166,20 @@ test('configuration : seul l’ID du credential est accepté, jamais une clé', 
 
 test('agent SSH géré : hôte, utilisateur via credential, racine, label interne, exclusif, clé d’hôte épinglée', () => {
   const { config } = normalizeCiRuntimeConfig(CONFIG);
-  const xml = agentConfigXml(config, { nodeHome: '/usr' });
+  const xml = agentConfigXml(config, { nodeHome: '/usr', hostKey: HOST_KEY });
   assert.match(xml, new RegExp(`<name>${AGENT_NAME}</name>`));
   assert.match(xml, /<description>Managed by Security Center \(CI Runtime\)\./);
   assert.match(xml, /<remoteFS>\/home\/deploy\/scenter-agent<\/remoteFS>/);
   assert.match(xml, /<mode>EXCLUSIVE<\/mode>/);
   assert.match(xml, new RegExp(`<label>${RUNTIME_LABEL}</label>`));
   assert.match(xml, /<launcher class="hudson\.plugins\.sshslaves\.SSHLauncher">[\s\S]*<host>ci-runtime\.internal<\/host>[\s\S]*<port>22<\/port>[\s\S]*<credentialsId>scenter-runtime-ssh<\/credentialsId>/);
-  assert.match(xml, /ManuallyTrustedKeyVerificationStrategy">\s*<requireInitialManualTrust>false<\/requireInitialManualTrust>/);
-  assert.doesNotMatch(xml, /NonVerifyingKeyVerificationStrategy/, 'jamais de vérification d’hôte désactivée');
+  assert.ok(xml.includes('<sshHostKeyVerificationStrategy class="hudson.plugins.sshslaves.verifiers.ManuallyProvidedKeyVerificationStrategy">'), 'clé d’hôte épinglée');
+  assert.ok(xml.includes('<algorithm>ssh-ed25519</algorithm>') && xml.includes(`<key>${HOST_KEY.key}</key>`));
+  assert.doesNotMatch(xml, /NonVerifyingKeyVerificationStrategy|ManuallyTrustedKeyVerificationStrategy|requireInitialManualTrust/, 'ni vérification désactivée ni confiance au premier contact');
+  assert.throws(() => agentConfigXml(config, { nodeHome: '/usr' }), /approved, pinned SSH host key/);
   assert.match(xml, /<int>3<\/int>\s*<string>SCENTER_CI_RUNTIME<\/string>\s*<string>managed<\/string>\s*<string>SCENTER_HOME<\/string>\s*<string>\/home\/deploy\/scenter-agent\/\.security-center<\/string>\s*<string>SCENTER_NODE_HOME<\/string>\s*<string>\/usr<\/string>/);
   assert.doesNotMatch(xml, /PRIVATE KEY|privateKey|password/i);
-  assert.match(agentConfigXml({ ...config, host: 'a<b>&"c' }), /<host>a&lt;b&gt;&amp;&quot;c<\/host>/, 'valeurs échappées');
+  assert.match(agentConfigXml({ ...config, host: 'a<b>&"c' }, { hostKey: HOST_KEY }), /<host>a&lt;b&gt;&amp;&quot;c<\/host>/, 'valeurs échappées');
 
   const job = checkJobConfigXml();
   assert.match(job, /<sandbox>true<\/sandbox>/);
@@ -202,6 +223,8 @@ test('Configure CI Runtime : agent créé, connecté, Docker et workspace vérif
   }
   const [firstWrite, finalWrite] = [jenkins.state.nodeWrites[0], jenkins.state.nodeWrites[jenkins.state.nodeWrites.length - 1]];
   assert.match(firstWrite, /<credentialsId>scenter-runtime-ssh<\/credentialsId>/);
+  assert.ok(firstWrite.includes(`<key>${HOST_KEY.key}</key>`), 'la clé d’hôte approuvée est épinglée dès la première écriture');
+  assert.equal(report.hostKeyApproval, null);
   assert.doesNotMatch(firstWrite, /SCENTER_NODE_HOME/, 'Node.js n’est pas deviné avant la vérification');
   assert.match(finalWrite, /<string>SCENTER_NODE_HOME<\/string>\s*<string>\/usr<\/string>/, 'Node.js détecté enregistré sur l’agent');
   assert.match(jenkins.state.jobXml, /<sandbox>true<\/sandbox>/);
@@ -210,8 +233,9 @@ test('Configure CI Runtime : agent créé, connecté, Docker et workspace vérif
 
 test('mise à jour idempotente : agent et job gérés réécrits, jamais recréés', async () => {
   const { config } = normalizeCiRuntimeConfig(CONFIG);
-  const jenkins = fakeJenkins({ existingNode: agentConfigXml(config, { nodeHome: '/usr' }), existingJob: checkJobConfigXml() });
-  const { report } = await run(jenkins);
+  const jenkins = fakeJenkins({ existingNode: agentConfigXml(config, { nodeHome: '/usr', hostKey: HOST_KEY }), existingJob: checkJobConfigXml() });
+  // Clé déjà épinglée et inchangée : aucune nouvelle approbation n'est demandée.
+  const { report } = await run(jenkins, { approvedHostKey: null });
   assert.equal(report.ready, true, report.lines.join(' | '));
   const posts = jenkins.posts().map((entry) => entry.path);
   assert.ok(!posts.includes('/computer/doCreateItem'), 'aucune création d’agent');
@@ -248,7 +272,8 @@ test('authentification SSH refusée : SSH en échec avec la cause, aucun build d
     launchLog: '[09/13/26 10:00:01] [SSH] Opening SSH connection to ci-runtime.internal:22.\nERROR: Server rejected the 1 private key(s) for deploy (credentialId:scenter-runtime-ssh/method:publickey)\n[09/13/26 10:00:02] [SSH] Authentication failed.'
   });
   const { report } = await run(jenkins);
-  assert.deepEqual(report.lines, ['Jenkins: Connected', 'SSH: Not connected', 'Docker: Not checked', 'CI Runtime: Not checked']);
+  assert.deepEqual(report.lines, ['Jenkins: Connected', 'SSH: Authentication failed', 'Docker: Not checked', 'CI Runtime: Not checked']);
+  assert.ok(report.steps[1].detail.startsWith('Credential failure, not a host trust problem'), report.steps[1].detail);
   assert.match(report.steps[1].detail, /SSH authentication failed for user "deploy" with credential "scenter-runtime-ssh"/);
   assert.doesNotMatch(report.steps[1].detail, /Server rejected|10:00:01/, 'le journal brut n’est pas recopié');
   assert.ok(!jenkins.posts().some((entry) => entry.path.endsWith('/build')), 'aucun build lancé');
@@ -303,6 +328,85 @@ test('plugin SSH Build Agents absent : SSH en échec précis', async () => {
   const { report } = await run(fakeJenkins({ plugins: ['workflow-job', 'workflow-cps'] }));
   assert.equal(report.steps[1].summary, 'SSH agents unavailable');
   assert.match(report.steps[1].detail, /SSH Build Agents/);
+});
+
+// ------------------------------------------------------------ clé d'hôte SSH
+
+test('premier contact : l’empreinte est présentée pour approbation, rien n’est écrit ni connecté avant', async () => {
+  const jenkins = fakeJenkins();
+  const scanned = [];
+  const { report } = await run(jenkins, { approvedHostKey: null, scanHostKey: async (target) => { scanned.push(target); return HOST_KEY; } });
+  assert.deepEqual(report.lines, ['Jenkins: Connected', 'SSH: Host key approval required', 'Docker: Not checked', 'CI Runtime: Not checked']);
+  assert.deepEqual(scanned, [{ host: CONFIG.host, port: 22, timeoutMs: 10000 }]);
+  assert.deepEqual(report.hostKeyApproval, {
+    change: 'new', host: CONFIG.host, port: '22', algorithm: 'ssh-ed25519', key: HOST_KEY.key, fingerprint: HOST_KEY.fingerprint, previousFingerprint: ''
+  });
+  assert.ok(report.steps[1].detail.includes(`Confirm its host key before Jenkins trusts it: ssh-ed25519 ${HOST_KEY.fingerprint}.`), report.steps[1].detail);
+  assert.equal(jenkins.posts().length, 0, 'aucun agent créé ni connecté avant approbation');
+
+  const stale = fakeJenkins();
+  const other = await run(stale, { approvedHostKey: { algorithm: OTHER_HOST_KEY.algorithm, key: OTHER_HOST_KEY.key } });
+  assert.equal(other.report.steps[1].summary, 'Host key approval required', 'l’approbation d’une autre clé ne vaut rien');
+  assert.equal(other.report.hostKeyApproval.fingerprint, HOST_KEY.fingerprint);
+  assert.equal(stale.posts().length, 0);
+});
+
+test('clé d’hôte modifiée : avertissement de sécurité, jamais acceptée d’office, ré-approbation liée à l’ancienne clé', async () => {
+  const { config } = normalizeCiRuntimeConfig(CONFIG);
+  const pinnedNode = agentConfigXml(config, { nodeHome: '/usr', hostKey: OTHER_HOST_KEY });
+
+  const refused = fakeJenkins({ existingNode: pinnedNode });
+  const { report } = await run(refused, { approvedHostKey: null });
+  assert.deepEqual(report.lines, ['Jenkins: Connected', 'SSH: Host key changed', 'Docker: Not checked', 'CI Runtime: Not checked']);
+  assert.ok(report.steps[1].detail.startsWith('SECURITY WARNING: ci-runtime.internal:22 now presents'), report.steps[1].detail);
+  assert.ok(report.steps[1].detail.includes(OTHER_HOST_KEY.fingerprint) && report.steps[1].detail.includes(HOST_KEY.fingerprint));
+  assert.deepEqual(report.hostKeyApproval, {
+    change: 'changed', host: CONFIG.host, port: '22', algorithm: 'ssh-ed25519', key: HOST_KEY.key, fingerprint: HOST_KEY.fingerprint, previousFingerprint: OTHER_HOST_KEY.fingerprint
+  });
+  assert.equal(refused.posts().length, 0, 'le nœud géré garde la clé épinglée');
+
+  const unbound = fakeJenkins({ existingNode: pinnedNode });
+  const blind = await run(unbound, { approvedHostKey: { algorithm: HOST_KEY.algorithm, key: HOST_KEY.key } });
+  assert.equal(blind.report.steps[1].summary, 'Host key changed', 'approuver la nouvelle clé sans nommer celle qu’elle remplace ne suffit pas');
+  assert.equal(unbound.posts().length, 0);
+
+  const approved = fakeJenkins({ existingNode: pinnedNode });
+  const renewed = await run(approved, { approvedHostKey: { algorithm: HOST_KEY.algorithm, key: HOST_KEY.key, replaces: OTHER_HOST_KEY.fingerprint } });
+  assert.equal(renewed.report.ready, true, renewed.report.lines.join(' | '));
+  assert.ok(approved.state.nodeXml.includes(`<key>${HOST_KEY.key}</key>`) && !approved.state.nodeXml.includes(OTHER_HOST_KEY.key), 'nouvelle clé épinglée');
+  assert.ok(!approved.posts().some((entry) => entry.path === '/computer/doCreateItem'), 'seul le nœud géré existant est modifié');
+});
+
+test('confiance d’hôte refusée par Jenkins distincte d’un credential refusé', async () => {
+  const hostTrust = await run(fakeJenkins({
+    connects: false,
+    launchLog: ['[SSH] Opening SSH connection to ci-runtime.internal:22.', '[SSH] WARNING: The SSH key presented by the remote host does not match the key saved for this host. Connections will be denied until this new key is authorised.'].join('\n')
+  }));
+  assert.equal(hostTrust.report.steps[1].summary, 'Host key mismatch');
+  assert.ok(hostTrust.report.steps[1].detail.startsWith('Remote host trust failure, not a credential problem'), hostTrust.report.steps[1].detail);
+  assert.ok(hostTrust.report.steps[1].detail.includes(HOST_KEY.fingerprint));
+  assert.doesNotMatch(hostTrust.report.steps[1].detail, /authentication failed/i);
+
+  const credential = await run(fakeJenkins({
+    connects: false,
+    launchLog: ['[SSH] SSH host key matches key seen previously for this host. Connection will be allowed.', 'ERROR: Server rejected the 1 private key(s) for deploy (credentialId:vm-deploy-key/method:publickey)', '[SSH] Authentication failed.'].join('\n')
+  }));
+  assert.equal(credential.report.steps[1].summary, 'Authentication failed', 'une clé d’hôte acceptée n’est pas un échec de confiance');
+  assert.ok(credential.report.steps[1].detail.startsWith('Credential failure, not a host trust problem'));
+
+  const java = await run(fakeJenkins({
+    connects: false,
+    launchLog: ['[SSH] SSH host key matches key seen previously for this host. Connection will be allowed.', '[SSH] Checking java version of java', 'Java not found on hudson.slaves.SlaveComputer'].join('\n')
+  }));
+  assert.equal(java.report.steps[1].summary, 'Java missing', 'un « host key matches » dans le journal ne masque pas la vraie cause');
+});
+
+test('clé d’hôte illisible : SSH en échec précis, aucun agent écrit', async () => {
+  const jenkins = fakeJenkins();
+  const { report } = await run(jenkins, { scanHostKey: async () => { throw new Error('connection refused on ci-runtime.internal:22'); } });
+  assert.equal(report.steps[1].summary, 'Host key unavailable');
+  assert.match(report.steps[1].detail, /could not read the SSH host key of ci-runtime\.internal:22 \(connection refused on ci-runtime\.internal:22\)/);
+  assert.equal(jenkins.posts().length, 0);
 });
 
 // ------------------------------------------------------------ UX

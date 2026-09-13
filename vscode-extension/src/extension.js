@@ -4813,13 +4813,14 @@ async function activate(context) {
           try {
             // Le jeton d'API Jenkins reste dans SecretStorage (Security Delivery → Jenkins).
             const jenkinsAuth = await mergedDeliveryConfiguration('jenkins');
-            ciRuntimeStatus = await vscode.window.withProgress({
+            const onboard = (approvedHostKey) => vscode.window.withProgress({
               location: vscode.ProgressLocation.Notification,
               title: 'Security Center — Configure CI Runtime'
             }, (progress) => configureCiRuntime({
               config: saved.config,
               user: jenkinsAuth.user || '',
               token: jenkinsAuth.token || '',
+              approvedHostKey,
               onProgress: (report) => {
                 const current = report.steps.find((step) => step.state === 'pending');
                 if (current) progress.report({ message: `${current.label}…` });
@@ -4827,6 +4828,40 @@ async function activate(context) {
                 renderDeliveryPage();
               }
             }));
+            ciRuntimeStatus = await onboard(null);
+            // La clé d'hôte SSH n'est jamais acceptée d'office : son empreinte est
+            // présentée pour approbation explicite, et un changement de clé est un
+            // avertissement de sécurité. Une approbation relance l'onboarding une fois.
+            const approval = ciRuntimeStatus.hostKeyApproval;
+            if (approval) {
+              const changed = approval.change === 'changed';
+              const trust = changed ? 'Trust the new host key' : 'Trust this host key';
+              const decision = await vscode.window.showWarningMessage(
+                changed
+                  ? `Security warning: the SSH host key of ${approval.host} has changed.`
+                  : `Trust the SSH host key of ${approval.host}?`,
+                {
+                  modal: true,
+                  detail: changed
+                    ? [
+                      `Previously trusted: ${approval.previousFingerprint}`,
+                      `Now presented: ${approval.algorithm} ${approval.fingerprint}`,
+                      '',
+                      'A reinstalled host or rotated keys explain this, and so does an intercepted connection. Trust the new key only after verifying this fingerprint with the host administrator.'
+                    ].join('\n')
+                    : [
+                      `First SSH connection to ${approval.host}:${approval.port}.`,
+                      `${approval.algorithm} ${approval.fingerprint}`,
+                      '',
+                      'Jenkins will only connect to a host presenting exactly this key.'
+                    ].join('\n')
+                },
+                trust
+              );
+              if (decision === trust) {
+                ciRuntimeStatus = await onboard({ algorithm: approval.algorithm, key: approval.key, replaces: approval.previousFingerprint || '' });
+              }
+            }
             await context.workspaceState.update('securityCenter.ciRuntime.status', ciRuntimeStatus);
             await createAuditEvent(backendBaseUrl(), {
               scan_id: currentScanId || 0, action: 'scanner.configuration.changed', actor: 'System',

@@ -63,8 +63,8 @@ const HANDLER = extract("if (message.action === 'ciRuntimeSave' || message.actio
 const SAVE = extract('async function saveCiRuntimeConfiguration(values = {})');
 
 /** The real handler and save function, with VS Code and their collaborators replaced. */
-function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scenter-admin', token: TOKEN }, onboarding = () => READY } = {}) {
-  const calls = { configure: [], jenkinsConfig: [], settings: [], workspaceState: [], info: [], error: [], progress: [], audit: [], renders: 0 };
+function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scenter-admin', token: TOKEN }, onboarding = () => READY, answer = undefined } = {}) {
+  const calls = { configure: [], jenkinsConfig: [], settings: [], workspaceState: [], info: [], error: [], warning: [], progress: [], audit: [], renders: 0 };
   const settings = {};
   const vscode = {
     ConfigurationTarget: { Workspace: 2 },
@@ -78,6 +78,7 @@ function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scent
     window: {
       showInformationMessage: async (message) => { calls.info.push(message); },
       showErrorMessage: async (message) => { calls.error.push(message); },
+      showWarningMessage: async (message, options, ...items) => { calls.warning.push({ message, options, items }); return answer; },
       withProgress: async (_options, task) => task({ report: (value) => calls.progress.push(value) }, { isCancellationRequested: false })
     }
   };
@@ -201,4 +202,43 @@ test('failure is surfaced cleanly: not ready, thrown error, invalid form, second
   release(READY);
   await first;
   assert.deepEqual(busy.state(), { ciRuntimeStatus: READY, ciRuntimeRunning: false });
+});
+
+test('SSH host key: fingerprint shown for explicit approval, onboarding re-runs pinned; a changed key is a security warning', async () => {
+  const NEW_KEY = { change: 'new', host: '192.168.222.132', port: '22', algorithm: 'ssh-ed25519', key: 'AAAAC3NzaC1lZDI1NTE5AAAAIHostKeyBlobForTest', fingerprint: 'SHA256:newHostKeyFingerprint', previousFingerprint: '' };
+  const APPROVAL = { ...report(false, ['Connected', 'Host key approval required', 'Not checked', 'Not checked']), hostKeyApproval: NEW_KEY };
+
+  const approved = harness({ answer: 'Trust this host key', onboarding: (options) => (options.approvedHostKey ? READY : APPROVAL) });
+  await approved.handle(CONFIGURE);
+  assert.equal(approved.calls.warning.length, 1);
+  const [prompt] = approved.calls.warning;
+  assert.equal(prompt.message, 'Trust the SSH host key of 192.168.222.132?');
+  assert.equal(prompt.options.modal, true, 'explicit confirmation, not a toast');
+  assert.ok(prompt.options.detail.includes('ssh-ed25519 SHA256:newHostKeyFingerprint'), prompt.options.detail);
+  assert.deepEqual(prompt.items, ['Trust this host key']);
+  assert.deepEqual(approved.calls.configure.map((options) => options.approvedHostKey), [null, { algorithm: 'ssh-ed25519', key: NEW_KEY.key, replaces: '' }]);
+  assert.deepEqual(approved.calls.info, ['Security Center : Jenkins: Connected · SSH: Ready · Docker: Ready · CI Runtime: Ready']);
+  assert.deepEqual(approved.state(), { ciRuntimeStatus: READY, ciRuntimeRunning: false });
+
+  const declined = harness({ answer: undefined, onboarding: () => APPROVAL });
+  await declined.handle(CONFIGURE);
+  assert.equal(declined.calls.configure.length, 1, 'nothing is trusted without approval');
+  assert.deepEqual(declined.calls.error, ['Security Center : Jenkins: Connected · SSH: Host key approval required · Docker: Not checked · CI Runtime: Not checked']);
+
+  const CHANGED_KEY = { ...NEW_KEY, change: 'changed', previousFingerprint: 'SHA256:previouslyPinnedFingerprint' };
+  const CHANGED = { ...report(false, ['Connected', 'Host key changed', 'Not checked', 'Not checked']), hostKeyApproval: CHANGED_KEY };
+  const rotated = harness({ answer: 'Trust the new host key', onboarding: (options) => (options.approvedHostKey ? READY : CHANGED) });
+  await rotated.handle(CONFIGURE);
+  const [warning] = rotated.calls.warning;
+  assert.equal(warning.message, 'Security warning: the SSH host key of 192.168.222.132 has changed.');
+  assert.ok(warning.options.detail.includes('Previously trusted: SHA256:previouslyPinnedFingerprint'), warning.options.detail);
+  assert.ok(warning.options.detail.includes('Now presented: ssh-ed25519 SHA256:newHostKeyFingerprint'));
+  assert.deepEqual(warning.items, ['Trust the new host key']);
+  assert.deepEqual(rotated.calls.configure[1].approvedHostKey, { algorithm: 'ssh-ed25519', key: NEW_KEY.key, replaces: 'SHA256:previouslyPinnedFingerprint' });
+
+  const again = harness({ answer: 'Trust this host key', onboarding: () => APPROVAL });
+  await again.handle(CONFIGURE);
+  assert.equal(again.calls.warning.length, 1, 'one approval prompt per click, never a loop');
+  assert.equal(again.calls.configure.length, 2);
+  assert.equal(again.calls.error.length, 1);
 });

@@ -78,13 +78,19 @@ Security Delivery) to:
 
 1. check the Jenkins connection, the job and the Pipeline / SSH Build Agents plugins;
 2. check that the credential exists and is an SSH key (its secret is never read);
-3. create or update the SSH agent `scenter-ci-runtime` (label `scenter-ci-runtime`,
-   exclusive, remote root `/home/<ssh user>/scenter-agent` by default, host key
-   trusted on first connection);
-4. connect it;
-5. run the managed check job `scenter-ci-runtime-check` on that label: SSH user,
+3. read the SSH host key the runtime host presents (key exchange only, server
+   signature verified) and show its fingerprint for explicit approval; a key that
+   differs from the one already pinned is a security warning that needs
+   re-approval, never accepted automatically;
+4. create or update the SSH agent `scenter-ci-runtime` (label `scenter-ci-runtime`,
+   exclusive, remote root `/home/<ssh user>/scenter-agent` by default) with that
+   approved host key pinned: no trust-on-first-use, no non-verifying strategy;
+5. connect it;
+6. run the managed check job `scenter-ci-runtime-check` on that label: SSH user,
    writable workspace, git, Node.js 20+ and `docker info`;
-6. report `Jenkins`, `SSH`, `Docker` and `CI Runtime`, each Ready or with the reason.
+7. report `Jenkins`, `SSH`, `Docker` and `CI Runtime`, each Ready or with the reason.
+   A refused host key (remote host trust) and a refused credential
+   (authentication) are reported as different failures.
 
 The private key stays in Jenkins Credentials: Security Center stores only the
 credential ID. A node or job with those names that Security Center did not create

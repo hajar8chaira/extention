@@ -24,6 +24,7 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 const { normalizeJenkinsUrl, jenkinsJobPath, scrubJenkinsError } = require('./jenkins');
+const { scanSshHostKey, describeHostKey } = require('./ssh-host-key');
 
 const RUNTIME_LABEL = 'scenter-ci-runtime';
 const AGENT_NAME = 'scenter-ci-runtime';
@@ -96,12 +97,14 @@ function unxml(value) {
 
 /**
  * The managed SSH agent, as Jenkins stores it. Exclusive mode: it only runs
- * builds that ask for the Security Center label. The host key is trusted on
- * first connection and pinned afterwards. SCENTER_HOME (and SCENTER_NODE_HOME
+ * builds that ask for the Security Center label. Jenkins only connects to a host
+ * presenting exactly the explicitly approved host key, pinned here: never trust on
+ * first use, never a non-verifying strategy. SCENTER_HOME (and SCENTER_NODE_HOME
  * once detected) travel as node environment variables, so the Jenkinsfile needs
  * no host-specific path.
  */
-function agentConfigXml(config, { nodeHome = '' } = {}) {
+function agentConfigXml(config, { nodeHome = '', hostKey = null } = {}) {
+  if (!hostKey?.algorithm || !hostKey?.key) throw new Error('The managed agent is only written with an approved, pinned SSH host key.');
   const environment = [
     ['SCENTER_CI_RUNTIME', 'managed'],
     ['SCENTER_HOME', `${config.remoteRoot}/.security-center`],
@@ -122,8 +125,11 @@ function agentConfigXml(config, { nodeHome = '' } = {}) {
     <launchTimeoutSeconds>60</launchTimeoutSeconds>
     <maxNumRetries>3</maxNumRetries>
     <retryWaitTime>15</retryWaitTime>
-    <sshHostKeyVerificationStrategy class="hudson.plugins.sshslaves.verifiers.ManuallyTrustedKeyVerificationStrategy">
-      <requireInitialManualTrust>false</requireInitialManualTrust>
+    <sshHostKeyVerificationStrategy class="hudson.plugins.sshslaves.verifiers.ManuallyProvidedKeyVerificationStrategy">
+      <key>
+        <algorithm>${xml(hostKey.algorithm)}</algorithm>
+        <key>${xml(hostKey.key)}</key>
+      </key>
     </sshHostKeyVerificationStrategy>
   </launcher>
   <label>${RUNTIME_LABEL}</label>
@@ -283,22 +289,61 @@ function httpProblem(response, what) {
   return `Jenkins answered HTTP ${response.status} while trying to ${what}.`;
 }
 
-/** Why the SSH agent did not come online, from the agent log, without quoting it. */
-function sshFailureReason(log, config) {
+/**
+ * Why the SSH agent did not come online, from the agent log, without quoting it.
+ * A remote host trust failure and a credential failure are different facts: only
+ * an explicit refusal of the host key counts as the first — the SSH plugin also
+ * logs "host key matches" on a connection whose authentication then fails.
+ */
+function sshConnectionFailure(log, config, pin) {
   const text = String(log || '');
-  if (/authentication failed|server rejected|publickey|auth fail/i.test(text)) {
-    return `SSH authentication failed for user "${config.sshUser}" with credential "${config.credentialId}". The credential's public key must be authorized for ${config.sshUser} on ${config.host}.`;
+  if (/connections will be denied|does not match the key|not currently trusted|not previously been seen|host key verification failed|host ?key (?:was )?(?:rejected|refused|denied)/i.test(text)) {
+    return {
+      summary: 'Host key mismatch',
+      detail: `Remote host trust failure, not a credential problem: Jenkins refused the SSH host key presented to it by ${config.host}:${config.port}, which is not the approved ${pin.algorithm} ${pin.fingerprint}. Jenkins may be reaching a different or intercepted host. Nothing was trusted.`
+    };
   }
-  if (/host key|hostkey|not trusted|key verification/i.test(text)) {
-    return `The SSH host key of ${config.host} was refused. If the host was reinstalled, clear the trusted key of agent ${AGENT_NAME} in Jenkins.`;
+  if (/authentication failed|server rejected the \d+ private key|auth fail|permission denied \(publickey/i.test(text)) {
+    return {
+      summary: 'Authentication failed',
+      detail: `Credential failure, not a host trust problem: the host key of ${config.host} is trusted, but SSH authentication failed for user "${config.sshUser}" with credential "${config.credentialId}". The credential's public key must be authorized for ${config.sshUser} on ${config.host}.`
+    };
   }
   if (/connection refused|timed out|no route to host|unknownhost|unresolved|could not resolve/i.test(text)) {
-    return `Jenkins cannot reach ${config.host}:${config.port} over SSH.`;
+    return { summary: 'Host unreachable', detail: `Jenkins cannot reach ${config.host}:${config.port} over SSH.` };
   }
-  if (/java/i.test(text) && /not found|no such file|unable to find|cannot find|could not find/i.test(text)) {
-    return `Java is not installed on ${config.host}: Jenkins SSH agents need Java 17 or later on the runtime host.`;
+  if (/java/i.test(text) && /not found|no such file|unable to find|cannot find|could not find|couldn't figure out/i.test(text)) {
+    return { summary: 'Java missing', detail: `Java is not installed on ${config.host}: Jenkins SSH agents need Java 17 or later on the runtime host.` };
   }
-  return `Jenkins could not start agent ${AGENT_NAME} on ${config.host}. The agent log in Jenkins has the details.`;
+  return { summary: 'Not connected', detail: `Jenkins could not start agent ${AGENT_NAME} on ${config.host}. The agent log in Jenkins has the details.` };
+}
+
+/** The host key pinned on the managed agent for this host and port, if any. */
+function pinnedHostKey(configXml, config) {
+  const text = String(configXml || '');
+  const host = unxml(/<host>([^<]*)<\/host>/.exec(text)?.[1] ?? '');
+  const port = /<port>(\d+)<\/port>/.exec(text)?.[1] || '22';
+  if (host !== config.host || Number(port) !== Number(config.port)) return null;
+  const block = /ManuallyProvidedKeyVerificationStrategy"\s*>\s*<key>\s*<algorithm>([^<]+)<\/algorithm>\s*<key>([^<]+)<\/key>/.exec(text);
+  if (!block) return null;
+  try {
+    const described = describeHostKey(unxml(block[2]).replace(/\s+/g, ''));
+    return described.algorithm === unxml(block[1]).trim() ? described : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A host key a person approved, re-validated: its fingerprint is recomputed, never taken as given. */
+function acceptedApproval(input) {
+  if (!input?.key) return null;
+  try {
+    const described = describeHostKey(String(input.key));
+    if (input.algorithm && input.algorithm !== described.algorithm) return null;
+    return { ...described, replaces: String(input.replaces || '') };
+  } catch {
+    return null;
+  }
 }
 
 function existingNodeHome(configXml, host) {
@@ -328,24 +373,29 @@ async function poll(read, done, { sleep, now, timeoutMs, intervalMs }) {
  */
 async function configureCiRuntime({
   config: input = {}, user = '', token = '', call = jenkinsCall,
+  approvedHostKey = null, scanHostKey = scanSshHostKey,
   sleep = defaultSleep, now = Date.now, timeouts = {}, onProgress = () => {}
 } = {}) {
-  const limits = { requestMs: 15000, connectMs: 180000, queueMs: 300000, buildMs: 600000, pollMs: 3000, ...timeouts };
+  const limits = { requestMs: 15000, hostKeyMs: 10000, connectMs: 180000, queueMs: 300000, buildMs: 600000, pollMs: 3000, ...timeouts };
   const steps = CI_RUNTIME_STEPS.map((step) => ({ id: step.id, label: step.label, state: STEP_STATE.PENDING, summary: 'Not checked', detail: '' }));
   const byId = Object.fromEntries(steps.map((step) => [step.id, step]));
+  let extras = {};
   const report = () => ({
     ready: steps.every((step) => step.state === STEP_STATE.READY),
     steps: steps.map((step) => ({ ...step })),
     lines: steps.map((step) => `${step.label}: ${step.summary}`),
     agentName: AGENT_NAME,
     label: RUNTIME_LABEL,
+    // A host key waiting for explicit approval: public data, shown as a fingerprint.
+    hostKeyApproval: extras.hostKeyApproval || null,
     checkedAt: new Date(now()).toISOString()
   });
   const set = (id, state, summary, detail = '') => {
     Object.assign(byId[id], { state, summary, detail });
     onProgress(report());
   };
-  const stop = (id, summary, detail) => {
+  const stop = (id, summary, detail, extra = {}) => {
+    extras = { ...extras, ...extra };
     set(id, STEP_STATE.FAILED, summary, detail);
     for (const step of steps.slice(steps.indexOf(byId[id]) + 1)) {
       if (step.state === STEP_STATE.PENDING) Object.assign(step, { state: STEP_STATE.SKIPPED, summary: 'Not checked', detail: `Waiting for ${byId[id].label}.` });
@@ -399,21 +449,48 @@ async function configureCiRuntime({
 
   const nodePath = `computer/${encodeURIComponent(AGENT_NAME)}`;
   const existing = await attempt(() => jenkins.get(`${nodePath}/config.xml`));
-  let nodeHome = '';
-  if (existing.status === 200) {
-    if (!existing.text.includes(MANAGED_MARKER)) {
-      return stop('ssh', 'Name in use', `A Jenkins node named "${AGENT_NAME}" exists but was not created by Security Center. It is never overwritten: rename or remove it in Jenkins.`);
-    }
-    nodeHome = existingNodeHome(existing.text, config.host);
-  } else if (existing.status === 404) {
+  if (existing.status === 200 && !existing.text.includes(MANAGED_MARKER)) {
+    return stop('ssh', 'Name in use', `A Jenkins node named "${AGENT_NAME}" exists but was not created by Security Center. It is never overwritten: rename or remove it in Jenkins.`);
+  }
+  if (existing.status !== 200 && existing.status !== 404) {
+    return stop('ssh', 'Agent unavailable', existing.error || httpProblem(existing, 'read agents'));
+  }
+  let nodeHome = existing.status === 200 ? existingNodeHome(existing.text, config.host) : '';
+
+  // Remote host trust comes before any connection: the key the host presents is
+  // compared with the one pinned on the managed agent. A key nobody approved is
+  // never pinned, and a changed key is a security warning, never accepted.
+  let presented;
+  try {
+    presented = await scanHostKey({ host: config.host, port: Number(config.port), timeoutMs: limits.hostKeyMs });
+  } catch (error) {
+    return stop('ssh', 'Host key unavailable', `Security Center could not read the SSH host key of ${config.host}:${config.port} (${safeFact(error.message)}). It is read and approved before Jenkins connects.`);
+  }
+  const pinned = existing.status === 200 ? pinnedHostKey(existing.text, config) : null;
+  const approval = acceptedApproval(approvedHostKey);
+  const sameKey = (a, b) => Boolean(a && b && a.algorithm === b.algorithm && a.key === b.key);
+  let pin = null;
+  if (pinned && sameKey(pinned, presented)) pin = pinned;
+  else if (!pinned && sameKey(approval, presented) && !approval.replaces) pin = presented;
+  else if (pinned && sameKey(approval, presented) && approval.replaces === pinned.fingerprint) pin = presented;
+  if (!pin) {
+    const hostKeyApproval = {
+      change: pinned ? 'changed' : 'new', host: config.host, port: config.port,
+      algorithm: presented.algorithm, key: presented.key, fingerprint: presented.fingerprint,
+      previousFingerprint: pinned ? pinned.fingerprint : ''
+    };
+    return pinned
+      ? stop('ssh', 'Host key changed', `SECURITY WARNING: ${config.host}:${config.port} now presents ${presented.algorithm} ${presented.fingerprint}, but the managed agent trusts ${pinned.algorithm} ${pinned.fingerprint}. A reinstalled host or rotated keys explain this, and so does an intercepted connection. Jenkins will not connect until the new key is explicitly approved.`, { hostKeyApproval })
+      : stop('ssh', 'Host key approval required', `First SSH connection to ${config.host}:${config.port}. Confirm its host key before Jenkins trusts it: ${presented.algorithm} ${presented.fingerprint}.`, { hostKeyApproval });
+  }
+
+  if (existing.status === 404) {
     const created = await attempt(() => jenkins.post(`computer/doCreateItem?name=${encodeURIComponent(AGENT_NAME)}&type=hudson.slaves.DumbSlave`, {
       body: formBody({ name: AGENT_NAME, type: 'hudson.slaves.DumbSlave', json: JSON.stringify(createNodeJson(config)) })
     }));
     if (created.error || created.status >= 400) return stop('ssh', 'Agent not created', created.error || httpProblem(created, 'create agents (Agent/Create)'));
-  } else {
-    return stop('ssh', 'Agent unavailable', existing.error || httpProblem(existing, 'read agents'));
   }
-  const written = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome }), contentType: 'application/xml' }));
+  const written = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome, hostKey: pin }), contentType: 'application/xml' }));
   if (written.error || written.status >= 400) return stop('ssh', 'Agent not configured', written.error || httpProblem(written, 'configure agents (Agent/Configure)'));
 
   const nodeStatus = async () => {
@@ -434,9 +511,10 @@ async function configureCiRuntime({
   }
   if (computer.offline) {
     const log = await attempt(() => jenkins.get(`${nodePath}/logText/progressiveText?start=0`, { maxBytes: 256 * 1024 }));
-    return stop('ssh', 'Not connected', sshFailureReason(log.text, config));
+    const failure = sshConnectionFailure(log.text, config, pin);
+    return stop('ssh', failure.summary, failure.detail);
   }
-  set('ssh', STEP_STATE.READY, 'Ready', `Agent ${AGENT_NAME} online on ${config.host} with credential ${config.credentialId}.`);
+  set('ssh', STEP_STATE.READY, 'Ready', `Agent ${AGENT_NAME} online on ${config.host} with credential ${config.credentialId}; host key ${pin.algorithm} ${pin.fingerprint} pinned.`);
 
   // ------------------------------------------------------------ 3-4. Docker and workspace, from a real build
   set('docker', STEP_STATE.PENDING, 'Checking');
@@ -499,7 +577,7 @@ async function configureCiRuntime({
   else {
     const detectedHome = path.posix.dirname(path.posix.dirname(node[2]));
     if (detectedHome !== nodeHome) {
-      const updated = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome: detectedHome }), contentType: 'application/xml' }));
+      const updated = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome: detectedHome, hostKey: pin }), contentType: 'application/xml' }));
       if (updated.error || updated.status >= 400) problems.push(`SCENTER_NODE_HOME could not be recorded on the agent (${updated.error || `HTTP ${updated.status}`})`);
       else nodeHome = detectedHome;
     }
@@ -514,6 +592,6 @@ async function configureCiRuntime({
 
 module.exports = {
   RUNTIME_LABEL, AGENT_NAME, CHECK_JOB, MANAGED_MARKER, MIN_NODE_MAJOR, STEP_STATE, CI_RUNTIME_STEPS,
-  normalizeCiRuntimeConfig, agentConfigXml, checkJobConfigXml, parseCheckOutput, sshFailureReason,
+  normalizeCiRuntimeConfig, agentConfigXml, checkJobConfigXml, parseCheckOutput, sshConnectionFailure, pinnedHostKey,
   configureCiRuntime, jenkinsCall
 };
