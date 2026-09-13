@@ -84,7 +84,7 @@ function manifestFor(pkg, tgzUrl, label) {
 }
 
 /** Runs the real bootstrap asynchronously, so the local servers keep answering. */
-function runBootstrap(toolsDir, env = {}, { killAfterPhase = null } = {}) {
+function runBootstrap(toolsDir, env = {}, { killAfterPhase = null, onOutput = null } = {}) {
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SCENTER_')));
   return new Promise((resolve) => {
     const started = Date.now();
@@ -98,6 +98,7 @@ function runBootstrap(toolsDir, env = {}, { killAfterPhase = null } = {}) {
     let output = '';
     const onData = (chunk) => {
       output += chunk;
+      if (onOutput) onOutput(output);
       if (killAfterPhase && output.includes(killAfterPhase) && !child.killed) child.kill('SIGKILL');
     };
     child.stdout.on('data', onData);
@@ -294,13 +295,105 @@ test('D — verrou détenu par un autre bootstrap vivant : attente journalisée 
   const tools = path.join(root, 'tools-d');
   fs.mkdirSync(lockDir(tools), { recursive: true });
   // Un détenteur sur un autre agent : son processus ne peut pas être vérifié ici.
-  fs.writeFileSync(path.join(lockDir(tools), 'owner'), `pid=4242 host=other-agent started=${Math.floor(Date.now() / 1000)} build=jenkins-security-pipeline-7`);
+  const record = `pid=4242 host=other-agent started=${Math.floor(Date.now() / 1000)} build=jenkins-security-pipeline-7`;
+  fs.writeFileSync(path.join(lockDir(tools), 'owner'), record);
   const result = await runBootstrap(tools, { SCENTER_ENGINE_TGZ_URL: 'http://127.0.0.1:9/x.tgz', SCENTER_ENGINE_SHA256: v1.sha });
   assert.equal(result.status, 2, result.output);
   assert.match(result.output, /waiting for install lock held by pid 4242 on other-agent, build jenkins-security-pipeline-7 \(0s of 4s\)/);
   assert.match(result.output, /ERROR during 'acquiring install lock .+': install lock still held after 4s: .+\.bootstrap\.lock \(pid 4242 on other-agent, build jenkins-security-pipeline-7\)\. If no Security Center build is running, remove that directory\./);
   assert.ok(result.elapsedMs < 30000, `borné (${result.elapsedMs} ms)`);
-  assert.ok(fs.existsSync(lockDir(tools)), 'le verrou d’un autre agent n’est pas volé');
+  assert.equal(fs.readFileSync(path.join(lockDir(tools), 'owner'), 'utf8'), record, 'le verrou d’un autre agent n’est pas volé');
+  assert.doesNotMatch(result.output, /found lock without owner|recovering abandoned lock|removing abandoned install lock/);
+  assert.doesNotMatch(result.output, /No such file or directory/, 'aucune erreur shell');
+});
+
+// Verrou sans propriétaire : délai de grâce court, puis reprise automatique.
+const LOCK_LOG = {
+  grace: (seconds) => new RegExp(`^\\[scenter-engine\\] found lock without owner; waiting ${seconds}s grace period$`, 'm'),
+  recovering: /^\[scenter-engine\] owner still missing; recovering abandoned lock$/m,
+  acquired: /^\[scenter-engine\] install lock acquired$/m
+};
+
+function assertInOrder(output, patterns) {
+  let cursor = 0;
+  for (const pattern of patterns) {
+    const match = new RegExp(pattern.source, pattern.flags.replace('g', '')).exec(output.slice(cursor));
+    assert.ok(match, `${pattern} absent ou hors d'ordre :\n${output}`);
+    cursor += match.index + match[0].length;
+  }
+}
+
+test('A — verrou sans propriétaire qui le reste : repris après le délai de grâce, sans attendre le verrou', { skip: SKIP }, async (t) => {
+  fixtures();
+  const server = await startServer({});
+  t.after(() => server.close());
+  // Le cas Jenkins réel : répertoire récent, aucun fichier owner.
+  const tools = path.join(root, 'tools-ownerless');
+  fs.mkdirSync(lockDir(tools), { recursive: true });
+  const result = await runBootstrap(tools, {
+    SCENTER_ENGINE_TGZ_URL: `http://127.0.0.1:${server.port}/missing.tgz`, SCENTER_ENGINE_SHA256: v1.sha,
+    SCENTER_BOOTSTRAP_LOCK_TIMEOUT: '300', SCENTER_BOOTSTRAP_LOCK_OWNER_GRACE: '3'
+  });
+  assertInOrder(result.output, [/acquiring install lock \(.+, timeout 300s\)/, LOCK_LOG.grace(3), LOCK_LOG.recovering, LOCK_LOG.acquired]);
+  assert.equal(result.status, 2, 'échoue ensuite sur le téléchargement, pas sur le verrou');
+  assert.match(result.output, /ERROR during 'downloading engine package/);
+  assert.ok(result.elapsedMs < 30000, `pas d’attente du verrou (${result.elapsedMs} ms)`);
+  assert.doesNotMatch(result.output, /waiting for install lock|install lock still held/);
+  assert.doesNotMatch(result.output, /No such file or directory/, 'aucune erreur shell');
+  assert.equal(fs.existsSync(lockDir(tools)), false, 'verrou libéré');
+  assert.deepEqual(fs.readdirSync(path.join(tools, 'security-center-packages')).filter((name) => name.startsWith('.bootstrap.')), []);
+});
+
+test('B — un propriétaire apparaît pendant le délai de grâce : le verrou n’est pas retiré', { skip: SKIP }, async () => {
+  fixtures();
+  const tools = path.join(root, 'tools-late-owner');
+  fs.mkdirSync(lockDir(tools), { recursive: true });
+  const record = `pid=4242 host=other-agent started=${Math.floor(Date.now() / 1000)} build=late-writer`;
+  let written = false;
+  const result = await runBootstrap(tools, {
+    SCENTER_ENGINE_TGZ_URL: 'http://127.0.0.1:9/x.tgz', SCENTER_ENGINE_SHA256: v1.sha,
+    SCENTER_BOOTSTRAP_LOCK_TIMEOUT: '4', SCENTER_BOOTSTRAP_LOCK_OWNER_GRACE: '3'
+  }, {
+    // Un bootstrap concurrent écrit son owner juste après son mkdir.
+    onOutput: (output) => {
+      if (written || !/found lock without owner/.test(output)) return;
+      written = true;
+      const temporary = path.join(tools, 'security-center-packages', 'owner.writing');
+      fs.writeFileSync(temporary, record);
+      fs.renameSync(temporary, path.join(lockDir(tools), 'owner'));
+    }
+  });
+  assert.ok(written, result.output);
+  assert.equal(result.status, 2, result.output);
+  assertInOrder(result.output, [LOCK_LOG.grace(3), /waiting for install lock held by pid 4242 on other-agent, build late-writer/]);
+  assert.doesNotMatch(result.output, /owner still missing|recovering abandoned lock|removing abandoned install lock|install lock acquired/);
+  assert.match(result.output, /install lock still held after 4s: .+ \(pid 4242 on other-agent, build late-writer\)/);
+  assert.equal(fs.readFileSync(path.join(lockDir(tools), 'owner'), 'utf8'), record, 'propriétaire légitime conservé');
+  assert.doesNotMatch(result.output, /No such file or directory/, 'aucune erreur shell');
+});
+
+test('F — acquisitions concurrentes sur un verrou sans propriétaire : un seul installe, aucun double détenteur', { skip: SKIP }, async (t) => {
+  fixtures();
+  const server = await startServer({ '/v1.tgz': serveBytes(v1.bytes) });
+  t.after(() => server.close());
+  const tools = path.join(root, 'tools-concurrent');
+  fs.mkdirSync(lockDir(tools), { recursive: true });
+  const env = {
+    SCENTER_ENGINE_TGZ_URL: `http://127.0.0.1:${server.port}/v1.tgz`, SCENTER_ENGINE_SHA256: v1.sha,
+    SCENTER_BOOTSTRAP_LOCK_TIMEOUT: '240', SCENTER_BOOTSTRAP_LOCK_OWNER_GRACE: '2', SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT: '60'
+  };
+  const runs = await Promise.all([1, 2, 3].map(() => runBootstrap(tools, env)));
+  const all = runs.map((run, index) => `--- run ${index + 1} (exit ${run.status})\n${run.output}`).join('\n');
+  for (const run of runs) {
+    assert.equal(run.status, 0, all);
+    assert.match(run.output, LOCK_LOG.acquired, all);
+    assert.doesNotMatch(run.output, /No such file or directory|install lock still held/, all);
+  }
+  // Un double détenteur installerait deux fois.
+  assert.deepEqual(runs.map((run) => run.action).sort(), ['installed', 'unchanged', 'unchanged'], all);
+  assert.equal(runs.filter((run) => /^\[scenter-engine\] installing engine /m.test(run.output)).length, 1, all);
+  assert.equal(fs.existsSync(lockDir(tools)), false, 'verrou libéré');
+  assert.deepEqual(fs.readdirSync(path.join(tools, 'security-center-packages')).filter((name) => name.startsWith('.bootstrap.')), []);
 });
 
 test('D / F — verrou abandonné (processus tué, ancien bootstrap, trop vieux) : repris immédiatement', { skip: SKIP }, async (t) => {
@@ -317,16 +410,17 @@ test('D / F — verrou abandonné (processus tué, ancien bootstrap, trop vieux)
   assert.match(afterKill.output, /removing abandoned install lock: its owner process 999999 on .+ is no longer running/);
   assert.match(afterKill.output, /install lock acquired/);
   assert.equal(afterKill.status, 2, 'échoue ensuite sur le téléchargement, pas sur le verrou');
-  assert.doesNotMatch(afterKill.output, /waiting for install lock/);
+  assert.doesNotMatch(afterKill.output, /waiting for install lock|found lock without owner/);
+  assert.doesNotMatch(afterKill.output, /No such file or directory/, 'aucune erreur shell');
 
-  // 2. Verrou sans propriétaire laissé par l'ancien bootstrap, plus vieux que le seuil.
-  const legacy = path.join(root, 'tools-legacy');
-  fs.mkdirSync(lockDir(legacy), { recursive: true });
-  const old = new Date(Date.now() - 2 * 3600 * 1000);
-  fs.utimesSync(lockDir(legacy), old, old);
-  const afterLegacy = await runBootstrap(legacy, { SCENTER_ENGINE_TGZ_URL: `http://127.0.0.1:${server.port}/missing.tgz`, SCENTER_ENGINE_SHA256: v1.sha, SCENTER_BOOTSTRAP_LOCK_STALE_AFTER: '600' });
-  assert.match(afterLegacy.output, /removing abandoned install lock: it is \d+s old \(abandoned after 600s\)/);
-  assert.match(afterLegacy.output, /install lock acquired/);
+  // 2. Propriétaire vivant sur un autre agent, mais enregistré il y a trop longtemps.
+  const expired = path.join(root, 'tools-expired');
+  fs.mkdirSync(lockDir(expired), { recursive: true });
+  fs.writeFileSync(path.join(lockDir(expired), 'owner'), `pid=4242 host=other-agent started=${Math.floor(Date.now() / 1000) - 2 * 3600} build=forgotten`);
+  const afterExpired = await runBootstrap(expired, { SCENTER_ENGINE_TGZ_URL: `http://127.0.0.1:${server.port}/missing.tgz`, SCENTER_ENGINE_SHA256: v1.sha, SCENTER_BOOTSTRAP_LOCK_STALE_AFTER: '600' });
+  assert.match(afterExpired.output, /removing abandoned install lock: it is \d+s old \(abandoned after 600s\)/);
+  assert.match(afterExpired.output, /install lock acquired/);
+  assert.doesNotMatch(afterExpired.output, /No such file or directory/, 'aucune erreur shell');
 
   // 3. Bootstrap tué pendant le téléchargement : le build suivant reprend sans attendre.
   const aborted = path.join(root, 'tools-aborted');
@@ -337,7 +431,8 @@ test('D / F — verrou abandonné (processus tué, ancien bootstrap, trop vieux)
   assert.ok(fs.existsSync(path.join(lockDir(aborted), 'owner')), 'le kill brutal laisse le verrou, comme sur Jenkins');
   const next = await runBootstrap(aborted, { SCENTER_ENGINE_TGZ_URL: `http://127.0.0.1:${server.port}/missing.tgz`, SCENTER_ENGINE_SHA256: v1.sha });
   assert.match(next.output, /removing abandoned install lock: its owner process \d+ on .+ is no longer running/);
-  assert.doesNotMatch(next.output, /waiting for install lock/);
+  assert.doesNotMatch(next.output, /waiting for install lock|found lock without owner/);
+  assert.doesNotMatch(next.output, /No such file or directory/, 'aucune erreur shell');
 });
 
 test('F — interruption par signal : verrou et temporaires libérés, ERROR explicite', { skip: SKIP }, async (t) => {

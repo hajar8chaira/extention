@@ -29,7 +29,8 @@
 #   SCENTER_BOOTSTRAP_FAILURE_REPORT (CI report written when the engine is unavailable)
 # Bounds, in seconds:
 #   SCENTER_BOOTSTRAP_LOCK_TIMEOUT (300)       wait for another bootstrap's install lock
-#   SCENTER_BOOTSTRAP_LOCK_STALE_AFTER (900)   a lock older than this is abandoned
+#   SCENTER_BOOTSTRAP_LOCK_STALE_AFTER (900)   a lock whose owner is older than this is abandoned
+#   SCENTER_BOOTSTRAP_LOCK_OWNER_GRACE (3)     a lock still without owner record after this is abandoned
 #   SCENTER_BOOTSTRAP_CONNECT_TIMEOUT (20)     TCP/TLS connection, per attempt
 #   SCENTER_BOOTSTRAP_MANIFEST_TIMEOUT (60)    whole manifest download, redirects included
 #   SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT (300)   whole engine package download
@@ -55,6 +56,7 @@ EXPECTED_SHA=''
 FAILURE_REPORT="${SCENTER_BOOTSTRAP_FAILURE_REPORT:-}"
 LOCK_TIMEOUT="${SCENTER_BOOTSTRAP_LOCK_TIMEOUT:-300}"
 LOCK_STALE_AFTER="${SCENTER_BOOTSTRAP_LOCK_STALE_AFTER:-900}"
+LOCK_OWNER_GRACE="${SCENTER_BOOTSTRAP_LOCK_OWNER_GRACE:-3}"
 CONNECT_TIMEOUT="${SCENTER_BOOTSTRAP_CONNECT_TIMEOUT:-20}"
 MANIFEST_TIMEOUT="${SCENTER_BOOTSTRAP_MANIFEST_TIMEOUT:-60}"
 DOWNLOAD_TIMEOUT="${SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT:-300}"
@@ -157,14 +159,25 @@ current_host() {
   hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown
 }
 
-# One key=value field of the lock owner record.
-lock_owner_field() {
-  local owner entry
-  owner="$(tr -cd 'A-Za-z0-9=._: -' < "$LOCK_OWNER_FILE" 2>/dev/null || true)"
-  for entry in $owner; do
-    case "$entry" in "$1="*) printf '%s' "${entry#*=}"; return 0 ;; esac
+# The lock owner record as printable text, nothing when there is none. The group
+# redirection also silences the shell's own error when the file disappears.
+lock_owner_record() {
+  [ -f "$LOCK_OWNER_FILE" ] || return 0
+  { tr -cd 'A-Za-z0-9=._: -' < "$LOCK_OWNER_FILE"; } 2>/dev/null || true
+}
+
+# One key=value field ($2) of an owner record ($1).
+owner_field() {
+  local entry
+  for entry in $1; do
+    case "$entry" in "$2="*) printf '%s' "${entry#*=}"; return 0 ;; esac
   done
   return 0
+}
+
+# One key=value field of the current lock owner record.
+lock_owner_field() {
+  owner_field "$(lock_owner_record)" "$1"
 }
 
 # Releases the lock only if this process still owns it.
@@ -231,7 +244,7 @@ is_timeout_status() {
 
 check_bounds() {
   local name value
-  for name in LOCK_TIMEOUT LOCK_STALE_AFTER CONNECT_TIMEOUT MANIFEST_TIMEOUT DOWNLOAD_TIMEOUT INSTALL_TIMEOUT VERIFY_TIMEOUT; do
+  for name in LOCK_TIMEOUT LOCK_STALE_AFTER LOCK_OWNER_GRACE CONNECT_TIMEOUT MANIFEST_TIMEOUT DOWNLOAD_TIMEOUT INSTALL_TIMEOUT VERIFY_TIMEOUT; do
     value="${!name}"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ]; then
       fail "invalid SCENTER_BOOTSTRAP_$name value '$value' (expected a number of seconds)"
@@ -294,14 +307,14 @@ installed_command() {
   return 1
 }
 
-# Why the existing install lock can be taken over, or nothing when it may still
-# be held by a running bootstrap.
+# Why the owner record $1 of the existing install lock is abandoned, or nothing
+# when it may still belong to a running bootstrap.
 lock_stale_reason() {
   local pid host started now age mtime probe
-  [ -d "$LOCK_DIR" ] || return 0
-  pid="$(lock_owner_field pid)"
-  host="$(lock_owner_field host)"
-  started="$(lock_owner_field started)"
+  [ -n "$1" ] || return 0
+  pid="$(owner_field "$1" pid)"
+  host="$(owner_field "$1" host)"
+  started="$(owner_field "$1" started)"
   now="$(date +%s)"
   if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$host" = "$(current_host)" ]; then
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -315,7 +328,7 @@ lock_stale_reason() {
   if [[ "$started" =~ ^[0-9]+$ ]]; then
     age=$((now - started))
   else
-    mtime="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
+    mtime="$(stat -c %Y "$LOCK_OWNER_FILE" 2>/dev/null || stat -f %m "$LOCK_OWNER_FILE" 2>/dev/null || true)"
     if [[ "$mtime" =~ ^[0-9]+$ ]]; then age=$((now - mtime)); else age=''; fi
   fi
   if [ -n "$age" ] && [ "$age" -ge "$LOCK_STALE_AFTER" ]; then
@@ -336,29 +349,91 @@ lock_holder() {
   fi
 }
 
+# One attempt to take the lock. The owner record ($1) is written beforehand, then
+# the directory is created and the record hard-linked into it: a link never
+# replaces an existing file, so exactly one bootstrap owns the lock even when
+# several recover the same abandoned directory at once. Ownership is confirmed
+# by reading the record back.
+try_lock() {
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  if ! ln "$1" "$LOCK_OWNER_FILE" 2>/dev/null; then
+    # Filesystems without hard links: a no-clobber rename, confirmed below.
+    if [ -d "$LOCK_DIR" ] && [ ! -e "$LOCK_OWNER_FILE" ]; then mv -n "$1" "$LOCK_OWNER_FILE" 2>/dev/null || true; fi
+  fi
+  [ "$(lock_owner_field pid)" = "$$" ]
+}
+
+# A lock directory without owner record: a bootstrap between its mkdir and its
+# owner link (milliseconds), or one killed there, or an older bootstrap. It is
+# abandoned when the record is still missing after the grace period. rmdir only
+# removes an empty directory: once any owner record exists, it is kept.
+recover_ownerless_lock() {
+  local contents
+  log "found lock without owner; waiting ${LOCK_OWNER_GRACE}s grace period"
+  sleep "$LOCK_OWNER_GRACE"
+  LOCK_WAITED=$((LOCK_WAITED + LOCK_OWNER_GRACE))
+  if [ ! -d "$LOCK_DIR" ] || [ -e "$LOCK_OWNER_FILE" ]; then return 0; fi
+  log 'owner still missing; recovering abandoned lock'
+  if rmdir "$LOCK_DIR" 2>/dev/null; then return 0; fi
+  # Another bootstrap recovered it first, recreated it, or linked its owner: retry.
+  contents="$(ls -A "$LOCK_DIR" 2>/dev/null || true)"
+  if [ -z "$contents" ] || [ "$contents" = owner ] || [ -e "$LOCK_OWNER_FILE" ]; then return 0; fi
+  log "cannot recover $LOCK_DIR automatically: it contains unexpected files"
+  OWNERLESS_RECOVERY=0
+  return 1
+}
+
+# Removes the owner record judged abandoned ($1) only if it is still that record:
+# it is renamed away first (atomic) and put back when another bootstrap took the
+# lock in the meantime.
+remove_abandoned_owner() {
+  local moved="$PACKAGES/.bootstrap.abandoned-$$"
+  mv "$LOCK_OWNER_FILE" "$moved" 2>/dev/null || return 1
+  if [ "$({ tr -cd 'A-Za-z0-9=._: -' < "$moved"; } 2>/dev/null || true)" != "$1" ]; then
+    ln "$moved" "$LOCK_OWNER_FILE" 2>/dev/null || true
+    rm -f "$moved"
+    return 1
+  fi
+  rm -f "$moved"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  return 0
+}
+
 acquire_lock() {
-  local waited=0 next_report=0 reason
+  local next_report=0 reason record host build owner_record
   phase "acquiring install lock ($LOCK_DIR, timeout ${LOCK_TIMEOUT}s)"
   mkdir -p "$PACKAGES" "$PREFIX" 2>/dev/null || fail "cannot create $PREFIX and $PACKAGES (the Jenkins user must own $TOOLS_DIR)"
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    reason="$(lock_stale_reason)"
-    if [ -n "$reason" ]; then
-      log "removing abandoned install lock: $reason"
-      rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true
-      if rmdir "$LOCK_DIR" 2>/dev/null; then continue; fi
+  LOCK_WAITED=0
+  OWNERLESS_RECOVERY=1
+  host="$(current_host)"
+  build="$(printf '%s' "${BUILD_TAG:-manual}" | tr -cd 'A-Za-z0-9._-' | cut -c1-120)"
+  owner_record="$PACKAGES/.bootstrap.owner-$$"
+  track_temp "$owner_record"
+  while :; do
+    printf 'pid=%s host=%s started=%s build=%s' "$$" "$host" "$(date +%s)" "$build" > "$owner_record"
+    if try_lock "$owner_record"; then break; fi
+    if [ -d "$LOCK_DIR" ] && [ ! -e "$LOCK_OWNER_FILE" ]; then
+      if [ "$OWNERLESS_RECOVERY" = 1 ] && recover_ownerless_lock; then continue; fi
+    elif [ -d "$LOCK_DIR" ]; then
+      record="$(lock_owner_record)"
+      reason="$(lock_stale_reason "$record")"
+      if [ -n "$reason" ]; then
+        log "removing abandoned install lock: $reason"
+        if remove_abandoned_owner "$record"; then continue; fi
+      fi
     fi
-    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
+    if [ "$LOCK_WAITED" -ge "$LOCK_TIMEOUT" ]; then
       fail "install lock still held after ${LOCK_TIMEOUT}s: $LOCK_DIR ($(lock_holder)). If no Security Center build is running, remove that directory."
     fi
-    if [ "$waited" -ge "$next_report" ]; then
-      log "waiting for install lock held by $(lock_holder) (${waited}s of ${LOCK_TIMEOUT}s)"
-      next_report=$((waited + 10))
+    if [ "$LOCK_WAITED" -ge "$next_report" ]; then
+      log "waiting for install lock held by $(lock_holder) (${LOCK_WAITED}s of ${LOCK_TIMEOUT}s)"
+      next_report=$((LOCK_WAITED + 10))
     fi
     sleep 1
-    waited=$((waited + 1))
+    LOCK_WAITED=$((LOCK_WAITED + 1))
   done
+  rm -f "$owner_record"
   LOCK_HELD=1
-  printf 'pid=%s host=%s started=%s build=%s' "$$" "$(current_host)" "$(date +%s)" "$(printf '%s' "${BUILD_TAG:-manual}" | tr -cd 'A-Za-z0-9._-' | cut -c1-120)" > "$LOCK_OWNER_FILE"
   log 'install lock acquired'
 }
 
