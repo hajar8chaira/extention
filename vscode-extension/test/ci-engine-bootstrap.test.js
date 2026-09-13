@@ -69,11 +69,10 @@ function recordingNpm(root) {
 
 function runBootstrap(tools, env = {}) {
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SCENTER_')));
-  const result = spawnSync(BASH, [posix(BOOTSTRAP)], {
-    encoding: 'utf8',
-    timeout: 180000,
-    env: { ...inherited, SCENTER_TOOLS_DIR: posix(tools), SCENTER_NODE_HOME: NODE_HOME, SCENTER_BOOTSTRAP_LOCK_TIMEOUT: '20', ...env }
-  });
+  const merged = { ...inherited, SCENTER_TOOLS_DIR: posix(tools), SCENTER_NODE_HOME: NODE_HOME, SCENTER_BOOTSTRAP_LOCK_TIMEOUT: '20', ...env };
+  // null unsets a variable, e.g. SCENTER_TOOLS_DIR to exercise the default home.
+  for (const [key, value] of Object.entries(merged)) if (value === null) delete merged[key];
+  const result = spawnSync(BASH, [posix(BOOTSTRAP)], { encoding: 'utf8', timeout: 180000, env: merged });
   const stdout = result.stdout || '';
   const field = (name) => (stdout.match(new RegExp(`^${name}=(.*)$`, 'm')) || [])[1];
   return {
@@ -104,6 +103,73 @@ function ensureFixtures() {
     recorder = recordingNpm(root);
   }
 }
+
+// ------------------------------------------------------------ home Security Center
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+test('home par défaut : $JENKINS_HOME/.security-center créé et utilisé, ancien répertoire tools ignoré', { skip: SKIP }, () => {
+  ensureFixtures();
+  const jenkinsHome = path.join(root, 'default-home', 'jenkins_home');
+  // L'ancien emplacement du vrai Jenkins, laissé tel quel : verrou orphelin compris.
+  const legacyLock = path.join(jenkinsHome, 'tools', 'security-center-packages', '.bootstrap.lock');
+  fs.mkdirSync(legacyLock, { recursive: true });
+  const home = path.join(jenkinsHome, '.security-center');
+  const result = runBootstrap(jenkinsHome, { SCENTER_TOOLS_DIR: null, JENKINS_HOME: posix(jenkinsHome), SCENTER_ENGINE_TGZ_URL: v1.url, SCENTER_ENGINE_SHA256: v1.sha });
+  assert.equal(result.status, 0, result.output);
+  assert.equal(result.action, 'installed');
+  const homePosix = escapeRegExp(`${posix(jenkinsHome)}/.security-center`);
+  assert.match(result.output, /^\[scenter-engine\] preparing Security Center home$/m);
+  assert.match(result.output, new RegExp(`^\\[scenter-engine\\] Security Center home: engine ${homePosix}/engine, packages ${homePosix}/packages$`, 'm'));
+  assert.match(result.output, new RegExp(`^SCENTER_ENGINE_COMMAND=${homePosix}/engine/`, 'm'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'engine', 'scenter-ci-engine.json'), 'utf8')).sha256, v1.sha);
+  assert.ok(fs.existsSync(path.join(home, 'packages', `sha256-${v1.sha}.tgz`)), 'paquet vérifié dans le cache du home');
+  assert.ok(fs.existsSync(legacyLock), 'ancien emplacement jamais touché');
+  assert.equal(fs.existsSync(path.join(jenkinsHome, 'tools', 'security-center')), false);
+  for (const dir of ['engine', 'packages']) {
+    assert.deepEqual(fs.readdirSync(path.join(home, dir)).filter((name) => name.startsWith('.scenter-write-test-')), [], 'sonde d’écriture retirée');
+  }
+});
+
+test('chemin configuré impossible à créer : ERROR clair avec la variable, aucun verrou ni installation', { skip: SKIP }, () => {
+  ensureFixtures();
+  const blocker = path.join(root, 'not-a-directory');
+  fs.writeFileSync(blocker, 'a file where the tools directory should be');
+  const report = path.join(root, 'report-uncreatable.json');
+  const result = runBootstrap(blocker, { SCENTER_ENGINE_TGZ_URL: v1.url, SCENTER_ENGINE_SHA256: v1.sha, SCENTER_BOOTSTRAP_FAILURE_REPORT: posix(report) });
+  assert.equal(result.status, 2, result.output);
+  assert.equal(result.engineStatus, 'ERROR');
+  assert.match(result.output, /ERROR during 'preparing Security Center home': .+not-a-directory\/security-center-packages cannot be created by user \S+ \(configured by SCENTER_TOOLS_DIR; give user \S+ write access to it, or unset SCENTER_TOOLS_DIR to use the default .+\/\.security-center\)/);
+  assert.doesNotMatch(result.output, /acquiring install lock|downloading engine package|installing engine/);
+  const failure = JSON.parse(fs.readFileSync(report, 'utf8'));
+  assert.equal(failure.verdict.status, 'ERROR');
+  // Security Delivery affiche l'erreur telle que validée par le contrat du rapport CI.
+  const shown = validateCiReport(JSON.stringify(failure));
+  assert.equal(shown.ok, true, JSON.stringify(shown));
+  assert.match(shown.report.execution.error, /^preparing Security Center home: .+not-a-directory\/security-center-packages cannot be created by user \S+ \(configured by SCENTER_TOOLS_DIR;/);
+  // Jamais de réparation par élévation de privilèges.
+  assert.doesNotMatch(fs.readFileSync(BOOTSTRAP, 'utf8'), /\b(sudo|chown|chmod)\b/);
+});
+
+const RUNS_AS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
+const POSIX_PERMISSIONS = SKIP || (process.platform === 'win32' && 'permissions POSIX indisponibles sous Windows') || (RUNS_AS_ROOT && 'root ignore les permissions');
+
+test('répertoire configuré existant mais non inscriptible : ERROR clair, rien écrit, aucun chmod', { skip: POSIX_PERMISSIONS }, (t) => {
+  ensureFixtures();
+  const locked = path.join(root, 'read-only-packages');
+  fs.mkdirSync(locked);
+  fs.chmodSync(locked, 0o555);
+  t.after(() => fs.chmodSync(locked, 0o755));
+  const result = runBootstrap(tools, {
+    SCENTER_ENGINE_PACKAGES: posix(locked), SCENTER_ENGINE_PREFIX: posix(path.join(root, 'writable-prefix')),
+    SCENTER_ENGINE_TGZ_URL: v1.url, SCENTER_ENGINE_SHA256: v1.sha
+  });
+  assert.equal(result.status, 2, result.output);
+  assert.match(result.output, /ERROR during 'preparing Security Center home': .+read-only-packages is not writable by user \S+ \(configured by SCENTER_ENGINE_PACKAGES; give user \S+ write access to it, or unset SCENTER_ENGINE_PACKAGES to use the default .+\)/);
+  assert.doesNotMatch(result.output, /acquiring install lock|Permission denied/);
+  assert.deepEqual(fs.readdirSync(locked), [], 'rien écrit');
+  assert.equal(fs.statSync(locked).mode & 0o777, 0o555, 'permissions inchangées');
+});
 
 // ------------------------------------------------------------ A / B / C
 

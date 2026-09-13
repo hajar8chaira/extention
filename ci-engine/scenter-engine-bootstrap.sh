@@ -24,8 +24,14 @@
 # Optional:
 #   SCENTER_ENGINE_DOWNLOAD_TOKEN  bearer token for a private artifact host, sent
 #                                  only to the manifest host, never logged
-#   SCENTER_TOOLS_DIR (default /var/jenkins_home/tools), SCENTER_NODE_HOME,
-#   SCENTER_ENGINE_PREFIX, SCENTER_ENGINE_PACKAGES,
+#   SCENTER_NODE_HOME (default /var/jenkins_home/tools/node22)
+#   Where the engine and its verified package cache live, most specific first:
+#     SCENTER_ENGINE_PREFIX, SCENTER_ENGINE_PACKAGES   exact directories
+#     SCENTER_HOME                                     <home>/engine and <home>/packages
+#     SCENTER_TOOLS_DIR                                legacy <tools>/security-center(-packages)
+#     default                                          $JENKINS_HOME/.security-center/engine and /packages
+#   Directories are created and checked as the Jenkins user; ownership and
+#   permissions are never changed: an unusable path fails with its origin.
 #   SCENTER_BOOTSTRAP_FAILURE_REPORT (CI report written when the engine is unavailable)
 # Bounds, in seconds:
 #   SCENTER_BOOTSTRAP_LOCK_TIMEOUT (300)       wait for another bootstrap's install lock
@@ -47,8 +53,25 @@ readonly HELP_MARKER='Security Center headless'
 
 TOOLS_DIR="${SCENTER_TOOLS_DIR:-/var/jenkins_home/tools}"
 NODE_HOME="${SCENTER_NODE_HOME:-$TOOLS_DIR/node22}"
-PREFIX="${SCENTER_ENGINE_PREFIX:-$TOOLS_DIR/security-center}"
-PACKAGES="${SCENTER_ENGINE_PACKAGES:-$TOOLS_DIR/security-center-packages}"
+SC_HOME="${SCENTER_HOME:-${JENKINS_HOME:-/var/jenkins_home}/.security-center}"
+if [ -n "${SCENTER_ENGINE_PREFIX:-}" ]; then
+  PREFIX="$SCENTER_ENGINE_PREFIX"; PREFIX_ORIGIN='SCENTER_ENGINE_PREFIX'
+elif [ -n "${SCENTER_HOME:-}" ]; then
+  PREFIX="$SC_HOME/engine"; PREFIX_ORIGIN='SCENTER_HOME'
+elif [ -n "${SCENTER_TOOLS_DIR:-}" ]; then
+  PREFIX="$TOOLS_DIR/security-center"; PREFIX_ORIGIN='SCENTER_TOOLS_DIR'
+else
+  PREFIX="$SC_HOME/engine"; PREFIX_ORIGIN='default'
+fi
+if [ -n "${SCENTER_ENGINE_PACKAGES:-}" ]; then
+  PACKAGES="$SCENTER_ENGINE_PACKAGES"; PACKAGES_ORIGIN='SCENTER_ENGINE_PACKAGES'
+elif [ -n "${SCENTER_HOME:-}" ]; then
+  PACKAGES="$SC_HOME/packages"; PACKAGES_ORIGIN='SCENTER_HOME'
+elif [ -n "${SCENTER_TOOLS_DIR:-}" ]; then
+  PACKAGES="$TOOLS_DIR/security-center-packages"; PACKAGES_ORIGIN='SCENTER_TOOLS_DIR'
+else
+  PACKAGES="$SC_HOME/packages"; PACKAGES_ORIGIN='default'
+fi
 MANIFEST_URL="${SCENTER_ENGINE_MANIFEST_URL:-}"
 DOWNLOAD_TOKEN="${SCENTER_ENGINE_DOWNLOAD_TOKEN:-}"
 ENGINE_URL="${SCENTER_ENGINE_TGZ_URL:-}"
@@ -402,7 +425,7 @@ remove_abandoned_owner() {
 acquire_lock() {
   local next_report=0 reason record host build owner_record
   phase "acquiring install lock ($LOCK_DIR, timeout ${LOCK_TIMEOUT}s)"
-  mkdir -p "$PACKAGES" "$PREFIX" 2>/dev/null || fail "cannot create $PREFIX and $PACKAGES (the Jenkins user must own $TOOLS_DIR)"
+  mkdir -p "$PACKAGES" "$PREFIX" 2>/dev/null || fail "cannot create $PREFIX and $PACKAGES"
   LOCK_WAITED=0
   OWNERLESS_RECOVERY=1
   host="$(current_host)"
@@ -698,11 +721,54 @@ emit() {
   echo "SCENTER_ENGINE_COMMAND=$ENGINE_COMMAND"
 }
 
+# How to fix a directory that cannot be used, by where its path came from.
+path_hint() {
+  local user="$1" origin="$2"
+  if [ "$origin" = default ]; then
+    printf 'default Security Center home; JENKINS_HOME must be writable by user %s, or set SCENTER_HOME to a directory it owns' "$user"
+  else
+    printf 'configured by %s; give user %s write access to it, or unset %s to use the default %s' "$origin" "$user" "$origin" "${JENKINS_HOME:-/var/jenkins_home}/.security-center"
+  fi
+}
+
+# Creates a directory as the Jenkins process and proves it is writable. Never
+# changes ownership or permissions: an unusable path is reported, not repaired.
+ensure_writable_dir() {
+  local dir="$1" origin="$2" user probe
+  user="$(id -un 2>/dev/null || printf '%s' "${USER:-unknown}")"
+  if ! mkdir -p "$dir" 2>/dev/null || [ ! -d "$dir" ]; then
+    fail "$dir cannot be created by user $user ($(path_hint "$user" "$origin"))"
+  fi
+  probe="$dir/.scenter-write-test-$$"
+  if ! { : > "$probe"; } 2>/dev/null; then
+    fail "$dir is not writable by user $user ($(path_hint "$user" "$origin"))"
+  fi
+  rm -f "$probe"
+}
+
+prepare_directories() {
+  local sub user
+  # Short phase: the failing path is in the reason, and the CI report keeps
+  # only the first 300 characters of the error.
+  phase 'preparing Security Center home'
+  log "Security Center home: engine $PREFIX, packages $PACKAGES"
+  ensure_writable_dir "$PACKAGES" "$PACKAGES_ORIGIN"
+  ensure_writable_dir "$PREFIX" "$PREFIX_ORIGIN"
+  # An existing engine tree must stay writable too, or npm install fails later.
+  for sub in bin lib lib/node_modules; do
+    if [ -d "$PREFIX/$sub" ] && [ ! -w "$PREFIX/$sub" ]; then
+      user="$(id -un 2>/dev/null || printf '%s' "${USER:-unknown}")"
+      fail "$PREFIX/$sub is not writable by user $user ($(path_hint "$user" "$PREFIX_ORIGIN"))"
+    fi
+  done
+}
+
 main() {
   local previous='' action='installed'
   check_bounds
   resolve_toolchain
   log "node $NODE_VERSION, npm $NPM_VERSION"
+  prepare_directories
   acquire_lock
   resolve_expected_build
   if engine_is_expected; then

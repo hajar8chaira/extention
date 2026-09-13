@@ -53,9 +53,17 @@ Backward-compatible fallback without a manifest:
 | `SCENTER_ENGINE_TGZ_URL` | URL serving `security-center-vscode-X.Y.Z.tgz` (`npm pack`) |
 | `SCENTER_ENGINE_SHA256` | SHA-256 of that exact package |
 
-Paths used: `/var/jenkins_home/tools/node22` (prerequisite),
-`/var/jenkins_home/tools/security-center` (engine),
-`/var/jenkins_home/tools/security-center-packages` (verified package cache).
+Paths used: `/var/jenkins_home/tools/node22` (prerequisite), and a Security
+Center home the Jenkins user creates and checks itself before installing:
+`$JENKINS_HOME/.security-center/engine` (engine) and
+`$JENKINS_HOME/.security-center/packages` (verified package cache). No
+`chown`/`chmod` by an administrator is needed.
+
+Path overrides, most specific first: `SCENTER_ENGINE_PREFIX` /
+`SCENTER_ENGINE_PACKAGES`, `SCENTER_HOME` (`<home>/engine`, `<home>/packages`),
+legacy `SCENTER_TOOLS_DIR` (`<tools>/security-center`,
+`<tools>/security-center-packages`). A configured path the Jenkins user cannot
+create or write fails the build with ERROR, naming the variable.
 
 To roll out a new engine build: publish the new `.tgz` at the URL and update
 `SCENTER_ENGINE_SHA256`. The next build upgrades itself.

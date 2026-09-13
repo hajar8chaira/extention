@@ -305,7 +305,13 @@ test('K — un enregistrement de livraison inconnu ou absent n’est jamais pré
 test('le pipeline suit exactement le flux attendu', () => {
   const stages = [...JENKINSFILE.matchAll(/stage\('([^']+)'\)/g)].map((match) => match[1]);
   assert.deepEqual(stages, ['Checkout', 'Bootstrap Security Center CI Engine', 'Security Center Analysis', 'Policy Gate', 'Supply chain evidence', 'Deploy', 'Health Check']);
-  assert.match(JENKINSFILE, /PATH = "\/var\/jenkins_home\/tools\/security-center\/bin:\/var\/jenkins_home\/tools\/node22\/bin:\$\{env\.PATH\}"/);
+  assert.match(JENKINSFILE, /PATH = "\/var\/jenkins_home\/tools\/node22\/bin:\$\{env\.PATH\}"/);
+  // Le moteur vient du home Security Center résolu comme par le bootstrap, jamais
+  // d'un ancien emplacement forcé que l'utilisateur Jenkins ne peut pas écrire.
+  assert.doesNotMatch(JENKINSFILE, /SCENTER_TOOLS_DIR = '|tools\/security-center\/bin/);
+  assert.match(JENKINSFILE, /def scenterHome = env\.SCENTER_HOME \?: "\$\{env\.JENKINS_HOME \?: '\/var\/jenkins_home'\}\/\.security-center"/);
+  assert.match(JENKINSFILE, /def enginePrefix = env\.SCENTER_ENGINE_PREFIX \?: \(env\.SCENTER_HOME \? "\$\{scenterHome\}\/engine" : \(env\.SCENTER_TOOLS_DIR \? "\$\{env\.SCENTER_TOOLS_DIR\}\/security-center" : "\$\{scenterHome\}\/engine"\)\)/);
+  assert.match(JENKINSFILE, /withEnv\(\["PATH\+SCENTER_ENGINE=\$\{env\.SC_ENGINE_BIN\}"\]\) \{\s*\/\/[^\n]*\n[^\n]*\n\s*def status = sh\(\s*returnStatus: true,\s*label: 'Security Center Analysis'/);
   assert.match(JENKINSFILE, /triggers \{\s*pollSCM\('H\/2 \* \* \* \*'\)\s*\}/);
   assert.match(JENKINSFILE, /git\(repository\)/);
   assert.doesNotMatch(JENKINSFILE_CODE, /vscode-extension|npm pack|docker exec/);
