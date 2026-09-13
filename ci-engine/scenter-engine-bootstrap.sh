@@ -184,8 +184,10 @@ fail() {
   trap - ERR INT TERM HUP
   # A bounded download or install still running is stopped with the bootstrap.
   if [ -n "${CHILD_PID:-}" ]; then kill "$CHILD_PID" 2>/dev/null || true; CHILD_PID=''; fi
-  echo "[scenter-engine] ERROR during '$PHASE': $reason" >&2
-  echo 'SCENTER_ENGINE_STATUS=ERROR'
+  # Written to the build log saved at startup: a signal trap can run while a
+  # bounded call has stdout or stderr redirected, and the reason must not be lost.
+  echo "[scenter-engine] ERROR during '$PHASE': $reason" >&4
+  echo 'SCENTER_ENGINE_STATUS=ERROR' >&3
   cleanup_temp
   write_failure_report "$PHASE: $reason" || true
   release_lock
@@ -195,6 +197,9 @@ fail() {
 on_signal() {
   fail "interrupted by signal $1 (build aborted or agent stopping); the installed engine was not modified by this phase unless it was installing"
 }
+
+# The build log as it was at startup (3: stdout, 4: stderr), for fail.
+exec 3>&1 4>&2
 
 trap 'fail "unexpected bootstrap error (line $LINENO)"' ERR
 trap 'on_signal TERM' TERM
@@ -210,9 +215,9 @@ run_bounded() {
   local limit="$1" status=0
   shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout -k 10 "$limit" "$@" &
+    timeout -k 10 "$limit" "$@" 3>&- 4>&- &
   else
-    "$@" &
+    "$@" 3>&- 4>&- &
   fi
   CHILD_PID=$!
   wait "$CHILD_PID" || status=$?

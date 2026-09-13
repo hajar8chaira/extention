@@ -111,26 +111,40 @@ function runBootstrap(toolsDir, env = {}, { killAfterPhase = null } = {}) {
   });
 }
 
+/** A route that never answers, and leaves `file` once the request has arrived. */
+const hangAndRecord = (file) => (request) => { fs.writeFileSync(file, request.url); };
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /**
- * Starts the bootstrap from a bash driver, waits until `afterPhase` is logged,
- * then sends `signal` to the real bash process — the process Jenkins signals on
- * abort. (Killing the Windows `bash.exe` launcher from Node would not reach it.)
+ * Starts the bootstrap from a bash driver, waits until `afterPhase` is logged
+ * (and, with `afterFile`, until that file exists: the request really reached the
+ * server, so the bootstrap is inside the bounded download and not just before
+ * it), then sends `signal` to the real bash process — the process Jenkins
+ * signals on abort. (Killing the Windows `bash.exe` launcher from Node would not
+ * reach it.) Readiness, delivery and the exit status go to a separate file: the
+ * bootstrap's own log is never written by two processes.
  */
-function signalDuringPhase(toolsDir, env, { signal, afterPhase }) {
+function signalDuringPhase(toolsDir, env, { signal, afterPhase, afterFile = null }) {
   const id = `${signal}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const driver = path.join(root, `driver-${id}.sh`);
   const logFile = posix(path.join(root, `driver-${id}.log`));
+  const metaFile = posix(path.join(root, `driver-${id}.meta`));
+  const readyTest = afterFile ? `grep -q "${afterPhase}" "${logFile}" && [ -f "${posix(afterFile)}" ]` : `grep -q "${afterPhase}" "${logFile}"`;
   fs.writeFileSync(driver, [
     '#!/usr/bin/env bash',
     `bash "${posix(BOOTSTRAP)}" > "${logFile}" 2>&1 &`,
     'pid=$!',
+    'ready=no',
     'for attempt in $(seq 1 600); do',
-    `  if grep -q "${afterPhase}" "${logFile}"; then break; fi`,
+    `  if ${readyTest} 2>/dev/null; then ready=yes; break; fi`,
+    '  if ! kill -0 "$pid" 2>/dev/null; then break; fi',
     '  sleep 0.1',
     'done',
-    `kill -${signal} "$pid" 2>/dev/null`,
+    `if kill -${signal} "$pid" 2>/dev/null; then delivered=yes; else delivered=no; fi`,
     'wait "$pid"',
-    `echo "bootstrap-exit=$?" >> "${logFile}"`,
+    'status=$?',
+    `printf 'ready=%s\\ndelivered=%s\\nbootstrap-exit=%s\\n' "$ready" "$delivered" "$status" > "${metaFile}"`,
     ''
   ].join('\n'), { mode: 0o755 });
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SCENTER_')));
@@ -141,8 +155,11 @@ function signalDuringPhase(toolsDir, env, { signal, afterPhase }) {
     const guard = setTimeout(() => child.kill('SIGKILL'), 120000);
     child.on('close', () => {
       clearTimeout(guard);
-      const output = fs.readFileSync(path.join(root, `driver-${id}.log`), 'utf8');
-      resolve({ output, status: Number((output.match(/bootstrap-exit=(\d+)/) || [])[1]) });
+      const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+      const output = read(path.join(root, `driver-${id}.log`));
+      const meta = read(path.join(root, `driver-${id}.meta`));
+      const field = (name) => (meta.match(new RegExp(`^${name}=(.*)$`, 'm')) || [])[1];
+      resolve({ output, status: Number(field('bootstrap-exit')), ready: field('ready') === 'yes', delivered: field('delivered') === 'yes' });
     });
   });
 }
@@ -325,20 +342,52 @@ test('D / F — verrou abandonné (processus tué, ancien bootstrap, trop vieux)
 
 test('F — interruption par signal : verrou et temporaires libérés, ERROR explicite', { skip: SKIP }, async (t) => {
   fixtures();
-  const hanging = await startServer({ '/hang.tgz': hang() });
-  t.after(() => hanging.close());
+  const routes = {};
+  const server = await startServer(routes);
+  const port = server.port;
+  t.after(() => server.close());
   const tools = path.join(root, 'tools-signal');
-  // Un vrai SIGTERM au bash du bootstrap pendant un téléchargement bloqué (abort Jenkins).
+  const manifestUrl = `http://127.0.0.1:${port}/latest.json`;
+
+  // Moteur v1 installé normalement : l'interruption ne doit pas l'abîmer.
+  routes['/latest.json'] = serveJson(manifestFor(v1, `http://127.0.0.1:${port}/v1.tgz`, 'v1'));
+  routes['/v1.tgz'] = serveBytes(v1.bytes);
+  const installed = await runBootstrap(tools, { SCENTER_ENGINE_MANIFEST_URL: manifestUrl });
+  assert.equal(installed.status, 0, installed.output);
+  const markerBefore = fs.readFileSync(markerOf(tools), 'utf8');
+
+  // Le build v2 est publié, mais son hôte ne répond jamais.
+  const requested = path.join(root, 'signal-v2-requested');
+  routes['/latest.json'] = serveJson(manifestFor(v2, `http://127.0.0.1:${port}/v2.tgz`, 'v2'));
+  routes['/v2.tgz'] = hangAndRecord(requested);
+
+  // Un vrai SIGTERM au bash du bootstrap (abort Jenkins), envoyé seulement une fois
+  // la phase journalisée ET la requête reçue : le téléchargement borné est en cours.
   const started = Date.now();
   const result = await signalDuringPhase(tools, {
-    SCENTER_ENGINE_TGZ_URL: `http://127.0.0.1:${hanging.port}/hang.tgz`, SCENTER_ENGINE_SHA256: v1.sha, SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT: '60'
-  }, { signal: 'TERM', afterPhase: 'downloading engine package' });
+    SCENTER_ENGINE_MANIFEST_URL: manifestUrl, SCENTER_BOOTSTRAP_DOWNLOAD_TIMEOUT: '60'
+  }, { signal: 'TERM', afterPhase: 'downloading engine package', afterFile: requested });
+  assert.ok(result.ready, `le téléchargement bloqué a démarré avant le signal :\n${result.output}`);
+  assert.ok(result.delivered, `SIGTERM reçu par le bootstrap encore vivant :\n${result.output}`);
   assert.equal(result.status, 2, result.output);
-  assert.match(result.output, /ERROR during 'downloading engine package .+': interrupted by signal TERM/);
-  assert.ok(Date.now() - started < 45000, 'l’abort n’attend pas la fin du téléchargement bloqué (60s)');
-  assert.match(result.output, /SCENTER_ENGINE_STATUS=ERROR/);
+  assert.ok(Date.now() - started < 45000, `l’abort n’attend pas la fin du téléchargement bloqué (60s) :\n${result.output}`);
+
+  // Contrat exact : la phase porte la source (sans requête) et la borne.
+  const phase = `downloading engine package (http://127.0.0.1:${port}/v2.tgz, timeout 60s)`;
+  assert.match(result.output, new RegExp(`^\\[scenter-engine\\] ${escapeRegExp(phase)}$`, 'm'), result.output);
+  assert.match(result.output, new RegExp(`^\\[scenter-engine\\] ERROR during '${escapeRegExp(phase)}': interrupted by signal TERM \\(build aborted or agent stopping\\)`, 'm'), result.output);
+  assert.match(result.output, /^SCENTER_ENGINE_STATUS=ERROR$/m, result.output);
+
+  // Verrou et temporaires libérés, rien de partiel en cache, ancien moteur intact.
   assert.equal(fs.existsSync(lockDir(tools)), false, 'verrou libéré à l’interruption');
-  assert.deepEqual(fs.readdirSync(path.join(tools, 'security-center-packages')).filter((name) => name.startsWith('.download-')), []);
+  const packages = fs.readdirSync(path.join(tools, 'security-center-packages'));
+  assert.deepEqual(packages.filter((name) => name.startsWith('.download-') || name.startsWith('.manifest-') || name.startsWith('.auth-')), [], 'aucun fichier temporaire');
+  assert.ok(!packages.includes(`sha256-${v2.sha}.tgz`), 'paquet interrompu jamais mis en cache');
+  assert.equal(fs.readFileSync(markerOf(tools), 'utf8'), markerBefore, 'enregistrement du moteur intact');
+  routes['/latest.json'] = serveJson(manifestFor(v1, `http://127.0.0.1:${port}/v1.tgz`, 'v1'));
+  const back = await runBootstrap(tools, { SCENTER_ENGINE_MANIFEST_URL: manifestUrl });
+  assert.equal(back.status, 0, back.output);
+  assert.equal(back.action, 'unchanged', 'le moteur v1 est toujours vérifié et utilisable');
 });
 
 test('bornes invalides refusées avant toute action', { skip: SKIP }, async () => {
