@@ -1,0 +1,519 @@
+'use strict';
+
+/**
+ * Security Center CI Runtime onboarding.
+ *
+ * Turns five facts — Jenkins URL, job, runtime host, SSH user and the ID of a
+ * Jenkins credential — into a working, verified Jenkins SSH agent that runs the
+ * Security Center analysis. Nobody creates a node by hand and nobody runs a
+ * shell command.
+ *
+ * Rules this module holds to:
+ *   - The private SSH key never leaves Jenkins. Security Center stores and sends
+ *     only the credential ID, and reads only the credential's public metadata.
+ *   - The Jenkins API token travels in an Authorization header, never in a URL,
+ *     a message or a returned object.
+ *   - Only the node and the check job Security Center created are ever changed:
+ *     each carries a marker in its description, and anything without it is
+ *     reported, never overwritten.
+ *   - "Ready" is earned: every state comes from what Jenkins and a real build on
+ *     the agent returned, never from what was merely submitted.
+ */
+
+const http = require('http');
+const https = require('https');
+const path = require('path');
+const { normalizeJenkinsUrl, jenkinsJobPath, scrubJenkinsError } = require('./jenkins');
+
+const RUNTIME_LABEL = 'scenter-ci-runtime';
+const AGENT_NAME = 'scenter-ci-runtime';
+const CHECK_JOB = 'scenter-ci-runtime-check';
+const MANAGED_MARKER = 'Managed by Security Center (CI Runtime).';
+const MIN_NODE_MAJOR = 20;
+
+const STEP_STATE = Object.freeze({ PENDING: 'pending', READY: 'ready', FAILED: 'failed', SKIPPED: 'skipped' });
+const CI_RUNTIME_STEPS = Object.freeze([
+  Object.freeze({ id: 'jenkins', label: 'Jenkins' }),
+  Object.freeze({ id: 'ssh', label: 'SSH' }),
+  Object.freeze({ id: 'docker', label: 'Docker' }),
+  Object.freeze({ id: 'runtime', label: 'CI Runtime' })
+]);
+
+const HOST_NAME = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+const IPV6 = /^[0-9A-Fa-f:]{2,39}$/;
+const SSH_USER = /^[A-Za-z_][A-Za-z0-9_.-]{0,31}$/;
+const CREDENTIAL_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const REMOTE_ROOT = /^\/[A-Za-z0-9._/-]*$/;
+const KEY_MATERIAL = /BEGIN [A-Z ]*PRIVATE KEY|PuTTY-User-Key-File|ssh-(rsa|ed25519|dss) AAAA/i;
+
+function defaultRemoteRoot(sshUser) {
+  return sshUser === 'root' ? '/root/scenter-agent' : `/home/${sshUser}/scenter-agent`;
+}
+
+/** Validates the runtime form. Nothing it rejects is ever echoed back. */
+function normalizeCiRuntimeConfig(input = {}) {
+  const text = (value) => String(value ?? '').trim();
+  if (Object.values(input || {}).some((value) => KEY_MATERIAL.test(String(value ?? '')))) {
+    return {
+      valid: false,
+      errors: ['Never paste an SSH key into Security Center: keep it in Jenkins Credentials and enter only its credential ID.'],
+      config: {}
+    };
+  }
+  const errors = [];
+  const config = {
+    jenkinsUrl: '',
+    job: text(input.job),
+    host: text(input.host),
+    port: text(input.port) || '22',
+    sshUser: text(input.sshUser),
+    credentialId: text(input.credentialId),
+    remoteRoot: text(input.remoteRoot)
+  };
+  try { config.jenkinsUrl = normalizeJenkinsUrl(input.jenkinsUrl); } catch (error) { errors.push(error.message); }
+  try { jenkinsJobPath(config.job); } catch (error) { errors.push(error.message); }
+  if (!config.host) errors.push('Enter the runtime host.');
+  else if (!HOST_NAME.test(config.host) && !IPV6.test(config.host)) errors.push('The runtime host must be a host name or an IP address, without user, port or path.');
+  if (!/^\d{1,5}$/.test(config.port) || Number(config.port) < 1 || Number(config.port) > 65535) errors.push('The SSH port must be between 1 and 65535.');
+  if (!config.sshUser) errors.push('Enter the SSH user.');
+  else if (!SSH_USER.test(config.sshUser)) errors.push('The SSH user may contain letters, digits, ".", "_" and "-" only.');
+  if (!config.credentialId) errors.push('Enter the ID of the Jenkins credential that holds the SSH private key.');
+  else if (!CREDENTIAL_ID.test(config.credentialId)) errors.push('The Jenkins credential ID may contain letters, digits, ".", "_" and "-" only.');
+  if (!config.remoteRoot && SSH_USER.test(config.sshUser)) config.remoteRoot = defaultRemoteRoot(config.sshUser);
+  if (config.remoteRoot && (!REMOTE_ROOT.test(config.remoteRoot) || config.remoteRoot === '/' || config.remoteRoot.split('/').includes('..'))) {
+    errors.push('The remote root must be an absolute directory, for example /home/jenkins/scenter-agent.');
+  }
+  return { valid: !errors.length, errors, config };
+}
+
+function xml(value) {
+  return String(value ?? '').replace(/[<>&'"]/g, (character) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[character]));
+}
+
+function unxml(value) {
+  return String(value ?? '').replace(/&(lt|gt|amp|apos|quot);/g, (_, entity) => ({ lt: '<', gt: '>', amp: '&', apos: "'", quot: '"' }[entity]));
+}
+
+/**
+ * The managed SSH agent, as Jenkins stores it. Exclusive mode: it only runs
+ * builds that ask for the Security Center label. The host key is trusted on
+ * first connection and pinned afterwards. SCENTER_HOME (and SCENTER_NODE_HOME
+ * once detected) travel as node environment variables, so the Jenkinsfile needs
+ * no host-specific path.
+ */
+function agentConfigXml(config, { nodeHome = '' } = {}) {
+  const environment = [
+    ['SCENTER_CI_RUNTIME', 'managed'],
+    ['SCENTER_HOME', `${config.remoteRoot}/.security-center`],
+    ...(nodeHome ? [['SCENTER_NODE_HOME', nodeHome]] : [])
+  ].sort(([a], [b]) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+  return `<?xml version="1.1" encoding="UTF-8"?>
+<slave>
+  <name>${AGENT_NAME}</name>
+  <description>${xml(MANAGED_MARKER)} Runs Security Center analyses on ${xml(config.host)}.</description>
+  <remoteFS>${xml(config.remoteRoot)}</remoteFS>
+  <numExecutors>2</numExecutors>
+  <mode>EXCLUSIVE</mode>
+  <retentionStrategy class="hudson.slaves.RetentionStrategy$Always"/>
+  <launcher class="hudson.plugins.sshslaves.SSHLauncher">
+    <host>${xml(config.host)}</host>
+    <port>${Number(config.port)}</port>
+    <credentialsId>${xml(config.credentialId)}</credentialsId>
+    <launchTimeoutSeconds>60</launchTimeoutSeconds>
+    <maxNumRetries>3</maxNumRetries>
+    <retryWaitTime>15</retryWaitTime>
+    <sshHostKeyVerificationStrategy class="hudson.plugins.sshslaves.verifiers.ManuallyTrustedKeyVerificationStrategy">
+      <requireInitialManualTrust>false</requireInitialManualTrust>
+    </sshHostKeyVerificationStrategy>
+  </launcher>
+  <label>${RUNTIME_LABEL}</label>
+  <nodeProperties>
+    <hudson.slaves.EnvironmentVariablesNodeProperty>
+      <envVars serialization="custom">
+        <unserializable-parents/>
+        <tree-map>
+          <default>
+            <comparator class="java.lang.String$CaseInsensitiveComparator"/>
+          </default>
+          <int>${environment.length}</int>
+${environment.map(([key, value]) => `          <string>${xml(key)}</string>\n          <string>${xml(value)}</string>`).join('\n')}
+        </tree-map>
+      </envVars>
+    </hudson.slaves.EnvironmentVariablesNodeProperty>
+  </nodeProperties>
+</slave>
+`;
+}
+
+/** Minimal creation payload; the full configuration is then written as config.xml. */
+function createNodeJson(config) {
+  return {
+    name: AGENT_NAME,
+    nodeDescription: MANAGED_MARKER,
+    numExecutors: '2',
+    remoteFS: config.remoteRoot,
+    labelString: RUNTIME_LABEL,
+    mode: 'EXCLUSIVE',
+    '': ['hudson.slaves.JNLPLauncher', 'hudson.slaves.RetentionStrategy$Always'],
+    launcher: { 'stapler-class': 'hudson.slaves.JNLPLauncher', $class: 'hudson.slaves.JNLPLauncher' },
+    retentionStrategy: { 'stapler-class': 'hudson.slaves.RetentionStrategy$Always', $class: 'hudson.slaves.RetentionStrategy$Always' },
+    nodeProperties: { 'stapler-class-bag': 'true' }
+  };
+}
+
+/**
+ * What the check build runs on the agent. Every probe runs, whatever the
+ * previous one found, and prints one SCENTER_CHECK_* line: Security Center
+ * reads facts, never a raw error.
+ */
+const CHECK_SHELL = [
+  'set +x',
+  'set +e',
+  'echo "SCENTER_CHECK_USER=$(id -un)"',
+  'echo "SCENTER_CHECK_WORKSPACE=$(pwd)"',
+  'if touch .scenter-runtime-check && rm -f .scenter-runtime-check; then echo "SCENTER_CHECK_WRITE=ok"; else echo "SCENTER_CHECK_WRITE=failed"; fi',
+  'if command -v git >/dev/null 2>&1; then echo "SCENTER_CHECK_GIT=$(git --version)"; else echo "SCENTER_CHECK_GIT=missing"; fi',
+  'node_bin=""',
+  'if [ -n "${SCENTER_NODE_HOME:-}" ] && [ -x "$SCENTER_NODE_HOME/bin/node" ]; then node_bin="$SCENTER_NODE_HOME/bin/node"; else node_bin="$(command -v node 2>/dev/null)"; fi',
+  'if [ -n "$node_bin" ]; then echo "SCENTER_CHECK_NODE=$("$node_bin" --version 2>/dev/null) $node_bin"; else echo "SCENTER_CHECK_NODE=missing"; fi',
+  'if ! command -v docker >/dev/null 2>&1; then echo "SCENTER_CHECK_DOCKER=missing"',
+  'elif docker_out="$(docker info --format \'{{.ServerVersion}}\' 2>&1)"; then echo "SCENTER_CHECK_DOCKER=ready $docker_out"',
+  'else case "$docker_out" in *ermission*) echo "SCENTER_CHECK_DOCKER=permission-denied" ;; *) echo "SCENTER_CHECK_DOCKER=unreachable" ;; esac; fi',
+  'echo "SCENTER_CHECK_DONE=1"'
+].join('\n');
+
+/** The managed check pipeline: sandboxed, one build at a time, ten builds kept. */
+function checkJobConfigXml() {
+  const pipeline = `node('${RUNTIME_LABEL}') {\n  sh(label: 'Security Center CI Runtime check', script: '''\n${CHECK_SHELL}\n''')\n}\n`;
+  return `<?xml version="1.1" encoding="UTF-8"?>
+<flow-definition>
+  <description>${xml(MANAGED_MARKER)} Verifies the Security Center CI Runtime: SSH, workspace and Docker.</description>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <org.jenkinsci.plugins.workflow.job.properties.DisableConcurrentBuildsJobProperty/>
+    <jenkins.model.BuildDiscarderProperty>
+      <strategy class="hudson.tasks.LogRotator">
+        <daysToKeep>-1</daysToKeep>
+        <numToKeep>10</numToKeep>
+        <artifactDaysToKeep>-1</artifactDaysToKeep>
+        <artifactNumToKeep>-1</artifactNumToKeep>
+      </strategy>
+    </jenkins.model.BuildDiscarderProperty>
+  </properties>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition">
+    <script>${xml(pipeline)}</script>
+    <sandbox>true</sandbox>
+  </definition>
+  <triggers/>
+  <disabled>false</disabled>
+</flow-definition>
+`;
+}
+
+function parseCheckOutput(text) {
+  const facts = {};
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const match = /^SCENTER_CHECK_([A-Z]+)=(.*)$/.exec(line.trim());
+    if (match && !(match[1] in facts)) facts[match[1]] = match[2].trim();
+  }
+  return facts;
+}
+
+/** Text that came from a remote host: printable and bounded. */
+function safeFact(value) {
+  return String(value ?? '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 200);
+}
+
+/** One Jenkins API call. Never throws on an HTTP status: the flow interprets it. */
+function jenkinsCall(target, { method = 'GET', user = '', token = '', body = null, contentType = '', headers: extra = {}, timeoutMs = 15000, maxBytes = 512 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try { url = new URL(target); } catch { return reject(new Error('Invalid Jenkins URL.')); }
+    const transport = url.protocol === 'https:' ? https : http;
+    const headers = { accept: 'application/json, application/xml, text/plain', ...extra };
+    if (token) headers.authorization = `Basic ${Buffer.from(`${user}:${token}`).toString('base64')}`;
+    if (body !== null) {
+      headers['content-type'] = contentType || 'application/x-www-form-urlencoded';
+      headers['content-length'] = Buffer.byteLength(body);
+    }
+    const request = transport.request(url, { method, headers, timeout: timeoutMs }, (response) => {
+      let size = 0;
+      const chunks = [];
+      response.on('data', (chunk) => {
+        size += chunk.length;
+        if (size <= maxBytes) chunks.push(chunk);
+      });
+      response.on('end', () => resolve({ status: response.statusCode || 500, headers: response.headers || {}, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    request.on('timeout', () => request.destroy(new Error('Jenkins did not answer in time.')));
+    request.on('error', (error) => reject(new Error(scrubJenkinsError(error.message))));
+    if (body !== null) request.write(body);
+    request.end();
+  });
+}
+
+/** GET and crumb-protected POST against one Jenkins, with the API token in a header. */
+function createJenkinsClient({ baseUrl, user, token, call, timeoutMs }) {
+  let crumbHeaders = null;
+  const url = (relative) => `${baseUrl}/${String(relative).replace(/^\/+/, '')}`;
+  const get = (relative, options = {}) => call(url(relative), { user, token, timeoutMs, ...options });
+  async function crumb() {
+    if (crumbHeaders) return crumbHeaders;
+    crumbHeaders = {};
+    const response = await get('crumbIssuer/api/json');
+    if (response.status === 200) {
+      try {
+        const data = JSON.parse(response.text);
+        if (data.crumbRequestField && data.crumb) crumbHeaders[data.crumbRequestField] = String(data.crumb);
+      } catch { /* no crumb: CSRF protection disabled */ }
+      const cookies = [].concat(response.headers?.['set-cookie'] || []).map((cookie) => String(cookie).split(';')[0]).filter(Boolean);
+      if (cookies.length) crumbHeaders.cookie = cookies.join('; ');
+    }
+    return crumbHeaders;
+  }
+  async function post(relative, { body = '', contentType = 'application/x-www-form-urlencoded' } = {}) {
+    return call(url(relative), { method: 'POST', user, token, timeoutMs, body, contentType, headers: await crumb() });
+  }
+  return { get, post };
+}
+
+function httpProblem(response, what) {
+  if (response.status === 401) return 'Jenkins rejected the API user or token (HTTP 401). Update them in Security Delivery → Jenkins.';
+  if (response.status === 403) return `The Jenkins API user is not allowed to ${what} (HTTP 403).`;
+  return `Jenkins answered HTTP ${response.status} while trying to ${what}.`;
+}
+
+/** Why the SSH agent did not come online, from the agent log, without quoting it. */
+function sshFailureReason(log, config) {
+  const text = String(log || '');
+  if (/authentication failed|server rejected|publickey|auth fail/i.test(text)) {
+    return `SSH authentication failed for user "${config.sshUser}" with credential "${config.credentialId}". The credential's public key must be authorized for ${config.sshUser} on ${config.host}.`;
+  }
+  if (/host key|hostkey|not trusted|key verification/i.test(text)) {
+    return `The SSH host key of ${config.host} was refused. If the host was reinstalled, clear the trusted key of agent ${AGENT_NAME} in Jenkins.`;
+  }
+  if (/connection refused|timed out|no route to host|unknownhost|unresolved|could not resolve/i.test(text)) {
+    return `Jenkins cannot reach ${config.host}:${config.port} over SSH.`;
+  }
+  if (/java/i.test(text) && /not found|no such file|unable to find|cannot find|could not find/i.test(text)) {
+    return `Java is not installed on ${config.host}: Jenkins SSH agents need Java 17 or later on the runtime host.`;
+  }
+  return `Jenkins could not start agent ${AGENT_NAME} on ${config.host}. The agent log in Jenkins has the details.`;
+}
+
+function existingNodeHome(configXml, host) {
+  const existingHost = /<host>([^<]*)<\/host>/.exec(configXml)?.[1];
+  if (existingHost === undefined || unxml(existingHost) !== host) return '';
+  const match = /<string>SCENTER_NODE_HOME<\/string>\s*<string>([^<]*)<\/string>/.exec(configXml);
+  return match ? unxml(match[1]) : '';
+}
+
+const json = (response) => { try { return JSON.parse(response?.text || ''); } catch { return null; } };
+const formBody = (fields) => Object.entries(fields).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join('&');
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function poll(read, done, { sleep, now, timeoutMs, intervalMs }) {
+  const deadline = now() + timeoutMs;
+  let value = await read();
+  while (!done(value) && now() < deadline) {
+    await sleep(intervalMs);
+    value = await read();
+  }
+  return value;
+}
+
+/**
+ * Configures and verifies the CI Runtime. Returns the four-line report
+ * (Jenkins, SSH, Docker, CI Runtime); `onProgress` receives it after every step.
+ */
+async function configureCiRuntime({
+  config: input = {}, user = '', token = '', call = jenkinsCall,
+  sleep = defaultSleep, now = Date.now, timeouts = {}, onProgress = () => {}
+} = {}) {
+  const limits = { requestMs: 15000, connectMs: 180000, queueMs: 300000, buildMs: 600000, pollMs: 3000, ...timeouts };
+  const steps = CI_RUNTIME_STEPS.map((step) => ({ id: step.id, label: step.label, state: STEP_STATE.PENDING, summary: 'Not checked', detail: '' }));
+  const byId = Object.fromEntries(steps.map((step) => [step.id, step]));
+  const report = () => ({
+    ready: steps.every((step) => step.state === STEP_STATE.READY),
+    steps: steps.map((step) => ({ ...step })),
+    lines: steps.map((step) => `${step.label}: ${step.summary}`),
+    agentName: AGENT_NAME,
+    label: RUNTIME_LABEL,
+    checkedAt: new Date(now()).toISOString()
+  });
+  const set = (id, state, summary, detail = '') => {
+    Object.assign(byId[id], { state, summary, detail });
+    onProgress(report());
+  };
+  const stop = (id, summary, detail) => {
+    set(id, STEP_STATE.FAILED, summary, detail);
+    for (const step of steps.slice(steps.indexOf(byId[id]) + 1)) {
+      if (step.state === STEP_STATE.PENDING) Object.assign(step, { state: STEP_STATE.SKIPPED, summary: 'Not checked', detail: `Waiting for ${byId[id].label}.` });
+    }
+    const final = report();
+    onProgress(final);
+    return final;
+  };
+  const attempt = async (action) => {
+    try { return await action(); } catch (error) { return { status: 0, headers: {}, text: '', error: scrubJenkinsError(error.message) }; }
+  };
+
+  // ------------------------------------------------------------ 1. Jenkins
+  const checked = normalizeCiRuntimeConfig(input);
+  if (!checked.valid) return stop('jenkins', 'Not configured', checked.errors.join(' '));
+  const config = checked.config;
+  if (!user || !token) {
+    return stop('jenkins', 'Not authenticated', 'Configure the Jenkins API user and token in Security Delivery → Jenkins: Security Center needs them to create the agent.');
+  }
+  set('jenkins', STEP_STATE.PENDING, 'Checking');
+  const jenkins = createJenkinsClient({ baseUrl: config.jenkinsUrl, user, token, call, timeoutMs: limits.requestMs });
+  const root = await attempt(() => jenkins.get('api/json?tree=mode'));
+  if (root.error) return stop('jenkins', 'Unreachable', `Cannot reach Jenkins at ${config.jenkinsUrl}: ${root.error}`);
+  if (root.status !== 200) return stop('jenkins', [401, 403].includes(root.status) ? 'Not authenticated' : 'Error', httpProblem(root, 'read Jenkins'));
+  const job = await attempt(() => jenkins.get(`${jenkinsJobPath(config.job)}/api/json?tree=name`));
+  if (job.status === 404) return stop('jenkins', 'Job not found', `Jenkins has no job "${config.job}".`);
+  if (job.error || job.status !== 200) return stop('jenkins', 'Error', job.error || httpProblem(job, 'read the job'));
+  const plugins = await attempt(() => jenkins.get('pluginManager/api/json?tree=plugins[shortName,active]'));
+  const pluginList = plugins.status === 200 ? (json(plugins)?.plugins || []) : null;
+  const pluginActive = (name) => !pluginList || pluginList.some((plugin) => plugin.shortName === name && plugin.active);
+  if (!pluginActive('workflow-job') || !pluginActive('workflow-cps')) {
+    return stop('jenkins', 'Pipeline unavailable', 'The Jenkins Pipeline plugins (workflow-job, workflow-cps) are not installed or not active.');
+  }
+  const version = /^[\w.-]{1,40}$/.test(String(root.headers?.['x-jenkins'] || '')) ? ` ${root.headers['x-jenkins']}` : '';
+  set('jenkins', STEP_STATE.READY, 'Connected', `Jenkins${version} · job ${config.job}.`);
+
+  // ------------------------------------------------------------ 2. SSH
+  set('ssh', STEP_STATE.PENDING, 'Checking');
+  if (!pluginActive('ssh-slaves')) {
+    return stop('ssh', 'SSH agents unavailable', 'The Jenkins plugin "SSH Build Agents" (ssh-slaves) is not installed or not active.');
+  }
+  const credential = await attempt(() => jenkins.get(`credentials/store/system/domain/_/credential/${encodeURIComponent(config.credentialId)}/api/json?tree=id,typeName,displayName`));
+  if (credential.status === 404) {
+    return stop('ssh', 'Credential not found', `Jenkins has no global credential "${config.credentialId}". Create an "SSH Username with private key" credential in Jenkins Credentials, then enter its ID.`);
+  }
+  if (credential.error || credential.status !== 200) return stop('ssh', 'Credential unavailable', credential.error || httpProblem(credential, 'view credentials'));
+  const credentialType = safeFact(json(credential)?.typeName);
+  if (!/ssh/i.test(credentialType)) {
+    return stop('ssh', 'Wrong credential type', `Credential "${config.credentialId}" is "${credentialType || 'unknown'}", not an SSH private key credential.`);
+  }
+
+  const nodePath = `computer/${encodeURIComponent(AGENT_NAME)}`;
+  const existing = await attempt(() => jenkins.get(`${nodePath}/config.xml`));
+  let nodeHome = '';
+  if (existing.status === 200) {
+    if (!existing.text.includes(MANAGED_MARKER)) {
+      return stop('ssh', 'Name in use', `A Jenkins node named "${AGENT_NAME}" exists but was not created by Security Center. It is never overwritten: rename or remove it in Jenkins.`);
+    }
+    nodeHome = existingNodeHome(existing.text, config.host);
+  } else if (existing.status === 404) {
+    const created = await attempt(() => jenkins.post(`computer/doCreateItem?name=${encodeURIComponent(AGENT_NAME)}&type=hudson.slaves.DumbSlave`, {
+      body: formBody({ name: AGENT_NAME, type: 'hudson.slaves.DumbSlave', json: JSON.stringify(createNodeJson(config)) })
+    }));
+    if (created.error || created.status >= 400) return stop('ssh', 'Agent not created', created.error || httpProblem(created, 'create agents (Agent/Create)'));
+  } else {
+    return stop('ssh', 'Agent unavailable', existing.error || httpProblem(existing, 'read agents'));
+  }
+  const written = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome }), contentType: 'application/xml' }));
+  if (written.error || written.status >= 400) return stop('ssh', 'Agent not configured', written.error || httpProblem(written, 'configure agents (Agent/Configure)'));
+
+  const nodeStatus = async () => {
+    const response = await attempt(() => jenkins.get(`${nodePath}/api/json?tree=offline,connecting,temporarilyOffline`));
+    return response.status === 200 ? (json(response) || { offline: true }) : { offline: true, connecting: false };
+  };
+  let computer = await nodeStatus();
+  if (computer.temporarilyOffline) {
+    return stop('ssh', 'Marked offline', `Agent ${AGENT_NAME} is marked temporarily offline in Jenkins. Bring it back online there, then retry.`);
+  }
+  if (computer.offline) {
+    const launched = await attempt(() => jenkins.post(`${nodePath}/launchSlaveAgent`));
+    if (launched.error || launched.status >= 400) return stop('ssh', 'Not connected', launched.error || httpProblem(launched, 'connect agents (Agent/Connect)'));
+    let reads = 0;
+    computer = await poll(async () => { reads += 1; return nodeStatus(); },
+      (value) => !value.offline || (reads >= 2 && !value.connecting),
+      { sleep, now, timeoutMs: limits.connectMs, intervalMs: limits.pollMs });
+  }
+  if (computer.offline) {
+    const log = await attempt(() => jenkins.get(`${nodePath}/logText/progressiveText?start=0`, { maxBytes: 256 * 1024 }));
+    return stop('ssh', 'Not connected', sshFailureReason(log.text, config));
+  }
+  set('ssh', STEP_STATE.READY, 'Ready', `Agent ${AGENT_NAME} online on ${config.host} with credential ${config.credentialId}.`);
+
+  // ------------------------------------------------------------ 3-4. Docker and workspace, from a real build
+  set('docker', STEP_STATE.PENDING, 'Checking');
+  set('runtime', STEP_STATE.PENDING, 'Checking');
+  const jobPath = `job/${encodeURIComponent(CHECK_JOB)}`;
+  const jobConfig = await attempt(() => jenkins.get(`${jobPath}/config.xml`));
+  let savedJob;
+  if (jobConfig.status === 200) {
+    if (!jobConfig.text.includes(MANAGED_MARKER)) {
+      return stop('docker', 'Check job name in use', `A Jenkins job named "${CHECK_JOB}" exists but was not created by Security Center. It is never overwritten.`);
+    }
+    savedJob = await attempt(() => jenkins.post(`${jobPath}/config.xml`, { body: checkJobConfigXml(), contentType: 'application/xml' }));
+  } else if (jobConfig.status === 404) {
+    savedJob = await attempt(() => jenkins.post(`createItem?name=${encodeURIComponent(CHECK_JOB)}`, { body: checkJobConfigXml(), contentType: 'application/xml' }));
+  } else {
+    savedJob = jobConfig;
+  }
+  if (savedJob.error || savedJob.status >= 400) return stop('docker', 'Check not started', savedJob.error || httpProblem(savedJob, 'create or configure jobs (Job/Create, Job/Configure)'));
+  const queued = await attempt(() => jenkins.post(`${jobPath}/build?delay=0sec`));
+  if (queued.error || queued.status >= 400) return stop('docker', 'Check not started', queued.error || httpProblem(queued, 'build jobs (Job/Build)'));
+  const queueId = /\/queue\/item\/(\d+)\/?$/.exec(String(queued.headers?.location || ''))?.[1];
+  if (!queueId) return stop('docker', 'Check not started', 'Jenkins did not return the queue item of the check build.');
+
+  const item = await poll(async () => json(await attempt(() => jenkins.get(`queue/item/${queueId}/api/json?tree=cancelled,why,executable[number]`))) || {},
+    (value) => value.cancelled === true || Number.isInteger(value.executable?.number),
+    { sleep, now, timeoutMs: limits.queueMs, intervalMs: limits.pollMs });
+  if (!Number.isInteger(item.executable?.number)) {
+    return stop('docker', 'Check not started', item.cancelled
+      ? 'The check build was cancelled in Jenkins.'
+      : `The check build did not start on label ${RUNTIME_LABEL} within ${Math.round(limits.queueMs / 1000)}s${item.why ? ` (${safeFact(item.why)})` : ''}.`);
+  }
+  const number = item.executable.number;
+  const build = await poll(async () => json(await attempt(() => jenkins.get(`${jobPath}/${number}/api/json?tree=building,result`))) || { building: true },
+    (value) => value.building === false,
+    { sleep, now, timeoutMs: limits.buildMs, intervalMs: limits.pollMs });
+  if (build.building !== false) return stop('docker', 'Check timed out', `Check build #${number} did not finish within ${Math.round(limits.buildMs / 1000)}s.`);
+  const consoleText = await attempt(() => jenkins.get(`${jobPath}/${number}/consoleText`, { maxBytes: 256 * 1024 }));
+  const facts = parseCheckOutput(consoleText.text);
+  const result = safeFact(build.result) || 'without a result';
+
+  const agentUser = safeFact(facts.USER);
+  if (agentUser && agentUser !== config.sshUser) {
+    set('ssh', STEP_STATE.FAILED, 'Wrong user', `The agent runs as "${agentUser}", but the SSH user is "${config.sshUser}". Use a credential whose username is ${config.sshUser}.`);
+  }
+  const docker = safeFact(facts.DOCKER);
+  const dockerVersion = /^ready\s+(\S+)/.exec(docker)?.[1];
+  const runner = agentUser || config.sshUser;
+  if (dockerVersion) set('docker', STEP_STATE.READY, 'Ready', `Docker ${dockerVersion} usable by ${runner} on ${config.host}.`);
+  else if (docker === 'missing') set('docker', STEP_STATE.FAILED, 'Not installed', `Docker is not installed on ${config.host}.`);
+  else if (docker === 'permission-denied') set('docker', STEP_STATE.FAILED, 'Permission denied', `User "${runner}" cannot use the Docker daemon on ${config.host}. Add that user to the docker group on the host.`);
+  else if (docker === 'unreachable') set('docker', STEP_STATE.FAILED, 'Daemon unreachable', `The Docker daemon on ${config.host} is not running or not reachable.`);
+  else set('docker', STEP_STATE.FAILED, 'Not checked', `Check build #${number} ended ${result} before Docker was checked.`);
+
+  const problems = [];
+  if (facts.WRITE !== 'ok') problems.push('the agent workspace is not writable');
+  if (!facts.GIT || facts.GIT === 'missing') problems.push(`git is not installed on ${config.host}`);
+  const node = /^v(\d+)\.\d+\.\d+\s+(\/\S+)$/.exec(safeFact(facts.NODE));
+  if (!node) problems.push(`Node.js ${MIN_NODE_MAJOR} or later is not installed on ${config.host}`);
+  else if (Number(node[1]) < MIN_NODE_MAJOR) problems.push(`Node.js ${node[1]} on ${config.host} is too old (${MIN_NODE_MAJOR} or later is required)`);
+  else {
+    const detectedHome = path.posix.dirname(path.posix.dirname(node[2]));
+    if (detectedHome !== nodeHome) {
+      const updated = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome: detectedHome }), contentType: 'application/xml' }));
+      if (updated.error || updated.status >= 400) problems.push(`SCENTER_NODE_HOME could not be recorded on the agent (${updated.error || `HTTP ${updated.status}`})`);
+      else nodeHome = detectedHome;
+    }
+  }
+  if (!facts.DONE || build.result !== 'SUCCESS') problems.push(`check build #${number} ended ${result}`);
+  if (byId.ssh.state !== STEP_STATE.READY) problems.push('SSH is not ready');
+  if (byId.docker.state !== STEP_STATE.READY) problems.push('Docker is not ready');
+  if (problems.length) set('runtime', STEP_STATE.FAILED, 'Not ready', `CI Runtime not ready: ${problems.join('; ')}.`);
+  else set('runtime', STEP_STATE.READY, 'Ready', `Workspace ${safeFact(facts.WORKSPACE)} writable · ${safeFact(facts.GIT)} · Node.js v${node[1]} (${nodeHome}) · label ${RUNTIME_LABEL}.`);
+  return report();
+}
+
+module.exports = {
+  RUNTIME_LABEL, AGENT_NAME, CHECK_JOB, MANAGED_MARKER, MIN_NODE_MAJOR, STEP_STATE, CI_RUNTIME_STEPS,
+  normalizeCiRuntimeConfig, agentConfigXml, checkJobConfigXml, parseCheckOutput, sshFailureReason,
+  configureCiRuntime, jenkinsCall
+};

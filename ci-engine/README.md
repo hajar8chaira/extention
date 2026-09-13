@@ -68,6 +68,35 @@ create or write fails the build with ERROR, naming the variable.
 To roll out a new engine build: publish the new `.tgz` at the URL and update
 `SCENTER_ENGINE_SHA256`. The next build upgrades itself.
 
+## Managed CI Runtime (no Jenkins node to create by hand)
+
+In VS Code, Security Delivery → Jenkins → **CI Runtime**: enter the Jenkins URL,
+the job, the runtime host, the SSH user and the ID of a Jenkins
+"SSH Username with private key" credential, then **Configure CI Runtime**.
+Security Center uses the Jenkins API (with the API token already stored for
+Security Delivery) to:
+
+1. check the Jenkins connection, the job and the Pipeline / SSH Build Agents plugins;
+2. check that the credential exists and is an SSH key (its secret is never read);
+3. create or update the SSH agent `scenter-ci-runtime` (label `scenter-ci-runtime`,
+   exclusive, remote root `/home/<ssh user>/scenter-agent` by default, host key
+   trusted on first connection);
+4. connect it;
+5. run the managed check job `scenter-ci-runtime-check` on that label: SSH user,
+   writable workspace, git, Node.js 20+ and `docker info`;
+6. report `Jenkins`, `SSH`, `Docker` and `CI Runtime`, each Ready or with the reason.
+
+The private key stays in Jenkins Credentials: Security Center stores only the
+credential ID. A node or job with those names that Security Center did not create
+is never overwritten. The Jenkinsfile runs Checkout-pinned bootstrap, analysis,
+Policy Gate and supply-chain evidence on that label; deployment stays on the main
+agent.
+
+The Jenkins API user needs Overall/Read, Agent/Create, Configure and Connect,
+Job/Create, Configure, Build and Read, and Credentials/View. The runtime host
+needs Java 17+ (for the SSH agent), git, Node.js 20+ and Docker usable by the SSH
+user; any missing piece is named in the report.
+
 ## Scanner runtime on the Jenkins node
 
 Under Jenkins, the CI Engine runs the scanners that `security-center.yml`

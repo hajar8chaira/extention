@@ -46,6 +46,8 @@ const {
   deliveryConsoleUrl, notConfiguredModel
 } = require('./integrations/delivery');
 const { renderDeliveryProviderPageHtml } = require('./delivery-provider-view');
+const { configureCiRuntime, normalizeCiRuntimeConfig } = require('./ci-runtime');
+const { renderCiRuntimeCard } = require('./ci-runtime-view');
 const {
   fetchPrometheusStatus, buildPrometheusStatus, normalizePrometheusUrl,
   DEFAULT_OBSERVABILITY_PROVIDER, isSupportedObservabilityProvider, observabilityProvider, observabilityAdapter
@@ -4643,6 +4645,27 @@ async function activate(context) {
   let deliveryView = 'hub';
   let deliveryConfiguring = false;
 
+  // ---------------------------------------------------------------- CI Runtime
+  // Distinct de Security Delivery (lecture des builds) et du déploiement : l'agent
+  // Jenkins qui exécute l'analyse. Seul l'ID du credential Jenkins est conservé,
+  // jamais une clé ; l'état enregistré ne contient aucun secret.
+  let ciRuntimeStatus = context.workspaceState.get('securityCenter.ciRuntime.status', null);
+  let ciRuntimeRunning = false;
+
+  function ciRuntimeConfiguration() {
+    const stored = vscode.workspace.getConfiguration('securityCenter').get('ciRuntime', {});
+    return stored && typeof stored === 'object' ? stored : {};
+  }
+
+  async function saveCiRuntimeConfiguration(values = {}) {
+    const checked = normalizeCiRuntimeConfig(values);
+    if (!checked.valid) return { ok: false, message: checked.errors.join(' ') };
+    const { jenkinsUrl, job, host, port, sshUser, credentialId, remoteRoot } = checked.config;
+    await vscode.workspace.getConfiguration('securityCenter')
+      .update('ciRuntime', { jenkinsUrl, job, host, port, sshUser, credentialId, remoteRoot }, vscode.ConfigurationTarget.Workspace);
+    return { ok: true, config: checked.config };
+  }
+
   function renderDeliveryPage() {
     if (!deliveryPanel) return;
     const selectedProvider = deliveryFormProvider();
@@ -4662,7 +4685,18 @@ async function activate(context) {
       view: deliveryView,
       configuring: deliveryConfiguring,
       activeProvider: deliveryConfiguration.getActiveProviderId() || '',
-      configurations
+      configurations,
+      // Le runtime CI appartient à Jenkins seul : la page générique l'accueille
+      // comme un panneau, sans connaître le fournisseur.
+      workspacePanels: selectedProvider === 'jenkins' ? renderCiRuntimeCard({
+        configuration: ciRuntimeConfiguration(),
+        defaults: {
+          jenkinsUrl: deliveryConfiguration.getProviderConfig('jenkins')?.url || '',
+          job: deliveryConfiguration.getProviderConfig('jenkins')?.job || ''
+        },
+        status: ciRuntimeStatus,
+        running: ciRuntimeRunning
+      }) : ''
     }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview)), 'delivery');
   }
 
@@ -4764,6 +4798,50 @@ async function activate(context) {
           if (!build || !artifact) return;
           try { await vscode.env.openExternal(vscode.Uri.parse(jenkinsArtifactUrl(cfg.url || '', cfg.job || '', build, artifact))); }
           catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
+          return;
+        }
+        if (message.action === 'ciRuntimeSave' || message.action === 'ciRuntimeConfigure') {
+          if (ciRuntimeRunning) return;
+          const saved = await saveCiRuntimeConfiguration(message.values || {});
+          if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
+          if (message.action === 'ciRuntimeSave') {
+            vscode.window.showInformationMessage('Security Center : CI Runtime configuration saved.');
+            return void renderDeliveryPage();
+          }
+          ciRuntimeRunning = true;
+          renderDeliveryPage();
+          try {
+            // Le jeton d'API Jenkins reste dans SecretStorage (Security Delivery → Jenkins).
+            const jenkinsAuth = await mergedDeliveryConfiguration('jenkins');
+            ciRuntimeStatus = await vscode.window.withProgress({
+              location: vscode.ProgressLocation.Notification,
+              title: 'Security Center — Configure CI Runtime'
+            }, (progress) => configureCiRuntime({
+              config: saved.config,
+              user: jenkinsAuth.user || '',
+              token: jenkinsAuth.token || '',
+              onProgress: (report) => {
+                const current = report.steps.find((step) => step.state === 'pending');
+                if (current) progress.report({ message: `${current.label}…` });
+                ciRuntimeStatus = report;
+                renderDeliveryPage();
+              }
+            }));
+            await context.workspaceState.update('securityCenter.ciRuntime.status', ciRuntimeStatus);
+            await createAuditEvent(backendBaseUrl(), {
+              scan_id: currentScanId || 0, action: 'scanner.configuration.changed', actor: 'System',
+              comment: `CI Runtime ${ciRuntimeStatus.ready ? 'ready' : 'not ready'} : ${ciRuntimeStatus.lines.join(' · ')}`,
+              metadata: { integration: 'jenkins-ci-runtime', ready: ciRuntimeStatus.ready }
+            }).catch(() => {});
+            const summary = ciRuntimeStatus.lines.join(' · ');
+            if (ciRuntimeStatus.ready) vscode.window.showInformationMessage(`Security Center : ${summary}`);
+            else vscode.window.showErrorMessage(`Security Center : ${summary}`);
+          } catch (error) {
+            vscode.window.showErrorMessage(`Security Center : CI Runtime — ${error.message}`);
+          } finally {
+            ciRuntimeRunning = false;
+            renderDeliveryPage();
+          }
           return;
         }
         if (message.action === 'deliveryConfigure') { deliveryConfiguring = true; renderDeliveryPage(); return; }

@@ -304,7 +304,7 @@ test('K — un enregistrement de livraison inconnu ou absent n’est jamais pré
 
 test('le pipeline suit exactement le flux attendu', () => {
   const stages = [...JENKINSFILE.matchAll(/stage\('([^']+)'\)/g)].map((match) => match[1]);
-  assert.deepEqual(stages, ['Checkout', 'Bootstrap Security Center CI Engine', 'Security Center Analysis', 'Policy Gate', 'Supply chain evidence', 'Deploy', 'Health Check']);
+  assert.deepEqual(stages, ['Checkout', 'Security Center CI Runtime', 'Prepare CI Runtime workspace', 'Bootstrap Security Center CI Engine', 'Security Center Analysis', 'Policy Gate', 'Supply chain evidence', 'Deploy', 'Health Check']);
   assert.match(JENKINSFILE, /PATH = "\/var\/jenkins_home\/tools\/node22\/bin:\$\{env\.PATH\}"/);
   // Le moteur vient du home Security Center résolu comme par le bootstrap, jamais
   // d'un ancien emplacement forcé que l'utilisateur Jenkins ne peut pas écrire.

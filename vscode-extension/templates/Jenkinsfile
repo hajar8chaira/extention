@@ -25,6 +25,9 @@
 //   SCENTER_PROJECT_CREDENTIALS_ID  credential Git du dépôt, s'il est privé
 //   SCENTER_DEPLOY_COMMAND          commande de déploiement, exécutée seulement sur PASS
 //   SCENTER_HEALTHCHECK_URL         URL vérifiée après un déploiement réussi
+//   SCENTER_CI_RUNTIME_LABEL        (optionnel) label du runtime CI géré, défaut scenter-ci-runtime.
+//                                   Security Center → Security Delivery → Jenkins → « Configure CI Runtime »
+//                                   crée et vérifie cet agent SSH : aucun nœud à créer à la main.
 // Credentials optionnels, liés seulement quand security-center.yml en a besoin :
 //   security-center-sonar-token (scanners.sonarqube: true), security-center-snyk-token (scanners.snyk: true),
 //   SECURITY_CENTER_COSIGN_KEY_CREDENTIAL / _PASSWORD_CREDENTIAL / _PUBLIC_KEY_CREDENTIAL (signature).
@@ -833,6 +836,20 @@ main() {
 main "$@"
 '''
 
+// Le dépôt applicatif, extrait de la même façon sur l'agent principal et sur le
+// runtime CI géré.
+def scenterCheckoutProject() {
+  if (env.SCENTER_PROJECT_REPO_URL) {
+    def repository = [url: env.SCENTER_PROJECT_REPO_URL, branch: env.SCENTER_PROJECT_BRANCH ?: 'master']
+    if (env.SCENTER_PROJECT_CREDENTIALS_ID) {
+      repository.credentialsId = env.SCENTER_PROJECT_CREDENTIALS_ID
+    }
+    git(repository)
+  } else {
+    checkout scm
+  }
+}
+
 pipeline {
   agent any
 
@@ -871,20 +888,9 @@ pipeline {
           env.SC_DEPLOY_REASON = 'Analyse Security Center non terminée.'
           env.SC_HEALTH_STATUS = 'SKIPPED'
           env.SC_HEALTH_DETAIL = 'Aucun déploiement.'
-          // Même résolution que le bootstrap : la commande security-center est celle
-          // du moteur qu'il vient de vérifier, jamais un ancien emplacement.
-          def scenterHome = env.SCENTER_HOME ?: "${env.JENKINS_HOME ?: '/var/jenkins_home'}/.security-center"
-          def enginePrefix = env.SCENTER_ENGINE_PREFIX ?: (env.SCENTER_HOME ? "${scenterHome}/engine" : (env.SCENTER_TOOLS_DIR ? "${env.SCENTER_TOOLS_DIR}/security-center" : "${scenterHome}/engine"))
-          env.SC_ENGINE_BIN = "${enginePrefix}/bin"
-          if (env.SCENTER_PROJECT_REPO_URL) {
-            def repository = [url: env.SCENTER_PROJECT_REPO_URL, branch: env.SCENTER_PROJECT_BRANCH ?: 'master']
-            if (env.SCENTER_PROJECT_CREDENTIALS_ID) {
-              repository.credentialsId = env.SCENTER_PROJECT_CREDENTIALS_ID
-            }
-            git(repository)
-          } else {
-            checkout scm
-          }
+          scenterCheckoutProject()
+          // Le runtime CI analyse exactement ce commit, même si la branche avance entre-temps.
+          env.SC_SOURCE_COMMIT = sh(returnStdout: true, label: 'Source commit', script: 'git rev-parse HEAD').trim()
           // Les preuves d'un build précédent ne doivent jamais être attribuées à celui-ci.
           sh(label: 'Clean previous Security Center outputs', script: 'rm -rf security-center-report.json security-center-full-report.json security-center-delivery.json security-center')
           if (!fileExists('security-center.yml') && !fileExists('security-center.yaml')) {
@@ -894,141 +900,177 @@ pipeline {
       }
     }
 
-    stage('Bootstrap Security Center CI Engine') {
-      steps {
-        script {
-          def engineCredentials = []
-          if (env.SCENTER_ENGINE_TGZ_URL_CREDENTIAL) {
-            engineCredentials << string(credentialsId: env.SCENTER_ENGINE_TGZ_URL_CREDENTIAL, variable: 'SCENTER_ENGINE_TGZ_URL')
+    stage('Security Center CI Runtime') {
+      // L'analyse s'exécute sur le runtime CI géré par Security Center : un agent
+      // SSH créé et vérifié par « Configure CI Runtime » (SSH, Docker, workspace).
+      // Le déploiement et le health check restent sur l'agent principal.
+      agent { label "${env.SCENTER_CI_RUNTIME_LABEL ?: 'scenter-ci-runtime'}" }
+      options { skipDefaultCheckout() }
+      stages {
+
+        stage('Prepare CI Runtime workspace') {
+          steps {
+            script {
+              // Même résolution que le bootstrap : la commande security-center est celle
+              // du moteur qu'il vient de vérifier, jamais un ancien emplacement.
+              def scenterHome = env.SCENTER_HOME ?: "${env.JENKINS_HOME ?: '/var/jenkins_home'}/.security-center"
+              def enginePrefix = env.SCENTER_ENGINE_PREFIX ?: (env.SCENTER_HOME ? "${scenterHome}/engine" : (env.SCENTER_TOOLS_DIR ? "${env.SCENTER_TOOLS_DIR}/security-center" : "${scenterHome}/engine"))
+              env.SC_ENGINE_BIN = "${enginePrefix}/bin"
+              scenterCheckoutProject()
+              if (env.SC_SOURCE_COMMIT) {
+                sh(label: 'Pin analysed commit', script: 'git checkout --quiet --detach "$SC_SOURCE_COMMIT"')
+              }
+              // Les preuves d'un build précédent ne doivent jamais être attribuées à celui-ci.
+              sh(label: 'Clean previous Security Center outputs', script: 'rm -rf security-center-report.json security-center-full-report.json security-center-delivery.json security-center')
+            }
           }
-          if (env.SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL) {
-            engineCredentials << string(credentialsId: env.SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL, variable: 'SCENTER_ENGINE_DOWNLOAD_TOKEN')
-          }
-          withCredentials(engineCredentials) {
-            withEnv(["SCENTER_BOOTSTRAP_FAILURE_REPORT=${env.WORKSPACE}/security-center-report.json"]) {
-              def status = sh(returnStatus: true, label: 'Bootstrap Security Center CI Engine', script: SCENTER_ENGINE_BOOTSTRAP)
-              env.SC_ENGINE_READY = status == 0 ? 'true' : 'false'
-              if (status != 0) {
-                // Jamais de repli silencieux sur un ancien moteur : l'analyse n'a pas lieu.
-                env.SC_EXIT = '2'
-                env.SC_VERDICT = 'ERROR'
-                env.SC_DEPLOY_REASON = 'CI Engine indisponible : bootstrap en échec.'
+        }
+
+        stage('Bootstrap Security Center CI Engine') {
+          steps {
+            script {
+              def engineCredentials = []
+              if (env.SCENTER_ENGINE_TGZ_URL_CREDENTIAL) {
+                engineCredentials << string(credentialsId: env.SCENTER_ENGINE_TGZ_URL_CREDENTIAL, variable: 'SCENTER_ENGINE_TGZ_URL')
+              }
+              if (env.SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL) {
+                engineCredentials << string(credentialsId: env.SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL, variable: 'SCENTER_ENGINE_DOWNLOAD_TOKEN')
+              }
+              withCredentials(engineCredentials) {
+                withEnv(["SCENTER_BOOTSTRAP_FAILURE_REPORT=${env.WORKSPACE}/security-center-report.json"]) {
+                  def status = sh(returnStatus: true, label: 'Bootstrap Security Center CI Engine', script: SCENTER_ENGINE_BOOTSTRAP)
+                  env.SC_ENGINE_READY = status == 0 ? 'true' : 'false'
+                  if (status != 0) {
+                    // Jamais de repli silencieux sur un ancien moteur : l'analyse n'a pas lieu.
+                    env.SC_EXIT = '2'
+                    env.SC_VERDICT = 'ERROR'
+                    env.SC_DEPLOY_REASON = 'CI Engine indisponible : bootstrap en échec.'
+                  }
+                }
               }
             }
           }
         }
-      }
-    }
 
-    stage('Security Center Analysis') {
-      when {
-        expression { env.SC_ENGINE_READY == 'true' }
-      }
-      steps {
-        script {
-          // Liaison de credentials uniquement. Le choix des scanners, les seuils,
-          // les secrets et les exigences supply chain restent dans
-          // security-center.yml, lu par le CI Engine lui-même.
-          def enabledInPolicy = { String scanner ->
-            sh(returnStatus: true, script: "grep -Eqs '^  ${scanner}:[[:space:]]*true' security-center.yml security-center.yaml") == 0
+        stage('Security Center Analysis') {
+          when {
+            expression { env.SC_ENGINE_READY == 'true' }
           }
-          def bindings = []
-          if (enabledInPolicy('sonarqube')) {
-            bindings << string(credentialsId: 'security-center-sonar-token', variable: 'SONAR_TOKEN')
-          }
-          if (enabledInPolicy('snyk')) {
-            bindings << string(credentialsId: 'security-center-snyk-token', variable: 'SNYK_TOKEN')
-          }
-          if (env.SECURITY_CENTER_COSIGN_KEY_CREDENTIAL) {
-            if (!env.SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL) {
-              error('Security Center : SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL est requis pour signer.')
-            }
-            bindings << file(credentialsId: env.SECURITY_CENTER_COSIGN_KEY_CREDENTIAL, variable: 'SC_COSIGN_KEY')
-            bindings << string(credentialsId: env.SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL, variable: 'COSIGN_PASSWORD')
-            if (env.SECURITY_CENTER_COSIGN_PUBLIC_KEY_CREDENTIAL) {
-              bindings << file(credentialsId: env.SECURITY_CENTER_COSIGN_PUBLIC_KEY_CREDENTIAL, variable: 'SC_COSIGN_PUB')
-            }
-          }
+          steps {
+            script {
+              // Liaison de credentials uniquement. Le choix des scanners, les seuils,
+              // les secrets et les exigences supply chain restent dans
+              // security-center.yml, lu par le CI Engine lui-même.
+              def enabledInPolicy = { String scanner ->
+                sh(returnStatus: true, script: "grep -Eqs '^  ${scanner}:[[:space:]]*true' security-center.yml security-center.yaml") == 0
+              }
+              def bindings = []
+              if (enabledInPolicy('sonarqube')) {
+                bindings << string(credentialsId: 'security-center-sonar-token', variable: 'SONAR_TOKEN')
+              }
+              if (enabledInPolicy('snyk')) {
+                bindings << string(credentialsId: 'security-center-snyk-token', variable: 'SNYK_TOKEN')
+              }
+              if (env.SECURITY_CENTER_COSIGN_KEY_CREDENTIAL) {
+                if (!env.SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL) {
+                  error('Security Center : SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL est requis pour signer.')
+                }
+                bindings << file(credentialsId: env.SECURITY_CENTER_COSIGN_KEY_CREDENTIAL, variable: 'SC_COSIGN_KEY')
+                bindings << string(credentialsId: env.SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL, variable: 'COSIGN_PASSWORD')
+                if (env.SECURITY_CENTER_COSIGN_PUBLIC_KEY_CREDENTIAL) {
+                  bindings << file(credentialsId: env.SECURITY_CENTER_COSIGN_PUBLIC_KEY_CREDENTIAL, variable: 'SC_COSIGN_PUB')
+                }
+              }
 
-          withCredentials(bindings) {
-            withEnv(["PATH+SCENTER_ENGINE=${env.SC_ENGINE_BIN}"]) {
-              // `returnStatus` : on LIT le code de sortie au lieu de laisser Jenkins
-              // interrompre le pipeline avant l'archivage des preuves.
-              def status = sh(
-                returnStatus: true,
-                label: 'Security Center Analysis',
-                script: '''
-                  security-center scan \
-                    --workspace "$WORKSPACE" \
-                    --format json \
-                    --output security-center-full-report.json \
-                    --ci-report security-center-report.json \
-                    --sbom \
-                    --provenance \
-                    ${SONAR_PROJECT_KEY:+--sonar-project-key "$SONAR_PROJECT_KEY"} \
-                    ${SC_COSIGN_KEY:+--sign-key "$SC_COSIGN_KEY"} \
-                    ${SC_COSIGN_PUB:+--verify-key "$SC_COSIGN_PUB"}
-                '''
-              )
-              // Tout code hors du contrat (commande introuvable, crash) est un ERROR.
-              env.SC_EXIT = (status in [0, 1, 2]) ? status.toString() : '2'
+              withCredentials(bindings) {
+                withEnv(["PATH+SCENTER_ENGINE=${env.SC_ENGINE_BIN}"]) {
+                  // `returnStatus` : on LIT le code de sortie au lieu de laisser Jenkins
+                  // interrompre le pipeline avant l'archivage des preuves.
+                  def status = sh(
+                    returnStatus: true,
+                    label: 'Security Center Analysis',
+                    script: '''
+                      security-center scan \
+                        --workspace "$WORKSPACE" \
+                        --format json \
+                        --output security-center-full-report.json \
+                        --ci-report security-center-report.json \
+                        --sbom \
+                        --provenance \
+                        ${SONAR_PROJECT_KEY:+--sonar-project-key "$SONAR_PROJECT_KEY"} \
+                        ${SC_COSIGN_KEY:+--sign-key "$SC_COSIGN_KEY"} \
+                        ${SC_COSIGN_PUB:+--verify-key "$SC_COSIGN_PUB"}
+                    '''
+                  )
+                  // Tout code hors du contrat (commande introuvable, crash) est un ERROR.
+                  env.SC_EXIT = (status in [0, 1, 2]) ? status.toString() : '2'
+                }
+              }
+              if (env.SC_EXIT == '0' && !fileExists('security-center-report.json')) {
+                env.SC_EXIT = '2'
+              }
+              env.SC_VERDICT = ['0': 'PASS', '1': 'BLOCK', '2': 'ERROR'][env.SC_EXIT]
             }
           }
-          if (env.SC_EXIT == '0' && !fileExists('security-center-report.json')) {
-            env.SC_EXIT = '2'
+          post {
+            // Archivé dans TOUS les cas : un build bloqué doit exposer ses preuves.
+            always {
+              archiveArtifacts artifacts: 'security-center-report.json', allowEmptyArchive: true, fingerprint: true
+              archiveArtifacts artifacts: 'security-center-full-report.json', allowEmptyArchive: true
+              archiveArtifacts artifacts: 'security-center/*.cdx.json, security-center/*.provenance.json, **/*.sigstore.json', excludes: '**/node_modules/**', allowEmptyArchive: true, fingerprint: true
+            }
           }
-          env.SC_VERDICT = ['0': 'PASS', '1': 'BLOCK', '2': 'ERROR'][env.SC_EXIT]
+        }
+
+        stage('Policy Gate') {
+          steps {
+            script {
+              if (env.SC_EXIT == '2') {
+                if (env.SC_ENGINE_READY == 'true') {
+                  env.SC_DEPLOY_REASON = 'Security Center ERROR : analyse incomplète ou non fiable.'
+                }
+                // Une politique illisible, un scanner en échec ou un CI Engine absent n'est pas un PASS.
+                error("Security Center : ERROR — échec d'exécution, CI Engine indisponible ou politique invalide (code 2). Déploiement ignoré.")
+              }
+              if (env.SC_EXIT == '1') {
+                env.SC_DEPLOY_REASON = 'Policy Gate BLOCK : livraison refusée par security-center.yml.'
+                error('Security Center : Policy Gate BLOCK — livraison refusée. Déploiement ignoré.')
+              }
+              env.SC_DEPLOY_REASON = ''
+              echo 'Security Center : PASS — livraison autorisée par security-center.yml.'
+            }
+          }
+        }
+
+        stage('Supply chain evidence') {
+          steps {
+            // Le CI Engine a déjà appliqué require_sbom, require_provenance et
+            // require_signature de security-center.yml : une preuve exigée mais
+            // absente donne un verdict non PASS. Ce contrôle final vérifie qu'aucune
+            // preuve déclarée produite n'est absente du disque.
+            withEnv(["PATH+SCENTER_NODE=${env.SCENTER_NODE_HOME ?: '/var/jenkins_home/tools/node22'}/bin"]) {
+              sh(label: 'Verify supply chain evidence', script: '''
+                node -e '
+                  const fs = require("fs");
+                  const report = JSON.parse(fs.readFileSync("security-center-report.json", "utf8"));
+                  const supply = report.supplyChain || {};
+                  const produced = ["generated", "signed", "verified"];
+                  for (const [kind, file] of [["sbom", supply.sbomPath], ["provenance", supply.provenancePath], ["signature", supply.signaturePath]]) {
+                    if (!produced.includes(supply[kind])) continue;
+                    if (!file || !fs.existsSync(file)) { console.error("Preuve " + kind + " déclarée mais absente : " + file); process.exit(1); }
+                    console.log("Preuve " + kind + " : " + file);
+                  }
+                '
+              ''')
+            }
+          }
         }
       }
       post {
-        // Archivé dans TOUS les cas : un build bloqué doit exposer ses preuves.
         always {
-          archiveArtifacts artifacts: 'security-center-report.json', allowEmptyArchive: true, fingerprint: true
-          archiveArtifacts artifacts: 'security-center-full-report.json', allowEmptyArchive: true
-          archiveArtifacts artifacts: 'security-center/*.cdx.json, security-center/*.provenance.json, **/*.sigstore.json', excludes: '**/node_modules/**', allowEmptyArchive: true, fingerprint: true
+          // Le rapport CI revient sur l'agent principal, archivé avec l'état de livraison.
+          stash name: 'scenter-ci-report', includes: 'security-center-report.json', allowEmpty: true
         }
-      }
-    }
-
-    stage('Policy Gate') {
-      steps {
-        script {
-          if (env.SC_EXIT == '2') {
-            if (env.SC_ENGINE_READY == 'true') {
-              env.SC_DEPLOY_REASON = 'Security Center ERROR : analyse incomplète ou non fiable.'
-            }
-            // Une politique illisible, un scanner en échec ou un CI Engine absent n'est pas un PASS.
-            error("Security Center : ERROR — échec d'exécution, CI Engine indisponible ou politique invalide (code 2). Déploiement ignoré.")
-          }
-          if (env.SC_EXIT == '1') {
-            env.SC_DEPLOY_REASON = 'Policy Gate BLOCK : livraison refusée par security-center.yml.'
-            error('Security Center : Policy Gate BLOCK — livraison refusée. Déploiement ignoré.')
-          }
-          env.SC_DEPLOY_REASON = ''
-          echo 'Security Center : PASS — livraison autorisée par security-center.yml.'
-        }
-      }
-    }
-
-    stage('Supply chain evidence') {
-      steps {
-        // Le CI Engine a déjà appliqué require_sbom, require_provenance et
-        // require_signature de security-center.yml : une preuve exigée mais
-        // absente donne un verdict non PASS. Ce contrôle final vérifie qu'aucune
-        // preuve déclarée produite n'est absente du disque.
-        sh(label: 'Verify supply chain evidence', script: '''
-          node -e '
-            const fs = require("fs");
-            const report = JSON.parse(fs.readFileSync("security-center-report.json", "utf8"));
-            const supply = report.supplyChain || {};
-            const produced = ["generated", "signed", "verified"];
-            for (const [kind, file] of [["sbom", supply.sbomPath], ["provenance", supply.provenancePath], ["signature", supply.signaturePath]]) {
-              if (!produced.includes(supply[kind])) continue;
-              if (!file || !fs.existsSync(file)) { console.error("Preuve " + kind + " déclarée mais absente : " + file); process.exit(1); }
-              console.log("Preuve " + kind + " : " + file);
-            }
-          '
-        ''')
       }
     }
 
@@ -1087,6 +1129,12 @@ pipeline {
   post {
     always {
       script {
+        // Le rapport CI produit sur le runtime CI, quand l'analyse a pu y démarrer.
+        try {
+          unstash 'scenter-ci-report'
+        } catch (ignored) {
+          echo 'Aucun rapport CI à récupérer du runtime CI.'
+        }
         // L'état de livraison lu par Security Delivery : verdict, déploiement,
         // health check. Uniquement ce que ce build a réellement établi.
         def text = { String value -> value == null ? 'null' : '"' + value.replace('"', "'") + '"' }

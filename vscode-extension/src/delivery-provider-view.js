@@ -349,7 +349,7 @@ ${facts ? `<div class="hub-facts">${facts}</div>` : ''}
  * vocabulaire. Rien n'est ajouté : une donnée qu'aucun adaptateur ne rapporte
  * aujourd'hui — un historique d'exécutions, par exemple — n'a pas de section.
  */
-function renderProviderWorkspace(model = {}, provider = null, { assets = {}, configuring = false, configuration = {}, secretsConfigured = {}, canDisconnect = false } = {}) {
+function renderProviderWorkspace(model = {}, provider = null, { assets = {}, configuring = false, configuration = {}, secretsConfigured = {}, canDisconnect = false, workspacePanels = '' } = {}) {
   const statusLabel = PAGE_STATUS_LABELS[model.status] || model.statusLabel || model.status || 'Inconnu';
   const logo = providerLogo({ id: model.providerId || provider?.id, label: model.providerLabel || provider?.label }, assets, 'hub-card-logo');
   const header = `<section class="workspace-head ${escapeHtml(STATUS_CLASS[model.status] || 'muted')}" aria-label="État du fournisseur">
@@ -371,7 +371,9 @@ ${model.consoleUrl ? `<button class="secondary" data-action="deliveryOpenConsole
     ? renderProviderForm(provider, { configuration, secretsConfigured, assets, canDisconnect })
     : '';
 
-  return `${header}${actions}${form}${renderWorkspaceSections(model)}`;
+  // Panels the caller adds to this workspace, rendered as given: the renderer
+  // hosts them without knowing which provider they belong to.
+  return `${header}${actions}${form}${workspacePanels || ''}${renderWorkspaceSections(model)}`;
 }
 
 /**
@@ -642,6 +644,13 @@ function deliveryPageCss() {
   .advanced{margin-top:12px;border:1px solid var(--sc-border);border-radius:var(--sc-radius-md);padding:0;background:color-mix(in srgb,var(--sc-surface) 96%,var(--sc-primary) 4%)}
   .advanced summary{display:flex;justify-content:space-between;gap:12px;align-items:center;cursor:pointer;padding:9px 10px;font-weight:800;color:var(--sc-text)}
   .advanced summary small{font-weight:600;color:var(--sc-muted)}.advanced .delivery-fields{padding:0 10px 10px}
+  .workspace-panel{margin-top:12px}
+  .panel-status{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px}
+  .panel-step{display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;padding:7px 10px;border:1px solid var(--sc-border);border-radius:var(--sc-radius-md)}
+  .panel-step small{flex-basis:100%;color:var(--sc-muted)}
+  .panel-step.ready span{color:var(--sc-success);font-weight:700}.panel-step.failed span{color:var(--sc-danger,#c62828);font-weight:700}
+  .panel-step.skipped span,.panel-step.pending span{color:var(--sc-muted)}
+  .panel-checked{display:block;margin-top:6px;color:var(--sc-muted)}
   @media(max-width:980px){.delivery-workspace{grid-template-columns:1fr}}
   @media(max-width:640px){.row{grid-template-columns:1fr}.card-head{align-items:start;flex-direction:column}.delivery-fields{grid-template-columns:1fr}}`;
 }
@@ -658,7 +667,8 @@ function renderDeliveryProviderPageHtml({
   view = 'hub',
   configuring = false,
   activeProvider = '',
-  configurations = {}
+  configurations = {},
+  workspacePanels = ''
 } = {}, nonce = '', theme = 'light', assets = {}) {
   const cspSource = assets?.cspSource || '';
   const resolvedModel = withResolvedProviderAsset(model, assets);
@@ -674,7 +684,7 @@ function renderDeliveryProviderPageHtml({
   // preuves de livraison.
   const workspaceView = view === 'provider' && provider?.implemented;
   const content = workspaceView
-    ? renderProviderWorkspace(resolvedModel, provider, { assets, configuring, configuration, secretsConfigured, canDisconnect })
+    ? renderProviderWorkspace(resolvedModel, provider, { assets, configuring, configuration, secretsConfigured, canDisconnect, workspacePanels })
     : `${renderProviderHub(providerHubEntries(providers, { model: resolvedModel, activeProviderId: activeProvider, configurations }), assets)}
   ${configuring && provider?.implemented ? `<section class="delivery-workspace" aria-label="Configuration du fournisseur">${renderProviderForm(provider, { configuration, secretsConfigured, assets, canDisconnect })}</section>` : ''}`;
 
@@ -710,6 +720,8 @@ function renderDeliveryProviderPageHtml({
     if(action==='deliverySelectProvider')return;
     if(action==='deliveryOpenWorkspace'||action==='deliveryConfigureSelected')return vscode.postMessage({type:'delivery',action,provider:b.dataset.provider||selected()});
     if(action==='deliveryBackToHub')return vscode.postMessage({type:'delivery',action});
+    const panel=b.closest('[data-panel]');
+    if(panel)return vscode.postMessage({type:'delivery',action,panel:panel.dataset.panel,values:Object.fromEntries([...panel.querySelectorAll('[data-panel-field]')].map(el=>[el.dataset.panelField,el.value.trim()]))});
     if(action==='deliverySave'||action==='deliveryTest')return vscode.postMessage({type:'delivery',action,provider:selected(),config:config()});
     vscode.postMessage({type:'delivery',action,provider:selected()});
   });
