@@ -4666,6 +4666,126 @@ async function activate(context) {
     return { ok: true, config: checked.config };
   }
 
+  // Actions of the CI Runtime card that run onboarding, and what each one asks for.
+  const ciRuntimeRunActions = Object.freeze({
+    ciRuntimeConfigure: {},
+    ciRuntimePrepare: {},
+    ciRuntimeInstallJava: { tools: ['java'] },
+    ciRuntimeInstallNode: { tools: ['node'] },
+    ciRuntimeAdminApply: { adminSetup: true }
+  });
+
+  /**
+   * Onboarding with its explicit confirmations: the SSH host key, the managed
+   * installations (host, tool, version, destination, source, SHA-256) and, only
+   * when asked for, the administrator setup through non-interactive sudo. Nothing
+   * is approved on the user's behalf, and no password is ever requested.
+   */
+  async function runCiRuntimeOnboarding(config, { tools = null, adminSetup = false } = {}) {
+    // Le jeton d'API Jenkins reste dans SecretStorage (Security Delivery → Jenkins).
+    const jenkinsAuth = await mergedDeliveryConfiguration('jenkins');
+    const approvals = { approvedHostKey: null, approvedInstalls: [], approvedAdminActions: [] };
+    const onboard = () => vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: 'Security Center — Configure CI Runtime'
+    }, (progress) => configureCiRuntime({
+      config,
+      user: jenkinsAuth.user || '',
+      token: jenkinsAuth.token || '',
+      ...approvals,
+      onProgress: (report) => {
+        const current = report.steps.find((step) => step.state === 'pending');
+        if (current) progress.report({ message: `${current.label}…` });
+        ciRuntimeStatus = report;
+        renderDeliveryPage();
+      }
+    }));
+    let status = await onboard();
+
+    // La clé d'hôte SSH n'est jamais acceptée d'office : son empreinte est
+    // présentée pour approbation explicite, et un changement de clé est un
+    // avertissement de sécurité.
+    const approval = status.hostKeyApproval;
+    if (approval) {
+      const changed = approval.change === 'changed';
+      const trust = changed ? 'Trust the new host key' : 'Trust this host key';
+      const decision = await vscode.window.showWarningMessage(
+        changed
+          ? `Security warning: the SSH host key of ${approval.host} has changed.`
+          : `Trust the SSH host key of ${approval.host}?`,
+        {
+          modal: true,
+          detail: changed
+            ? [
+              `Previously trusted: ${approval.previousFingerprint}`,
+              `Now presented: ${approval.algorithm} ${approval.fingerprint}`,
+              '',
+              'A reinstalled host or rotated keys explain this, and so does an intercepted connection. Trust the new key only after verifying this fingerprint with the host administrator.'
+            ].join('\n')
+            : [
+              `First SSH connection to ${approval.host}:${approval.port}.`,
+              `${approval.algorithm} ${approval.fingerprint}`,
+              '',
+              'Jenkins will only connect to a host presenting exactly this key.'
+            ].join('\n')
+        },
+        trust
+      );
+      if (decision !== trust) return status;
+      approvals.approvedHostKey = { algorithm: approval.algorithm, key: approval.key, replaces: approval.previousFingerprint || '' };
+      status = await onboard();
+      if (status.hostKeyApproval) return status;
+    }
+
+    // Configuration système : seulement sur demande (« Apply admin setup »), par un
+    // sudo non interactif déjà configuré sur l'hôte, jamais avec un mot de passe.
+    if (adminSetup) {
+      const actions = status.admin?.sudo ? (status.admin.actions || []) : [];
+      if (!actions.length) {
+        vscode.window.showWarningMessage('Security Center : no administrator setup can be applied automatically on this host (non-interactive sudo is not configured, or nothing applies). Use "Show manual instructions".');
+      } else {
+        const apply = 'Apply admin setup';
+        const decision = await vscode.window.showWarningMessage(`Apply administrator setup on ${config.host}?`, {
+          modal: true,
+          detail: [
+            ...actions.map((action) => `${action.label}: ${action.command}`),
+            '',
+            'This changes system configuration on the host through non-interactive sudo already configured there. No password is requested, sent or stored.'
+          ].join('\n')
+        }, apply);
+        if (decision === apply) {
+          approvals.approvedAdminActions = actions.map((action) => action.id);
+          status = await onboard();
+        }
+      }
+    }
+
+    // Outils gérés : confirmation explicite de l'hôte, de l'outil, de la version et
+    // de la destination ; la somme SHA-256 est vérifiée avant toute installation.
+    const plan = (status.installPlan || []).filter((item) => !tools || tools.includes(item.tool));
+    if (plan.length) {
+      const install = plan.length > 1 ? 'Install tools' : `Install ${plan[0].label}`;
+      const decision = await vscode.window.showWarningMessage(`Install ${plan.map((item) => item.label).join(' and ')} on ${plan[0].host}?`, {
+        modal: true,
+        detail: [
+          ...plan.flatMap((item) => [
+            `${item.label}: ${item.distribution} ${item.version} (${item.platform})`,
+            `Destination: ${item.destination}`,
+            `Source: ${item.url}`,
+            `SHA-256, verified before install: ${item.sha256}`,
+            ''
+          ]),
+          `Installed as ${plan[0].user} inside the Security Center agent directory: no system package, no sudo, no project file changed.`
+        ].join('\n')
+      }, install);
+      if (decision === install) {
+        approvals.approvedInstalls = plan.map(({ tool, version, destination }) => ({ tool, version, destination }));
+        status = await onboard();
+      }
+    }
+    return status;
+  }
+
   function renderDeliveryPage() {
     if (!deliveryPanel) return;
     const selectedProvider = deliveryFormProvider();
@@ -4800,7 +4920,15 @@ async function activate(context) {
           catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
           return;
         }
-        if (message.action === 'ciRuntimeSave' || message.action === 'ciRuntimeConfigure') {
+        if (message.action === 'ciRuntimeAdminInstructions') {
+          // Instructions pour un administrateur : un document sans titre, jamais un
+          // fichier du projet, et aucune commande n'est exécutée d'ici.
+          const instructions = ciRuntimeStatus?.admin?.instructions;
+          if (!instructions) return void vscode.window.showInformationMessage('Security Center : no administrator action is currently required for the CI Runtime.');
+          const document = await vscode.workspace.openTextDocument({ content: instructions, language: 'markdown' });
+          return void await vscode.window.showTextDocument(document, { preview: true });
+        }
+        if (message.action === 'ciRuntimeSave' || Object.hasOwn(ciRuntimeRunActions, message.action)) {
           if (ciRuntimeRunning) return;
           const saved = await saveCiRuntimeConfiguration(message.values || {});
           if (!saved.ok) return void vscode.window.showErrorMessage(`Security Center : ${saved.message}`);
@@ -4811,57 +4939,7 @@ async function activate(context) {
           ciRuntimeRunning = true;
           renderDeliveryPage();
           try {
-            // Le jeton d'API Jenkins reste dans SecretStorage (Security Delivery → Jenkins).
-            const jenkinsAuth = await mergedDeliveryConfiguration('jenkins');
-            const onboard = (approvedHostKey) => vscode.window.withProgress({
-              location: vscode.ProgressLocation.Notification,
-              title: 'Security Center — Configure CI Runtime'
-            }, (progress) => configureCiRuntime({
-              config: saved.config,
-              user: jenkinsAuth.user || '',
-              token: jenkinsAuth.token || '',
-              approvedHostKey,
-              onProgress: (report) => {
-                const current = report.steps.find((step) => step.state === 'pending');
-                if (current) progress.report({ message: `${current.label}…` });
-                ciRuntimeStatus = report;
-                renderDeliveryPage();
-              }
-            }));
-            ciRuntimeStatus = await onboard(null);
-            // La clé d'hôte SSH n'est jamais acceptée d'office : son empreinte est
-            // présentée pour approbation explicite, et un changement de clé est un
-            // avertissement de sécurité. Une approbation relance l'onboarding une fois.
-            const approval = ciRuntimeStatus.hostKeyApproval;
-            if (approval) {
-              const changed = approval.change === 'changed';
-              const trust = changed ? 'Trust the new host key' : 'Trust this host key';
-              const decision = await vscode.window.showWarningMessage(
-                changed
-                  ? `Security warning: the SSH host key of ${approval.host} has changed.`
-                  : `Trust the SSH host key of ${approval.host}?`,
-                {
-                  modal: true,
-                  detail: changed
-                    ? [
-                      `Previously trusted: ${approval.previousFingerprint}`,
-                      `Now presented: ${approval.algorithm} ${approval.fingerprint}`,
-                      '',
-                      'A reinstalled host or rotated keys explain this, and so does an intercepted connection. Trust the new key only after verifying this fingerprint with the host administrator.'
-                    ].join('\n')
-                    : [
-                      `First SSH connection to ${approval.host}:${approval.port}.`,
-                      `${approval.algorithm} ${approval.fingerprint}`,
-                      '',
-                      'Jenkins will only connect to a host presenting exactly this key.'
-                    ].join('\n')
-                },
-                trust
-              );
-              if (decision === trust) {
-                ciRuntimeStatus = await onboard({ algorithm: approval.algorithm, key: approval.key, replaces: approval.previousFingerprint || '' });
-              }
-            }
+            ciRuntimeStatus = await runCiRuntimeOnboarding(saved.config, ciRuntimeRunActions[message.action]);
             await context.workspaceState.update('securityCenter.ciRuntime.status', ciRuntimeStatus);
             await createAuditEvent(backendBaseUrl(), {
               scan_id: currentScanId || 0, action: 'scanner.configuration.changed', actor: 'System',

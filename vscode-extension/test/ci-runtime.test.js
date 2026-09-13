@@ -61,49 +61,189 @@ const CONSOLE_READY = [
 const ok = (value, headers = {}) => ({ status: 200, headers, text: typeof value === 'string' ? value : JSON.stringify(value) });
 const status = (code, headers = {}) => ({ status: code, headers, text: '' });
 
+const zlib = require('zlib');
+const { PREPARE_JOB } = require('../src/ci-runtime-prerequisites');
+
+/** A minimal jar: a stored manifest and a deflated Launcher.class of the given Java version. */
+function remotingJar(javaMajor, declared = 0) {
+  const entries = [
+    ['META-INF/MANIFEST.MF', Buffer.from(`Manifest-Version: 1.0\r\nVersion: 3301.v4363ddcca_4e7\r\n${declared ? `Remoting-Minimum-Java-Version: ${declared}\r\n` : ''}`), 0],
+    ['hudson/remoting/Launcher.class', Buffer.concat([Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 44 + javaMajor]), Buffer.alloc(64)]), 8]
+  ];
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const [name, raw, method] of entries) {
+    const data = method === 8 ? zlib.deflateRawSync(raw) : raw;
+    const nameBuffer = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(data.length, 18); local.writeUInt32LE(raw.length, 22); local.writeUInt16LE(nameBuffer.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6); central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(data.length, 20); central.writeUInt32LE(raw.length, 24); central.writeUInt16LE(nameBuffer.length, 28); central.writeUInt32LE(offset, 42);
+    locals.push(local, nameBuffer, data);
+    centrals.push(central, nameBuffer);
+    offset += local.length + nameBuffer.length + data.length;
+  }
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+/** The runtime host as the preparation job sees it over SSH. */
+function runtimeHost(overrides = {}) {
+  return {
+    user: 'deploy', platform: 'Linux x86_64', workspaceWritable: true,
+    java: ['21.0.5 /usr/bin/java'], node: ['v22.11.0 /usr/bin/node'], git: 'git version 2.43.0',
+    dockerCli: '/usr/bin/docker', docker: 'ready 27.3.1', socketGroup: 'docker', groups: 'deploy docker',
+    sudo: false, tools: 'curl tar sha256sum systemctl usermod apt-get', downloads: 'ok', installed: {},
+    scripts: [],
+    ...overrides
+  };
+}
+
+function detectionOutput(host) {
+  return [
+    `SCENTER_PREREQ_SSH=ready ${host.user}`,
+    `SCENTER_PREREQ_PLATFORM=${host.platform}`,
+    `SCENTER_PREREQ_WORKSPACE=${host.workspaceWritable ? 'ready' : 'not-writable'} /home/deploy/scenter-agent`,
+    ...host.java.map((entry) => `SCENTER_PREREQ_JAVA=${entry}`),
+    ...host.node.map((entry) => `SCENTER_PREREQ_NODE=${entry}`),
+    `SCENTER_PREREQ_GIT=${host.git}`,
+    host.dockerCli ? `SCENTER_PREREQ_DOCKER_CLI=ready ${host.dockerCli}` : 'SCENTER_PREREQ_DOCKER_CLI=missing',
+    ...(host.dockerCli ? [`SCENTER_PREREQ_DOCKER_DAEMON=${host.docker}`] : []),
+    `SCENTER_PREREQ_DOCKER_SOCKET=${host.dockerCli ? host.socketGroup : 'missing'}`,
+    `SCENTER_PREREQ_GROUPS=${host.groups}`,
+    `SCENTER_PREREQ_SUDO=${host.sudo ? 'non-interactive' : 'unavailable'}`,
+    `SCENTER_PREREQ_TOOLS= ${host.tools}`,
+    'SCENTER_PREREQ_DONE=1'
+  ].join('\n');
+}
+
+/** Runs a preparation script against the host model, as the real script would behave. */
+function runOnHost(host, script) {
+  host.scripts.push(script);
+  if (script.includes('SCENTER_PREREQ_DONE')) return { mode: 'detect', output: detectionOutput(host) };
+  if (script.includes('install_tool()')) {
+    const lines = [];
+    for (const match of script.matchAll(/^install_tool (\w+) '([^']+)' '([^']+)' '([0-9a-f]{64})' '([^']+)'/gm)) {
+      const [, id, version, url, sha, destination] = match;
+      if (host.installed[destination] === version) { lines.push(`SCENTER_INSTALL_${id}=already ${version}`); continue; }
+      if (host.downloads === 'offline') { lines.push(`SCENTER_INSTALL_${id}=download-failed`); continue; }
+      if (host.downloads === 'tampered') { lines.push(`SCENTER_INSTALL_${id}=checksum-mismatch ${'0'.repeat(64)}`); continue; }
+      assert.match(url, /^https:\/\/(github\.com|nodejs\.org)\//, 'only trusted publishers');
+      assert.match(sha, /^[0-9a-f]{64}$/);
+      host.installed[destination] = version;
+      if (id === 'JAVA') host.java.unshift(`${version.replace(/\+.*$/, '')} ${destination}/bin/java`);
+      if (id === 'NODE') host.node.unshift(`${version} ${destination}/bin/node`);
+      lines.push(`SCENTER_INSTALL_${id}=installed ${version}`);
+    }
+    lines.push('SCENTER_INSTALL_DONE=1');
+    return { mode: 'install', output: lines.join('\n') };
+  }
+  const lines = [];
+  if (!host.sudo) lines.push('SCENTER_ADMIN_SUDO=unavailable');
+  else {
+    if (script.includes('usermod -aG docker')) { host.groups += ' docker'; host.docker = 'ready 27.3.1'; lines.push('SCENTER_ADMIN_DOCKER_GROUP=applied'); }
+    if (script.includes('systemctl enable --now docker')) { host.docker = 'ready 27.3.1'; lines.push('SCENTER_ADMIN_DOCKER_START=applied'); }
+  }
+  lines.push('SCENTER_ADMIN_DONE=1');
+  return { mode: 'admin', output: lines.join('\n') };
+}
+
+/** What the managed check job reports from the agent, for the same host. */
+function checkOutput(host) {
+  const node = host.node[0];
+  return [
+    `SCENTER_CHECK_USER=${host.user}`,
+    `SCENTER_CHECK_WORKSPACE=/home/deploy/scenter-agent/workspace/${CHECK_JOB}`,
+    'SCENTER_CHECK_WRITE=ok',
+    `SCENTER_CHECK_GIT=${host.git}`,
+    `SCENTER_CHECK_NODE=${node || 'missing'}`,
+    `SCENTER_CHECK_DOCKER=${!host.dockerCli ? 'missing' : host.docker}`,
+    'SCENTER_CHECK_DONE=1'
+  ].join('\n');
+}
+
 /** A Jenkins double: stateful, strict about paths, recording every call. */
 function fakeJenkins({
   authorized = true,
   credential = { id: 'scenter-runtime-ssh', typeName: 'SSH Username with private key', displayName: 'deploy (CI runtime)' },
-  plugins = ['workflow-job', 'workflow-cps', 'ssh-slaves'],
+  plugins = ['workflow-job', 'workflow-cps', 'ssh-slaves', 'credentials-binding'],
   existingNode = null,
   existingJob = null,
+  existingPrepareJob = null,
+  online = false,
   connects = true,
   launchLog = '',
-  consoleText = CONSOLE_READY,
-  buildResult = 'SUCCESS'
+  consoleText = null,
+  buildResult = 'SUCCESS',
+  host = runtimeHost(),
+  remoting = remotingJar(21)
 } = {}) {
   const calls = [];
-  const state = { nodeXml: existingNode, jobXml: existingJob, online: false, queueReads: 0, buildReads: 0, nodeWrites: [] };
+  const state = {
+    nodeXml: existingNode, jobXml: existingJob, prepareXml: existingPrepareJob, online, nodeWrites: [],
+    host, prepareRuns: [], disconnects: 0, queue: {}, builds: {}, nextQueue: 7, nextBuild: { [CHECK_JOB]: 3, [PREPARE_JOB]: 1 }
+  };
+  const jobXml = (name) => (name === CHECK_JOB ? state.jobXml : state.prepareXml);
+  const saveJob = (name, body) => { if (name === CHECK_JOB) state.jobXml = body; else state.prepareXml = body; };
   async function call(url, options = {}) {
     const method = options.method || 'GET';
     const parsed = new URL(url);
     calls.push({ method, url, path: parsed.pathname, headers: { ...(options.headers || {}) }, body: options.body ?? null, user: options.user, token: options.token });
     if (!authorized) return status(401);
     const route = `${method} ${parsed.pathname}`;
+    const jobRoute = /^(GET|POST) \/job\/([^/]+)\/(config\.xml|build|(\d+)\/api\/json|(\d+)\/consoleText)$/.exec(route);
+    if (jobRoute && [CHECK_JOB, PREPARE_JOB].includes(decodeURIComponent(jobRoute[2]))) {
+      const name = decodeURIComponent(jobRoute[2]);
+      if (jobRoute[3] === 'config.xml' && method === 'GET') return jobXml(name) ? ok(jobXml(name)) : status(404);
+      if (jobRoute[3] === 'config.xml') { saveJob(name, options.body); return status(200); }
+      if (jobRoute[3] === 'build') {
+        const id = state.nextQueue++;
+        const number = state.nextBuild[name]++;
+        let output;
+        if (name === CHECK_JOB) output = consoleText ?? checkOutput(state.host);
+        else {
+          const encoded = /\.scenter-remote\.b64&apos;, text: &apos;([A-Za-z0-9+/=]+)&apos;/.exec(state.prepareXml || '')?.[1];
+          assert.ok(encoded, 'the preparation job carries its remote script');
+          const run = runOnHost(state.host, Buffer.from(encoded, 'base64').toString('utf8'));
+          state.prepareRuns.push(run.mode);
+          output = `Started by user scenter-admin\n+ set +x\n${run.output}\nSCENTER_PREPARE_EXIT=0\nFinished: SUCCESS`;
+        }
+        state.queue[id] = { reads: 0, number };
+        state.builds[`${name}/${number}`] = { reads: 0, output };
+        return status(201, { location: `${BASE}/queue/item/${id}/` });
+      }
+      const build = state.builds[`${name}/${jobRoute[4] || jobRoute[5]}`];
+      if (!build) return status(404);
+      if (jobRoute[4]) { build.reads += 1; return ok(build.reads < 2 ? { building: true } : { building: false, result: name === CHECK_JOB ? buildResult : 'SUCCESS' }); }
+      return ok(build.output);
+    }
+    const queueRoute = /^GET \/queue\/item\/(\d+)\/api\/json$/.exec(route);
+    if (queueRoute && state.queue[queueRoute[1]]) {
+      const item = state.queue[queueRoute[1]];
+      item.reads += 1;
+      return ok(item.reads < 2 ? { why: 'Waiting for next available executor' } : { executable: { number: item.number } });
+    }
     switch (route) {
-      case 'GET /api/json': return ok({ mode: 'NORMAL' }, { 'x-jenkins': '2.479.1' });
+      case 'GET /api/json': return ok({ mode: 'NORMAL' }, { 'x-jenkins': '2.568.2' });
       case 'GET /job/security-pipeline/api/json': return ok({ name: 'security-pipeline' });
       case 'GET /pluginManager/api/json': return ok({ plugins: plugins.map((shortName) => ({ shortName, active: true })) });
       case 'GET /crumbIssuer/api/json': return ok({ crumbRequestField: 'Jenkins-Crumb', crumb: 'crumb-123' }, { 'set-cookie': ['JSESSIONID.node0=abc; Path=/; HttpOnly'] });
+      case 'GET /jnlpJars/remoting.jar': return remoting ? { status: 200, headers: {}, text: '', buffer: remoting } : status(404);
       case `GET /credentials/store/system/domain/_/credential/${CONFIG.credentialId}/api/json`: return credential ? ok(credential) : status(404);
       case `GET /computer/${AGENT_NAME}/config.xml`: return state.nodeXml ? ok(state.nodeXml) : status(404);
       case 'POST /computer/doCreateItem': state.nodeXml = '<slave><description>created</description></slave>'; return status(302, { location: `${BASE}/computer/` });
       case `POST /computer/${AGENT_NAME}/config.xml`: state.nodeXml = options.body; state.nodeWrites.push(options.body); return status(200);
       case `GET /computer/${AGENT_NAME}/api/json`: return ok({ offline: !state.online, connecting: false, temporarilyOffline: false });
       case `POST /computer/${AGENT_NAME}/launchSlaveAgent`: state.online = connects; return status(302);
+      case `POST /computer/${AGENT_NAME}/doDisconnect`: state.online = false; state.disconnects += 1; return status(302);
       case `GET /computer/${AGENT_NAME}/logText/progressiveText`: return ok(launchLog);
-      case `GET /job/${CHECK_JOB}/config.xml`: return state.jobXml ? ok(state.jobXml) : status(404);
-      case 'POST /createItem': state.jobXml = options.body; return status(200);
-      case `POST /job/${CHECK_JOB}/config.xml`: state.jobXml = options.body; return status(200);
-      case `POST /job/${CHECK_JOB}/build`: return status(201, { location: `${BASE}/queue/item/7/` });
-      case 'GET /queue/item/7/api/json':
-        state.queueReads += 1;
-        return ok(state.queueReads < 2 ? { why: `Waiting for next available executor on ${RUNTIME_LABEL}` } : { executable: { number: 3 } });
-      case `GET /job/${CHECK_JOB}/3/api/json`:
-        state.buildReads += 1;
-        return ok(state.buildReads < 2 ? { building: true } : { building: false, result: buildResult });
-      case `GET /job/${CHECK_JOB}/3/consoleText`: return ok(consoleText);
+      case 'POST /createItem': saveJob(parsed.searchParams.get('name'), options.body); return status(200);
       default: return status(404);
     }
   }
@@ -225,7 +365,7 @@ test('Configure CI Runtime : agent créé, connecté, Docker et workspace vérif
   assert.match(firstWrite, /<credentialsId>scenter-runtime-ssh<\/credentialsId>/);
   assert.ok(firstWrite.includes(`<key>${HOST_KEY.key}</key>`), 'la clé d’hôte approuvée est épinglée dès la première écriture');
   assert.equal(report.hostKeyApproval, null);
-  assert.doesNotMatch(firstWrite, /SCENTER_NODE_HOME/, 'Node.js n’est pas deviné avant la vérification');
+  assert.match(firstWrite, /<string>SCENTER_NODE_HOME<\/string>\s*<string>\/usr<\/string>/, 'Node.js détecté par les prérequis avant l’écriture de l’agent, jamais deviné');
   assert.match(finalWrite, /<string>SCENTER_NODE_HOME<\/string>\s*<string>\/usr<\/string>/, 'Node.js détecté enregistré sur l’agent');
   assert.match(jenkins.state.jobXml, /<sandbox>true<\/sandbox>/);
   assertNoSecretLeak(jenkins, report);
@@ -233,7 +373,7 @@ test('Configure CI Runtime : agent créé, connecté, Docker et workspace vérif
 
 test('mise à jour idempotente : agent et job gérés réécrits, jamais recréés', async () => {
   const { config } = normalizeCiRuntimeConfig(CONFIG);
-  const jenkins = fakeJenkins({ existingNode: agentConfigXml(config, { nodeHome: '/usr', hostKey: HOST_KEY }), existingJob: checkJobConfigXml() });
+  const jenkins = fakeJenkins({ existingNode: agentConfigXml(config, { nodeHome: '/usr', hostKey: HOST_KEY }), existingJob: checkJobConfigXml(), existingPrepareJob: `<flow-definition><description>${MANAGED_MARKER}</description></flow-definition>` });
   // Clé déjà épinglée et inchangée : aucune nouvelle approbation n'est demandée.
   const { report } = await run(jenkins, { approvedHostKey: null });
   assert.equal(report.ready, true, report.lines.join(' | '));
@@ -276,7 +416,7 @@ test('authentification SSH refusée : SSH en échec avec la cause, aucun build d
   assert.ok(report.steps[1].detail.startsWith('Credential failure, not a host trust problem'), report.steps[1].detail);
   assert.match(report.steps[1].detail, /SSH authentication failed for user "deploy" with credential "scenter-runtime-ssh"/);
   assert.doesNotMatch(report.steps[1].detail, /Server rejected|10:00:01/, 'le journal brut n’est pas recopié');
-  assert.ok(!jenkins.posts().some((entry) => entry.path.endsWith('/build')), 'aucun build lancé');
+  assert.ok(!jenkins.posts().some((entry) => entry.path === `/job/${CHECK_JOB}/build`), 'aucun build de vérification lancé');
 });
 
 test('Java absent sur l’hôte : cause nommée', async () => {
@@ -409,6 +549,168 @@ test('clé d’hôte illisible : SSH en échec précis, aucun agent écrit', asy
   assert.equal(jenkins.posts().length, 0);
 });
 
+// ------------------------------------------------------------ prérequis guidés
+
+const JAVA21_DESTINATION = '/home/deploy/scenter-agent/tools/java21';
+const NODE22_DESTINATION = '/home/deploy/scenter-agent/tools/node22';
+const approve = (report) => report.installPlan.map(({ tool, version, destination }) => ({ tool, version, destination }));
+const prerequisiteStates = (report) => Object.fromEntries(report.prerequisites.map((item) => [item.id, item.state]));
+const agentPosts = (jenkins) => jenkins.posts().filter((entry) => entry.path.startsWith('/computer/'));
+
+test('tout est déjà installé : chaque prérequis Ready, aucune installation, CI Runtime Ready', async () => {
+  const jenkins = fakeJenkins();
+  const { report } = await run(jenkins);
+  assert.equal(report.ready, true, report.lines.join(' | '));
+  assert.deepEqual(prerequisiteStates(report), {
+    ssh: 'ready', workspace: 'ready', java: 'ready', git: 'ready', node: 'ready', 'docker-cli': 'ready', 'docker-daemon': 'ready', 'docker-access': 'ready'
+  });
+  assert.equal(report.prerequisites.find((item) => item.id === 'java').label, 'Java 21', 'exigence lue dans remoting.jar, pas codée en dur');
+  assert.equal(report.installPlan, null);
+  assert.equal(report.admin, null);
+  assert.deepEqual(jenkins.state.prepareRuns, ['detect']);
+  assert.doesNotMatch(jenkins.state.nodeXml, /<javaPath>/, 'Java système utilisé tel quel');
+});
+
+test('Java manquant : plan géré présenté, rien installé sans accord, puis installation vérifiée → Ready', async () => {
+  const host = runtimeHost({ java: ['17.0.12 /usr/bin/java'] });
+  const jenkins = fakeJenkins({ host });
+  const first = await run(jenkins);
+  assert.deepEqual(first.report.lines, ['Jenkins: Connected', 'SSH: Ready', 'Docker: Ready', 'CI Runtime: Prerequisites missing']);
+  const java = first.report.prerequisites.find((item) => item.id === 'java');
+  assert.equal(java.state, 'missing');
+  assert.match(java.detail, /Found only Java 17\.0\.12 at \/usr\/bin\/java; this Jenkins needs Java 21 \(remoting/);
+  assert.deepEqual(first.report.installPlan.map(({ tool, label, distribution, version, platform, destination, host: target, user }) => ({ tool, label, distribution, version, platform, destination, host: target, user })), [{
+    tool: 'java', label: 'Java 21', distribution: 'Eclipse Temurin JRE', version: '21.0.12.1+1', platform: 'linux-x64', destination: JAVA21_DESTINATION, host: CONFIG.host, user: 'deploy'
+  }]);
+  assert.match(first.report.installPlan[0].sha256, /^[0-9a-f]{64}$/);
+  assert.deepEqual(jenkins.state.prepareRuns, ['detect'], 'aucune installation sans confirmation');
+  assert.deepEqual(agentPosts(jenkins), [], 'aucun agent créé tant que Java manque');
+
+  const second = await run(jenkins, { approvedInstalls: approve(first.report) });
+  assert.equal(second.report.ready, true, second.report.lines.join(' | '));
+  assert.deepEqual(jenkins.state.prepareRuns, ['detect', 'detect', 'install', 'detect'], 'détection relancée après installation');
+  assert.equal(second.report.installResults[0].ok, true);
+  assert.equal(second.report.prerequisites.find((item) => item.id === 'java').state, 'ready');
+  assert.ok(jenkins.state.nodeXml.includes(`<javaPath>${JAVA21_DESTINATION}/bin/java</javaPath>`), 'l’agent SSH utilise le Java géré');
+});
+
+test('Node.js manquant : installation gérée de Node.js 22, exposé à l’agent → Ready', async () => {
+  const jenkins = fakeJenkins({ host: runtimeHost({ node: [] }) });
+  const first = await run(jenkins);
+  assert.equal(first.report.prerequisites.find((item) => item.id === 'node').state, 'missing');
+  assert.equal(first.report.installPlan[0].version, 'v22.23.2');
+  assert.equal(first.report.installPlan[0].destination, NODE22_DESTINATION);
+  const second = await run(jenkins, { approvedInstalls: approve(first.report) });
+  assert.equal(second.report.ready, true, second.report.lines.join(' | '));
+  assert.match(jenkins.state.nodeXml, new RegExp(`<string>PATH\\+SCENTER_NODE</string>\\s*<string>${NODE22_DESTINATION}/bin</string>`));
+  assert.match(jenkins.state.nodeXml, new RegExp(`<string>SCENTER_NODE_HOME</string>\\s*<string>${NODE22_DESTINATION}</string>`));
+});
+
+test('somme de contrôle invalide ou téléchargement impossible : ERREUR sûre, rien installé, aucun agent', async () => {
+  for (const [downloads, message] of [
+    ['tampered', /Java 21: the downloaded archive's SHA-256 0{64} does not match the pinned [0-9a-f]{64}\. Nothing was installed\./],
+    ['offline', /Java 21: the download from https:\/\/github\.com\/adoptium\/temurin21-binaries\/.+ failed \(host offline, proxy or firewall\)\./]
+  ]) {
+    const host = runtimeHost({ java: [], downloads });
+    const jenkins = fakeJenkins({ host });
+    const first = await run(jenkins);
+    const { report } = await run(jenkins, { approvedInstalls: approve(first.report) });
+    assert.deepEqual(report.lines, ['Jenkins: Connected', 'SSH: Ready', 'Docker: Ready', 'CI Runtime: Installation failed'], downloads);
+    assert.match(report.steps[3].detail, message);
+    assert.equal(report.installResults[0].ok, false);
+    assert.ok(report.installPlan, 'le plan reste proposé pour réessayer');
+    assert.deepEqual(host.installed, {}, 'rien n’est installé');
+    assert.deepEqual(agentPosts(jenkins), []);
+  }
+});
+
+test('installation refusée ou approbation d’une autre version : aucun changement', async () => {
+  const host = runtimeHost({ java: [] });
+  const jenkins = fakeJenkins({ host });
+  const first = await run(jenkins);
+  await run(jenkins, { approvedInstalls: [] });
+  await run(jenkins, { approvedInstalls: [{ tool: 'java', version: '21.0.1+12', destination: JAVA21_DESTINATION }] });
+  await run(jenkins, { approvedInstalls: [{ tool: 'java', version: first.report.installPlan[0].version, destination: '/tmp/java21' }] });
+  assert.deepEqual(jenkins.state.prepareRuns, ['detect', 'detect', 'detect', 'detect']);
+  assert.ok(!host.scripts.some((script) => script.includes('install_tool()')), 'aucun script d’installation exécuté');
+  assert.deepEqual(host.installed, {});
+  assert.deepEqual(agentPosts(jenkins), []);
+});
+
+test('exigence Java suivie de Jenkins : remoting Java 25 → plan Java 25 ; remoting illisible → défaut annoncé', async () => {
+  const newer = await run(fakeJenkins({ host: runtimeHost({ java: ['21.0.5 /usr/bin/java'] }), remoting: remotingJar(25) }));
+  assert.equal(newer.report.installPlan[0].label, 'Java 25');
+  assert.equal(newer.report.installPlan[0].destination, '/home/deploy/scenter-agent/tools/java25');
+  const unknown = await run(fakeJenkins({ remoting: null }));
+  assert.match(unknown.report.prerequisites.find((item) => item.id === 'java').detail, /required by current Jenkins releases \(remoting\.jar could not be read\)/);
+});
+
+test('Docker absent : administrateur requis, instructions exactes, aucune modification privilégiée', async () => {
+  const host = runtimeHost({ dockerCli: '', sudo: true });
+  const jenkins = fakeJenkins({ host });
+  const { report } = await run(jenkins, { approvedAdminActions: ['docker-group', 'docker-start'] });
+  assert.deepEqual(prerequisiteStates(report), {
+    ssh: 'ready', workspace: 'ready', java: 'ready', git: 'ready', node: 'ready', 'docker-cli': 'admin', 'docker-daemon': 'blocked', 'docker-access': 'blocked'
+  });
+  assert.equal(report.steps[2].summary, 'Administrator action required');
+  assert.equal(report.steps[2].detail, `Docker Engine is not installed on ${CONFIG.host}.`);
+  assert.equal(report.ready, false);
+  assert.deepEqual(report.admin.actions, [], 'Docker Engine n’est jamais installé automatiquement');
+  assert.match(report.admin.instructions, /https:\/\/docs\.docker\.com\/engine\/install\//);
+  assert.ok(!host.scripts.some((script) => /sudo -n (usermod|systemctl)/.test(script)), 'aucune commande privilégiée exécutée');
+});
+
+test('permission Docker refusée : remédiation exacte ; application seulement via sudo non interactif confirmé, puis reconnexion', async () => {
+  const withoutSudo = await run(fakeJenkins({ host: runtimeHost({ docker: 'permission-denied', groups: 'deploy' }) }));
+  const access = withoutSudo.report.prerequisites.find((item) => item.id === 'docker-access');
+  assert.equal(access.state, 'admin');
+  assert.equal(access.detail, 'User deploy cannot use the Docker daemon: /var/run/docker.sock belongs to group "docker" and deploy is not a member (groups: deploy).');
+  assert.match(withoutSudo.report.admin.instructions, /sudo usermod -aG docker deploy/);
+  assert.equal(withoutSudo.report.admin.sudo, false);
+  assert.deepEqual(withoutSudo.report.admin.actions, [], 'sans sudo non interactif : instructions manuelles seulement');
+
+  const host = runtimeHost({ docker: 'permission-denied', groups: 'deploy', sudo: true });
+  const { config } = normalizeCiRuntimeConfig(CONFIG);
+  const jenkins = fakeJenkins({ host, online: true, existingNode: agentConfigXml(config, { nodeHome: '/usr', hostKey: HOST_KEY }) });
+  const offered = await run(jenkins, { approvedHostKey: null });
+  assert.deepEqual(offered.report.admin.actions, [{ id: 'docker-group', label: 'Add deploy to the docker group', command: 'sudo usermod -aG docker deploy' }]);
+  assert.ok(!host.scripts.some((script) => script.includes('sudo -n usermod')), 'rien d’appliqué sans confirmation');
+  const applied = await run(jenkins, { approvedHostKey: null, approvedAdminActions: ['docker-group'] });
+  assert.equal(applied.report.ready, true, applied.report.lines.join(' | '));
+  assert.ok(host.scripts.some((script) => script.includes("sudo -n usermod -aG docker 'deploy'")));
+  assert.equal(jenkins.state.disconnects, 1, 'l’agent est reconnecté pour que le nouveau groupe s’applique');
+});
+
+test('second passage idempotent : rien réinstallé, aucun job ni agent recréé', async () => {
+  const host = runtimeHost({ java: [], node: [] });
+  const jenkins = fakeJenkins({ host });
+  const first = await run(jenkins);
+  const installed = await run(jenkins, { approvedInstalls: approve(first.report) });
+  assert.equal(installed.report.ready, true, installed.report.lines.join(' | '));
+  const creations = jenkins.posts().filter((entry) => ['/createItem', '/computer/doCreateItem'].includes(entry.path)).length;
+  const again = await run(jenkins, { approvedInstalls: approve(first.report) });
+  assert.equal(again.report.ready, true);
+  assert.equal(again.report.installPlan, null, 'outils gérés détectés : plus rien à installer');
+  assert.equal(host.scripts.filter((script) => script.includes('install_tool()')).length, 1, 'aucune seconde installation');
+  assert.equal(jenkins.posts().filter((entry) => ['/createItem', '/computer/doCreateItem'].includes(entry.path)).length, creations);
+});
+
+test('aucun mot de passe sudo ni secret demandé, envoyé, stocké ou journalisé', async () => {
+  const host = runtimeHost({ java: [], docker: 'permission-denied', groups: 'deploy', sudo: true });
+  const jenkins = fakeJenkins({ host });
+  const first = await run(jenkins);
+  const { report } = await run(jenkins, { approvedInstalls: approve(first.report), approvedAdminActions: ['docker-group'] });
+  assertNoSecretLeak(jenkins, report);
+  for (const script of host.scripts) {
+    assert.doesNotMatch(script.replace(/command -v sudo/g, ''), /sudo(?! -n)|sudo -S|SUDO_ASKPASS|passwd/, 'sudo uniquement non interactif');
+    assert.doesNotMatch(script, new RegExp(TOKEN), 'jeton absent des scripts');
+  }
+  assert.match(jenkins.state.prepareXml, /StrictHostKeyChecking=yes/);
+  assert.match(jenkins.state.prepareXml, /sshUserPrivateKey\(credentialsId: &apos;scenter-runtime-ssh&apos;, keyFileVariable: &apos;SCENTER_SSH_KEY&apos;\)/);
+  assert.doesNotMatch(jenkins.state.prepareXml, /PRIVATE KEY|StrictHostKeyChecking=no|password/i);
+  assert.doesNotMatch(JSON.stringify(report), /password|passphrase/i);
+});
+
 // ------------------------------------------------------------ UX
 
 test('carte CI Runtime : dans l’espace Jenkins, séparée du déploiement, sans champ de clé', () => {
@@ -458,7 +760,8 @@ test('le Jenkinsfile exécute l’analyse sur le label du runtime géré, le dé
   for (const stage of ['Prepare CI Runtime workspace', 'Bootstrap Security Center CI Engine', 'Security Center Analysis', 'Policy Gate', 'Supply chain evidence']) {
     assert.ok(runtime.includes(`stage('${stage}')`), `${stage} s’exécute sur le runtime`);
   }
-  assert.match(runtime, /git checkout --quiet --detach "\$SC_SOURCE_COMMIT"/, 'le runtime analyse le commit extrait');
+  assert.match(runtime, /scenterCheckoutAnalysedCommit\(\)/, 'le runtime analyse le commit extrait par l’agent principal');
+  assert.doesNotMatch(runtime, /scenterCheckoutProject\(\)|checkout scm|git\(repository\)/, 'aucun reclone complet sur le runtime');
   assert.match(runtime, /stash name: 'scenter-ci-report', includes: 'security-center-report\.json', allowEmpty: true/);
   assert.match(runtime, /PATH\+SCENTER_NODE=\$\{env\.SCENTER_NODE_HOME \?: '\/var\/jenkins_home\/tools\/node22'\}\/bin/);
   const afterGroup = jenkinsfile.slice(deploy);

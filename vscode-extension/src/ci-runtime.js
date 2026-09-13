@@ -25,6 +25,7 @@ const https = require('https');
 const path = require('path');
 const { normalizeJenkinsUrl, jenkinsJobPath, scrubJenkinsError } = require('./jenkins');
 const { scanSshHostKey, describeHostKey } = require('./ssh-host-key');
+const prerequisites = require('./ci-runtime-prerequisites');
 
 const RUNTIME_LABEL = 'scenter-ci-runtime';
 const AGENT_NAME = 'scenter-ci-runtime';
@@ -103,12 +104,14 @@ function unxml(value) {
  * once detected) travel as node environment variables, so the Jenkinsfile needs
  * no host-specific path.
  */
-function agentConfigXml(config, { nodeHome = '', hostKey = null } = {}) {
+function agentConfigXml(config, { nodeHome = '', hostKey = null, javaPath = '', managedNode = false } = {}) {
   if (!hostKey?.algorithm || !hostKey?.key) throw new Error('The managed agent is only written with an approved, pinned SSH host key.');
   const environment = [
     ['SCENTER_CI_RUNTIME', 'managed'],
     ['SCENTER_HOME', `${config.remoteRoot}/.security-center`],
-    ...(nodeHome ? [['SCENTER_NODE_HOME', nodeHome]] : [])
+    ...(nodeHome ? [['SCENTER_NODE_HOME', nodeHome]] : []),
+    // A managed Node.js is not on the host's PATH: the agent adds it.
+    ...(nodeHome && managedNode ? [['PATH+SCENTER_NODE', `${nodeHome}/bin`]] : [])
   ].sort(([a], [b]) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
   return `<?xml version="1.1" encoding="UTF-8"?>
 <slave>
@@ -122,7 +125,7 @@ function agentConfigXml(config, { nodeHome = '', hostKey = null } = {}) {
     <host>${xml(config.host)}</host>
     <port>${Number(config.port)}</port>
     <credentialsId>${xml(config.credentialId)}</credentialsId>
-    <launchTimeoutSeconds>60</launchTimeoutSeconds>
+${javaPath ? `    <javaPath>${xml(javaPath)}</javaPath>\n` : ''}    <launchTimeoutSeconds>60</launchTimeoutSeconds>
     <maxNumRetries>3</maxNumRetries>
     <retryWaitTime>15</retryWaitTime>
     <sshHostKeyVerificationStrategy class="hudson.plugins.sshslaves.verifiers.ManuallyProvidedKeyVerificationStrategy">
@@ -249,7 +252,10 @@ function jenkinsCall(target, { method = 'GET', user = '', token = '', body = nul
         size += chunk.length;
         if (size <= maxBytes) chunks.push(chunk);
       });
-      response.on('end', () => resolve({ status: response.statusCode || 500, headers: response.headers || {}, text: Buffer.concat(chunks).toString('utf8') }));
+      response.on('end', () => {
+        const body = Buffer.concat(chunks);
+        resolve({ status: response.statusCode || 500, headers: response.headers || {}, text: body.toString('utf8'), buffer: body });
+      });
     });
     request.on('timeout', () => request.destroy(new Error('Jenkins did not answer in time.')));
     request.on('error', (error) => reject(new Error(scrubJenkinsError(error.message))));
@@ -295,7 +301,7 @@ function httpProblem(response, what) {
  * an explicit refusal of the host key counts as the first — the SSH plugin also
  * logs "host key matches" on a connection whose authentication then fails.
  */
-function sshConnectionFailure(log, config, pin) {
+function sshConnectionFailure(log, config, pin, javaMajor = prerequisites.DEFAULT_JAVA_MAJOR) {
   const text = String(log || '');
   if (/connections will be denied|does not match the key|not currently trusted|not previously been seen|host key verification failed|host ?key (?:was )?(?:rejected|refused|denied)/i.test(text)) {
     return {
@@ -313,7 +319,7 @@ function sshConnectionFailure(log, config, pin) {
     return { summary: 'Host unreachable', detail: `Jenkins cannot reach ${config.host}:${config.port} over SSH.` };
   }
   if (/java/i.test(text) && /not found|no such file|unable to find|cannot find|could not find|couldn't figure out/i.test(text)) {
-    return { summary: 'Java missing', detail: `Java is not installed on ${config.host}: Jenkins SSH agents need Java 17 or later on the runtime host.` };
+    return { summary: 'Java missing', detail: `Java is not installed on ${config.host}: this Jenkins needs Java ${javaMajor} on the runtime agent. Run Configure CI Runtime to install a managed Java ${javaMajor}.` };
   }
   return { summary: 'Not connected', detail: `Jenkins could not start agent ${AGENT_NAME} on ${config.host}. The agent log in Jenkins has the details.` };
 }
@@ -374,9 +380,10 @@ async function poll(read, done, { sleep, now, timeoutMs, intervalMs }) {
 async function configureCiRuntime({
   config: input = {}, user = '', token = '', call = jenkinsCall,
   approvedHostKey = null, scanHostKey = scanSshHostKey,
+  approvedInstalls = [], approvedAdminActions = [],
   sleep = defaultSleep, now = Date.now, timeouts = {}, onProgress = () => {}
 } = {}) {
-  const limits = { requestMs: 15000, hostKeyMs: 10000, connectMs: 180000, queueMs: 300000, buildMs: 600000, pollMs: 3000, ...timeouts };
+  const limits = { requestMs: 15000, hostKeyMs: 10000, connectMs: 180000, queueMs: 300000, buildMs: 600000, prepareMs: 1800000, pollMs: 3000, ...timeouts };
   const steps = CI_RUNTIME_STEPS.map((step) => ({ id: step.id, label: step.label, state: STEP_STATE.PENDING, summary: 'Not checked', detail: '' }));
   const byId = Object.fromEntries(steps.map((step) => [step.id, step]));
   let extras = {};
@@ -388,10 +395,20 @@ async function configureCiRuntime({
     label: RUNTIME_LABEL,
     // A host key waiting for explicit approval: public data, shown as a fingerprint.
     hostKeyApproval: extras.hostKeyApproval || null,
+    // The prerequisite table, what Security Center may install after confirmation,
+    // what it installed, and what needs an administrator. No secret in any of it.
+    prerequisites: extras.prerequisites || [],
+    installPlan: extras.installPlan || null,
+    installResults: extras.installResults || [],
+    admin: extras.admin || null,
     checkedAt: new Date(now()).toISOString()
   });
   const set = (id, state, summary, detail = '') => {
     Object.assign(byId[id], { state, summary, detail });
+    onProgress(report());
+  };
+  const note = (extra) => {
+    extras = { ...extras, ...extra };
     onProgress(report());
   };
   const stop = (id, summary, detail, extra = {}) => {
@@ -484,13 +501,150 @@ async function configureCiRuntime({
       : stop('ssh', 'Host key approval required', `First SSH connection to ${config.host}:${config.port}. Confirm its host key before Jenkins trusts it: ${presented.algorithm} ${presented.fingerprint}.`, { hostKeyApproval });
   }
 
+  if (!pluginActive('credentials-binding')) {
+    return stop('ssh', 'Credentials binding unavailable', `The Jenkins plugin "Credentials Binding" (credentials-binding) is required: it lets Jenkins use credential "${config.credentialId}" to prepare the runtime host without the key ever leaving Jenkins.`);
+  }
+
+  const capitalized = (text) => `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+  /** Creates or updates a Security Center job, builds it and returns its console. */
+  const runManagedJob = async (name, configXml, { what, where, timeoutMs }) => {
+    const jobPath = `job/${encodeURIComponent(name)}`;
+    const current = await attempt(() => jenkins.get(`${jobPath}/config.xml`));
+    let saved;
+    if (current.status === 200) {
+      if (!current.text.includes(MANAGED_MARKER)) {
+        return { failure: 'name-in-use', detail: `A Jenkins job named "${name}" exists but was not created by Security Center. It is never overwritten.` };
+      }
+      saved = await attempt(() => jenkins.post(`${jobPath}/config.xml`, { body: configXml, contentType: 'application/xml' }));
+    } else if (current.status === 404) {
+      saved = await attempt(() => jenkins.post(`createItem?name=${encodeURIComponent(name)}`, { body: configXml, contentType: 'application/xml' }));
+    } else {
+      saved = current;
+    }
+    if (saved.error || saved.status >= 400) return { failure: 'not-started', detail: saved.error || httpProblem(saved, 'create or configure jobs (Job/Create, Job/Configure)') };
+    const queued = await attempt(() => jenkins.post(`${jobPath}/build?delay=0sec`));
+    if (queued.error || queued.status >= 400) return { failure: 'not-started', detail: queued.error || httpProblem(queued, 'build jobs (Job/Build)') };
+    const queueId = /\/queue\/item\/(\d+)\/?$/.exec(String(queued.headers?.location || ''))?.[1];
+    if (!queueId) return { failure: 'not-started', detail: `Jenkins did not return the queue item of the ${what} build.` };
+    const item = await poll(async () => json(await attempt(() => jenkins.get(`queue/item/${queueId}/api/json?tree=cancelled,why,executable[number]`))) || {},
+      (value) => value.cancelled === true || Number.isInteger(value.executable?.number),
+      { sleep, now, timeoutMs: limits.queueMs, intervalMs: limits.pollMs });
+    if (!Number.isInteger(item.executable?.number)) {
+      return {
+        failure: 'not-started',
+        detail: item.cancelled
+          ? `The ${what} build was cancelled in Jenkins.`
+          : `The ${what} build did not start ${where} within ${Math.round(limits.queueMs / 1000)}s${item.why ? ` (${safeFact(item.why)})` : ''}.`
+      };
+    }
+    const number = item.executable.number;
+    const build = await poll(async () => json(await attempt(() => jenkins.get(`${jobPath}/${number}/api/json?tree=building,result`))) || { building: true },
+      (value) => value.building === false,
+      { sleep, now, timeoutMs, intervalMs: limits.pollMs });
+    if (build.building !== false) return { failure: 'timeout', detail: `${capitalized(what)} build #${number} did not finish within ${Math.round(timeoutMs / 1000)}s.` };
+    const output = await attempt(() => jenkins.get(`${jobPath}/${number}/consoleText`, { maxBytes: 256 * 1024 }));
+    return { number, result: build.result, consoleText: output.text || '' };
+  };
+
+  // ------------------------------------------------------------ prerequisites, from Jenkins over SSH
+  // Detected before the agent exists: Java may be exactly what is missing. The
+  // private key stays in Jenkins, and ssh accepts only the approved host key.
+  set('ssh', STEP_STATE.PENDING, 'Checking prerequisites');
+  const remoting = await attempt(() => jenkins.get('jnlpJars/remoting.jar', { maxBytes: 16 * 1024 * 1024 }));
+  const javaRequirement = (remoting.status === 200 && prerequisites.javaRequirementFromRemotingJar(remoting.buffer))
+    || { major: prerequisites.DEFAULT_JAVA_MAJOR, source: 'current Jenkins releases (remoting.jar could not be read)' };
+  const prepare = async (mode, script) => {
+    const run = await runManagedJob(prerequisites.PREPARE_JOB,
+      prerequisites.prepareJobConfigXml({ config, hostKey: pin, script, runtimeLabel: RUNTIME_LABEL, marker: MANAGED_MARKER, mode }),
+      { what: 'preparation', where: `on a Jenkins executor outside label ${RUNTIME_LABEL}`, timeoutMs: limits.prepareMs });
+    if (run.failure) {
+      return { failure: { 'name-in-use': 'Preparation job name in use', timeout: 'Preparation timed out' }[run.failure] || 'Preparation not started', detail: run.detail };
+    }
+    const lines = run.consoleText.split(/\r?\n/).map((line) => line.trim());
+    if (lines.includes('SCENTER_PREPARE=no-ssh-client')) {
+      return { failure: 'Administrator action required', detail: 'The Jenkins executor that prepares the runtime has no ssh client: an administrator must install openssh-client where that build runs (Jenkins controller or executor).' };
+    }
+    if (lines.includes('SCENTER_PREPARE=ssh-failed')) {
+      const failure = sshConnectionFailure(lines.filter((line) => line.startsWith('SCENTER_SSH_ERROR=')).join('\n'), config, pin, javaRequirement.major);
+      return { failure: failure.summary, detail: failure.detail };
+    }
+    return { text: run.consoleText, number: run.number };
+  };
+  const detect = async () => {
+    const run = await prepare('detection', prerequisites.detectScript(config, javaRequirement.major));
+    if (run.failure) return run;
+    const markers = prerequisites.parseMarkers(run.text, 'PREREQ');
+    if (!markers.DONE) return { failure: 'Prerequisites not detected', detail: `Preparation build #${run.number} ended before ${config.host} reported its prerequisites.` };
+    return { evaluation: prerequisites.evaluatePrerequisites(markers, { config, javaRequirement }) };
+  };
+  const publish = (evaluation, extra = {}) => note({ prerequisites: evaluation.items, installPlan: evaluation.installPlan, admin: evaluation.admin, ...extra });
+  const stopBeforeAgent = (evaluation, summary, detail) => {
+    set('ssh', STEP_STATE.READY, 'Ready', `SSH to ${config.host} verified from Jenkins with credential ${config.credentialId}; the agent starts once its prerequisites are ready.`);
+    const dockerAdmin = evaluation.items.find((entry) => entry.id.startsWith('docker') && entry.state === prerequisites.STATE.ADMIN);
+    if (dockerAdmin) set('docker', STEP_STATE.FAILED, 'Administrator action required', dockerAdmin.detail);
+    else set('docker', STEP_STATE.READY, 'Ready', evaluation.items.find((entry) => entry.id === 'docker-daemon')?.detail || '');
+    return stop('runtime', summary, detail);
+  };
+
+  let detected = await detect();
+  if (detected.failure) return stop('ssh', detected.failure, detected.detail);
+  publish(detected.evaluation);
+
+  // Privileged setup: only the actions a person approved, only through
+  // non-interactive sudo already configured on the host. Never a password.
+  const adminApproved = (detected.evaluation.admin?.actions || []).map((action) => action.id)
+    .filter((id) => (Array.isArray(approvedAdminActions) ? approvedAdminActions : []).includes(id));
+  let reconnect = false;
+  if (adminApproved.length) {
+    const run = await prepare('administrator setup', prerequisites.adminScript(config, adminApproved));
+    if (run.failure) return stop('ssh', run.failure, run.detail);
+    const markers = prerequisites.parseMarkers(run.text, 'ADMIN');
+    const unavailable = markers.SUDO?.[0] === 'unavailable';
+    const failed = adminApproved.filter((id) => markers[prerequisites.ADMIN_ACTIONS[id].marker]?.[0] !== 'applied');
+    if (unavailable || failed.length) {
+      return stopBeforeAgent(detected.evaluation, 'Administrator action required', `Administrator setup was not applied on ${config.host}: ${unavailable ? 'non-interactive sudo is not available' : `${failed.join(', ')} failed`}. Use the manual instructions.`);
+    }
+    reconnect = adminApproved.includes('docker-group');
+    detected = await detect();
+    if (detected.failure) return stop('ssh', detected.failure, detected.detail);
+    publish(detected.evaluation, { adminApplied: adminApproved });
+  }
+
+  // Managed tools: only the pinned plan items a person approved.
+  const toInstall = prerequisites.approvedPlan(detected.evaluation.installPlan, approvedInstalls);
+  if (toInstall.length) {
+    set('runtime', STEP_STATE.PENDING, `Installing ${toInstall.map((item) => item.label).join(', ')}`);
+    const run = await prepare('installation', prerequisites.installScript(config, toInstall));
+    if (run.failure) return stop('ssh', run.failure, run.detail);
+    const installResults = prerequisites.installOutcome(prerequisites.parseMarkers(run.text, 'INSTALL'), toInstall);
+    note({ installResults });
+    const failed = installResults.filter((entry) => !entry.ok);
+    if (failed.length) return stopBeforeAgent(detected.evaluation, 'Installation failed', failed.map((entry) => entry.detail).join(' '));
+    detected = await detect();
+    if (detected.failure) return stop('ssh', detected.failure, detected.detail);
+    publish(detected.evaluation, { installResults });
+  }
+  const evaluation = detected.evaluation;
+  if (evaluation.installPlan) {
+    return stopBeforeAgent(evaluation, 'Prerequisites missing', `Missing on ${config.host}: ${evaluation.installPlan.map((item) => item.label).join(', ')}. Security Center installs ${evaluation.installPlan.length > 1 ? 'them' : 'it'} inside ${config.remoteRoot}/tools after your confirmation.`);
+  }
+  const blocking = evaluation.items.filter((entry) => ['workspace', 'java'].includes(entry.id) && entry.state === prerequisites.STATE.ADMIN);
+  if (blocking.length) return stopBeforeAgent(evaluation, 'Administrator action required', blocking.map((entry) => entry.detail).join(' '));
+  if (evaluation.node) nodeHome = evaluation.node.home;
+  const agentOptions = () => ({
+    nodeHome, hostKey: pin,
+    javaPath: evaluation.java?.managed ? evaluation.java.path : '',
+    managedNode: Boolean(evaluation.node?.managed)
+  });
+
+  // ------------------------------------------------------------ the managed agent
   if (existing.status === 404) {
     const created = await attempt(() => jenkins.post(`computer/doCreateItem?name=${encodeURIComponent(AGENT_NAME)}&type=hudson.slaves.DumbSlave`, {
       body: formBody({ name: AGENT_NAME, type: 'hudson.slaves.DumbSlave', json: JSON.stringify(createNodeJson(config)) })
     }));
     if (created.error || created.status >= 400) return stop('ssh', 'Agent not created', created.error || httpProblem(created, 'create agents (Agent/Create)'));
   }
-  const written = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome, hostKey: pin }), contentType: 'application/xml' }));
+  const written = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, agentOptions()), contentType: 'application/xml' }));
   if (written.error || written.status >= 400) return stop('ssh', 'Agent not configured', written.error || httpProblem(written, 'configure agents (Agent/Configure)'));
 
   const nodeStatus = async () => {
@@ -500,6 +654,11 @@ async function configureCiRuntime({
   let computer = await nodeStatus();
   if (computer.temporarilyOffline) {
     return stop('ssh', 'Marked offline', `Agent ${AGENT_NAME} is marked temporarily offline in Jenkins. Bring it back online there, then retry.`);
+  }
+  if (!computer.offline && reconnect) {
+    // A new group membership applies to new sessions only.
+    await attempt(() => jenkins.post(`${nodePath}/doDisconnect?offlineMessage=${encodeURIComponent('Security Center: reconnecting after administrator setup')}`));
+    computer = await poll(nodeStatus, (value) => value.offline === true, { sleep, now, timeoutMs: limits.connectMs, intervalMs: limits.pollMs });
   }
   if (computer.offline) {
     const launched = await attempt(() => jenkins.post(`${nodePath}/launchSlaveAgent`));
@@ -511,7 +670,7 @@ async function configureCiRuntime({
   }
   if (computer.offline) {
     const log = await attempt(() => jenkins.get(`${nodePath}/logText/progressiveText?start=0`, { maxBytes: 256 * 1024 }));
-    const failure = sshConnectionFailure(log.text, config, pin);
+    const failure = sshConnectionFailure(log.text, config, pin, javaRequirement.major);
     return stop('ssh', failure.summary, failure.detail);
   }
   set('ssh', STEP_STATE.READY, 'Ready', `Agent ${AGENT_NAME} online on ${config.host} with credential ${config.credentialId}; host key ${pin.algorithm} ${pin.fingerprint} pinned.`);
@@ -519,40 +678,13 @@ async function configureCiRuntime({
   // ------------------------------------------------------------ 3-4. Docker and workspace, from a real build
   set('docker', STEP_STATE.PENDING, 'Checking');
   set('runtime', STEP_STATE.PENDING, 'Checking');
-  const jobPath = `job/${encodeURIComponent(CHECK_JOB)}`;
-  const jobConfig = await attempt(() => jenkins.get(`${jobPath}/config.xml`));
-  let savedJob;
-  if (jobConfig.status === 200) {
-    if (!jobConfig.text.includes(MANAGED_MARKER)) {
-      return stop('docker', 'Check job name in use', `A Jenkins job named "${CHECK_JOB}" exists but was not created by Security Center. It is never overwritten.`);
-    }
-    savedJob = await attempt(() => jenkins.post(`${jobPath}/config.xml`, { body: checkJobConfigXml(), contentType: 'application/xml' }));
-  } else if (jobConfig.status === 404) {
-    savedJob = await attempt(() => jenkins.post(`createItem?name=${encodeURIComponent(CHECK_JOB)}`, { body: checkJobConfigXml(), contentType: 'application/xml' }));
-  } else {
-    savedJob = jobConfig;
+  const check = await runManagedJob(CHECK_JOB, checkJobConfigXml(), { what: 'check', where: `on label ${RUNTIME_LABEL}`, timeoutMs: limits.buildMs });
+  if (check.failure) {
+    return stop('docker', { 'name-in-use': 'Check job name in use', timeout: 'Check timed out' }[check.failure] || 'Check not started', check.detail);
   }
-  if (savedJob.error || savedJob.status >= 400) return stop('docker', 'Check not started', savedJob.error || httpProblem(savedJob, 'create or configure jobs (Job/Create, Job/Configure)'));
-  const queued = await attempt(() => jenkins.post(`${jobPath}/build?delay=0sec`));
-  if (queued.error || queued.status >= 400) return stop('docker', 'Check not started', queued.error || httpProblem(queued, 'build jobs (Job/Build)'));
-  const queueId = /\/queue\/item\/(\d+)\/?$/.exec(String(queued.headers?.location || ''))?.[1];
-  if (!queueId) return stop('docker', 'Check not started', 'Jenkins did not return the queue item of the check build.');
-
-  const item = await poll(async () => json(await attempt(() => jenkins.get(`queue/item/${queueId}/api/json?tree=cancelled,why,executable[number]`))) || {},
-    (value) => value.cancelled === true || Number.isInteger(value.executable?.number),
-    { sleep, now, timeoutMs: limits.queueMs, intervalMs: limits.pollMs });
-  if (!Number.isInteger(item.executable?.number)) {
-    return stop('docker', 'Check not started', item.cancelled
-      ? 'The check build was cancelled in Jenkins.'
-      : `The check build did not start on label ${RUNTIME_LABEL} within ${Math.round(limits.queueMs / 1000)}s${item.why ? ` (${safeFact(item.why)})` : ''}.`);
-  }
-  const number = item.executable.number;
-  const build = await poll(async () => json(await attempt(() => jenkins.get(`${jobPath}/${number}/api/json?tree=building,result`))) || { building: true },
-    (value) => value.building === false,
-    { sleep, now, timeoutMs: limits.buildMs, intervalMs: limits.pollMs });
-  if (build.building !== false) return stop('docker', 'Check timed out', `Check build #${number} did not finish within ${Math.round(limits.buildMs / 1000)}s.`);
-  const consoleText = await attempt(() => jenkins.get(`${jobPath}/${number}/consoleText`, { maxBytes: 256 * 1024 }));
-  const facts = parseCheckOutput(consoleText.text);
+  const number = check.number;
+  const build = { result: check.result };
+  const facts = parseCheckOutput(check.consoleText);
   const result = safeFact(build.result) || 'without a result';
 
   const agentUser = safeFact(facts.USER);
@@ -562,7 +694,9 @@ async function configureCiRuntime({
   const docker = safeFact(facts.DOCKER);
   const dockerVersion = /^ready\s+(\S+)/.exec(docker)?.[1];
   const runner = agentUser || config.sshUser;
+  const dockerAdmin = evaluation.items.find((entry) => entry.id.startsWith('docker') && entry.state === prerequisites.STATE.ADMIN);
   if (dockerVersion) set('docker', STEP_STATE.READY, 'Ready', `Docker ${dockerVersion} usable by ${runner} on ${config.host}.`);
+  else if (dockerAdmin) set('docker', STEP_STATE.FAILED, 'Administrator action required', dockerAdmin.detail);
   else if (docker === 'missing') set('docker', STEP_STATE.FAILED, 'Not installed', `Docker is not installed on ${config.host}.`);
   else if (docker === 'permission-denied') set('docker', STEP_STATE.FAILED, 'Permission denied', `User "${runner}" cannot use the Docker daemon on ${config.host}. Add that user to the docker group on the host.`);
   else if (docker === 'unreachable') set('docker', STEP_STATE.FAILED, 'Daemon unreachable', `The Docker daemon on ${config.host} is not running or not reachable.`);
@@ -577,7 +711,7 @@ async function configureCiRuntime({
   else {
     const detectedHome = path.posix.dirname(path.posix.dirname(node[2]));
     if (detectedHome !== nodeHome) {
-      const updated = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { nodeHome: detectedHome, hostKey: pin }), contentType: 'application/xml' }));
+      const updated = await attempt(() => jenkins.post(`${nodePath}/config.xml`, { body: agentConfigXml(config, { ...agentOptions(), nodeHome: detectedHome }), contentType: 'application/xml' }));
       if (updated.error || updated.status >= 400) problems.push(`SCENTER_NODE_HOME could not be recorded on the agent (${updated.error || `HTTP ${updated.status}`})`);
       else nodeHome = detectedHome;
     }

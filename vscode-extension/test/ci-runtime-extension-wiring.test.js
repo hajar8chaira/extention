@@ -59,12 +59,19 @@ function extract(marker) {
   return { start, header: SOURCE.slice(start, open), body: blockAt(SOURCE, open) };
 }
 
-const HANDLER = extract("if (message.action === 'ciRuntimeSave' || message.action === 'ciRuntimeConfigure')");
+const HANDLER = extract("if (message.action === 'ciRuntimeSave' || Object.hasOwn(ciRuntimeRunActions, message.action))");
 const SAVE = extract('async function saveCiRuntimeConfiguration(values = {})');
+const RUN = extract('async function runCiRuntimeOnboarding(config, { tools = null, adminSetup = false } = {})');
+const INSTRUCTIONS = extract("if (message.action === 'ciRuntimeAdminInstructions')");
+const ACTIONS = (() => {
+  const start = SOURCE.indexOf('const ciRuntimeRunActions = Object.freeze({');
+  assert.ok(start >= 0, 'ciRuntimeRunActions absent d’extension.js');
+  return SOURCE.slice(start, SOURCE.indexOf('});', start) + 3);
+})();
 
 /** The real handler and save function, with VS Code and their collaborators replaced. */
-function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scenter-admin', token: TOKEN }, onboarding = () => READY, answer = undefined } = {}) {
-  const calls = { configure: [], jenkinsConfig: [], settings: [], workspaceState: [], info: [], error: [], warning: [], progress: [], audit: [], renders: 0 };
+function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scenter-admin', token: TOKEN }, onboarding = () => READY, answer = undefined, status = null } = {}) {
+  const calls = { configure: [], jenkinsConfig: [], settings: [], workspaceState: [], info: [], error: [], warning: [], progress: [], audit: [], documents: [], shown: [], renders: 0 };
   const settings = {};
   const vscode = {
     ConfigurationTarget: { Workspace: 2 },
@@ -73,12 +80,17 @@ function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scent
       getConfiguration: (section) => ({
         get: (key, fallback) => (key in settings ? settings[key] : fallback),
         update: async (key, value, target) => { calls.settings.push({ section, key, value, target }); settings[key] = value; }
-      })
+      }),
+      openTextDocument: async (options) => { calls.documents.push(options); return { uri: 'untitled:ci-runtime-admin' }; }
     },
     window: {
       showInformationMessage: async (message) => { calls.info.push(message); },
       showErrorMessage: async (message) => { calls.error.push(message); },
-      showWarningMessage: async (message, options, ...items) => { calls.warning.push({ message, options, items }); return answer; },
+      showWarningMessage: async (message, options, ...items) => {
+        calls.warning.push({ message, options, items });
+        return typeof answer === 'function' ? answer(message, items) : answer;
+      },
+      showTextDocument: async (document, options) => { calls.shown.push({ document, options }); },
       withProgress: async (_options, task) => task({ report: (value) => calls.progress.push(value) }, { isCancellationRequested: false })
     }
   };
@@ -95,17 +107,20 @@ function harness({ jenkins = { url: FORM.jenkinsUrl, job: FORM.job, user: 'scent
   const factory = new Function('deps', `
     const { vscode, context, normalizeCiRuntimeConfig, configureCiRuntime, mergedDeliveryConfiguration, renderDeliveryPage, createAuditEvent, backendBaseUrl } = deps;
     const currentScanId = 0;
-    let ciRuntimeStatus = null;
+    let ciRuntimeStatus = deps.status;
     let ciRuntimeRunning = false;
     ${SAVE.header}${SAVE.body}
+    ${ACTIONS}
+    ${RUN.header}${RUN.body}
     return {
       state: () => ({ ciRuntimeStatus, ciRuntimeRunning }),
       handle: async (message) => {
+        ${INSTRUCTIONS.header}${INSTRUCTIONS.body}
         ${HANDLER.header}${HANDLER.body}
       }
     };
   `);
-  return { calls, ...factory(deps) };
+  return { calls, ...factory({ ...deps, status }) };
 }
 
 test('registered: the Security Delivery panel routes the CI Runtime actions to the onboarding module', () => {
@@ -116,7 +131,9 @@ test('registered: the Security Delivery panel routes the CI Runtime actions to t
   const next = SOURCE.indexOf("registerCommand('securityCenter.configureJenkins'", command);
   assert.ok(command > 0 && guard > command && HANDLER.start > guard && HANDLER.start < next,
     'handled inside the Security Delivery panel message listener, after its delivery guard');
-  assert.match(HANDLER.body, /configureCiRuntime\(\{/);
+  assert.match(HANDLER.body, /runCiRuntimeOnboarding\(saved\.config, ciRuntimeRunActions\[message\.action\]\)/);
+  assert.match(RUN.body, /configureCiRuntime\(\{/);
+  assert.match(ACTIONS, /ciRuntimeInstallJava: \{ tools: \['java'\] \}/);
   assert.match(SOURCE, /workspacePanels: selectedProvider === 'jenkins' \? renderCiRuntimeCard\(\{/);
   const card = renderCiRuntimeCard({});
   assert.match(card, /data-action="ciRuntimeConfigure"/, 'the card posts the action the handler listens to');
@@ -170,7 +187,7 @@ test('a private SSH key is never read, stored nor forwarded', async () => {
   assert.ok(!persisted.includes(TOKEN), 'the Jenkins API token is used, never stored or shown');
   assert.deepEqual(Object.keys(host.calls.settings[0].value).sort(), ['credentialId', 'host', 'jenkinsUrl', 'job', 'port', 'remoteRoot', 'sshUser']);
   assert.deepEqual(Object.keys(host.calls.configure[0].config).sort(), ['credentialId', 'host', 'jenkinsUrl', 'job', 'port', 'remoteRoot', 'sshUser']);
-  assert.doesNotMatch(HANDLER.body + SAVE.body, /secrets\.|privateKey|sshKey|PRIVATE KEY/, 'no path to key material in the wiring');
+  assert.doesNotMatch(HANDLER.body + SAVE.body + RUN.body + INSTRUCTIONS.body, /secrets\.|privateKey|sshKey|PRIVATE KEY|showInputBox/, 'no path to key material and no password prompt in the wiring');
 });
 
 test('failure is surfaced cleanly: not ready, thrown error, invalid form, second click while running', async () => {
@@ -241,4 +258,81 @@ test('SSH host key: fingerprint shown for explicit approval, onboarding re-runs 
   assert.equal(again.calls.warning.length, 1, 'one approval prompt per click, never a loop');
   assert.equal(again.calls.configure.length, 2);
   assert.equal(again.calls.error.length, 1);
+});
+
+const PLAN = Object.freeze([
+  { tool: 'java', label: 'Java 21', distribution: 'Eclipse Temurin JRE', version: '21.0.12.1+1', platform: 'linux-x64', url: 'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jre_x64_linux_hotspot_21.0.12.1_1.tar.gz', sha256: '2413149700df0f7d440500a84a8f764c535f21e5a5e87d38328b64eec2c5b500', destination: '/home/deploy/scenter-agent/tools/java21', host: '192.168.222.132', user: 'deploy' },
+  { tool: 'node', label: 'Node.js 22', distribution: 'Node.js', version: 'v22.23.2', platform: 'linux-x64', url: 'https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.gz', sha256: 'b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a', destination: '/home/deploy/scenter-agent/tools/node22', host: '192.168.222.132', user: 'deploy' }
+]);
+const MISSING = { ...report(false, ['Connected', 'Ready', 'Ready', 'Prerequisites missing']), installPlan: PLAN };
+
+test('managed installation: host, tool, version, destination, source and SHA-256 confirmed, then onboarding re-runs', async () => {
+  const host = harness({ answer: (_message, items) => items[0], onboarding: (options) => (options.approvedInstalls.length ? READY : MISSING) });
+  await host.handle(CONFIGURE);
+  assert.equal(host.calls.warning.length, 1);
+  const [prompt] = host.calls.warning;
+  assert.equal(prompt.message, 'Install Java 21 and Node.js 22 on 192.168.222.132?');
+  assert.equal(prompt.options.modal, true);
+  for (const expected of ['Java 21: Eclipse Temurin JRE 21.0.12.1+1 (linux-x64)', 'Destination: /home/deploy/scenter-agent/tools/java21', `Source: ${PLAN[0].url}`, `SHA-256, verified before install: ${PLAN[0].sha256}`, 'Destination: /home/deploy/scenter-agent/tools/node22', 'no system package, no sudo, no project file changed']) {
+    assert.ok(prompt.options.detail.includes(expected), expected);
+  }
+  assert.deepEqual(prompt.items, ['Install tools']);
+  assert.deepEqual(host.calls.configure.map((options) => options.approvedInstalls), [[], [
+    { tool: 'java', version: '21.0.12.1+1', destination: '/home/deploy/scenter-agent/tools/java21' },
+    { tool: 'node', version: 'v22.23.2', destination: '/home/deploy/scenter-agent/tools/node22' }
+  ]]);
+  assert.deepEqual(host.calls.info, ['Security Center : Jenkins: Connected · SSH: Ready · Docker: Ready · CI Runtime: Ready']);
+
+  const declined = harness({ answer: undefined, onboarding: () => MISSING });
+  await declined.handle(CONFIGURE);
+  assert.equal(declined.calls.configure.length, 1, 'declined: nothing installed');
+  assert.deepEqual(declined.calls.error, ['Security Center : Jenkins: Connected · SSH: Ready · Docker: Ready · CI Runtime: Prerequisites missing']);
+
+  const javaOnly = harness({ answer: (_message, items) => items[0], onboarding: (options) => (options.approvedInstalls.length ? READY : MISSING) });
+  await javaOnly.handle({ ...CONFIGURE, action: 'ciRuntimeInstallJava' });
+  assert.equal(javaOnly.calls.warning[0].message, 'Install Java 21 on 192.168.222.132?');
+  assert.deepEqual(javaOnly.calls.warning[0].items, ['Install Java 21']);
+  assert.deepEqual(javaOnly.calls.configure[1].approvedInstalls, [{ tool: 'java', version: '21.0.12.1+1', destination: '/home/deploy/scenter-agent/tools/java21' }]);
+});
+
+test('administrator setup: only on request, only via detected non-interactive sudo, exact commands confirmed, never a password', async () => {
+  const ADMIN = {
+    ...report(false, ['Connected', 'Ready', 'Administrator action required', 'Not ready']),
+    admin: { required: true, reasons: ['User deploy cannot use the Docker daemon.'], sudo: true, actions: [{ id: 'docker-group', label: 'Add deploy to the docker group', command: 'sudo usermod -aG docker deploy' }], instructions: '# setup' }
+  };
+  const configure = harness({ answer: (_message, items) => items[0], onboarding: () => ADMIN });
+  await configure.handle(CONFIGURE);
+  assert.equal(configure.calls.warning.length, 0, 'Configure never proposes privileged changes by itself');
+  assert.equal(configure.calls.configure.length, 1);
+
+  const apply = harness({ answer: (_message, items) => items[0], onboarding: (options) => (options.approvedAdminActions.length ? READY : ADMIN) });
+  await apply.handle({ ...CONFIGURE, action: 'ciRuntimeAdminApply' });
+  const [prompt] = apply.calls.warning;
+  assert.equal(prompt.message, 'Apply administrator setup on ci-runtime.internal?', 'the configured runtime host');
+  assert.equal(prompt.options.modal, true);
+  assert.ok(prompt.options.detail.includes('Add deploy to the docker group: sudo usermod -aG docker deploy'));
+  assert.ok(prompt.options.detail.includes('No password is requested, sent or stored.'));
+  assert.deepEqual(apply.calls.configure.map((options) => options.approvedAdminActions), [[], ['docker-group']]);
+
+  const noSudo = harness({ answer: (_message, items) => items[0], onboarding: () => ({ ...ADMIN, admin: { ...ADMIN.admin, sudo: false, actions: [] } }) });
+  await noSudo.handle({ ...CONFIGURE, action: 'ciRuntimeAdminApply' });
+  assert.equal(noSudo.calls.configure.length, 1, 'nothing applied without non-interactive sudo');
+  assert.equal(noSudo.calls.warning[0].options, undefined, 'a plain notice, not a confirmation');
+  assert.match(noSudo.calls.warning[0].message, /Use "Show manual instructions"/);
+  assert.doesNotMatch(JSON.stringify([apply.calls.settings, apply.calls.workspaceState, apply.calls.audit]), /password/i);
+});
+
+test('manual instructions open as an untitled Markdown document, without running onboarding or touching settings', async () => {
+  const instructions = '# Security Center CI Runtime — administrator setup\n\n```sh\nsudo usermod -aG docker deploy\n```\n';
+  const host = harness({ status: { ...READY, admin: { required: true, reasons: [], sudo: false, actions: [], instructions } } });
+  await host.handle({ type: 'delivery', action: 'ciRuntimeAdminInstructions', panel: 'ci-runtime', values: FORM });
+  assert.deepEqual(host.calls.documents, [{ content: instructions, language: 'markdown' }]);
+  assert.equal(host.calls.shown.length, 1);
+  assert.deepEqual(host.calls.configure, []);
+  assert.deepEqual(host.calls.settings, []);
+
+  const none = harness();
+  await none.handle({ type: 'delivery', action: 'ciRuntimeAdminInstructions' });
+  assert.deepEqual(none.calls.documents, []);
+  assert.deepEqual(none.calls.info, ['Security Center : no administrator action is currently required for the CI Runtime.']);
 });
