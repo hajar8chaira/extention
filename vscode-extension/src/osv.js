@@ -45,29 +45,40 @@ function dockerArgs(workspacePath, callAnalysis = supportedCallAnalysis(workspac
   ]);
 }
 
-async function resolveInvocation(mode, workspacePath) {
+const OSV_IMAGE = 'ghcr.io/google/osv-scanner:latest';
+
+/** CI container run: the same scan command, inside a runtime-managed container. */
+function containerArgs(container, workspacePath) {
+  return container.runArgs(OSV_IMAGE, scanArgs(container.root, supportedCallAnalysis(workspacePath)));
+}
+
+async function resolveInvocation(mode, workspacePath, container = null) {
+  if (container) return { executable: 'docker', args: containerArgs(container, workspacePath), cwd: workspacePath, mode: 'docker' };
   if (mode !== 'docker' && await commandExists('osv-scanner')) return { executable: 'osv-scanner', args: scanArgs(workspacePath, supportedCallAnalysis(workspacePath)), cwd: workspacePath, mode: 'local' };
   if (mode === 'local') throw new Error('OSV-Scanner local est introuvable. Ouvrez Configuration des scanners ou choisissez Auto.');
   if (!await commandExists('docker')) throw new Error('Ni OSV-Scanner local ni Docker ne sont disponibles.');
   return { executable: 'docker', args: dockerArgs(workspacePath), cwd: workspacePath, mode: 'docker' };
 }
 
-async function runOsv({ workspacePath, mode = 'auto', timeoutMs = 600000, signal }) {
-  const invocation = await resolveInvocation(mode, workspacePath);
+async function runOsv({ workspacePath, mode = 'auto', timeoutMs = 600000, signal, containerRuntime = null }) {
+  const container = containerRuntime ? await containerRuntime.forScanner(OSV_IMAGE) : null;
+  const invocation = await resolveInvocation(mode, workspacePath, container);
+  const exec = container?.exec || execFileAsync;
+  const parse = (text) => (container ? container.mapPaths(JSON.parse(text)) : JSON.parse(text));
   try {
-    const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, {
+    const { stdout, stderr } = await exec(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
       timeout: timeoutMs,
       maxBuffer: 100 * 1024 * 1024,
       windowsHide: true,
       signal
     });
-    return { payload: JSON.parse(stdout), stderr, mode: invocation.mode };
+    return { payload: parse(stdout), stderr, mode: invocation.mode };
   } catch (error) {
     if (signal?.aborted) throw new Error('Scan OSV-Scanner annulé.');
     if (error.stdout) {
       try {
-        return { payload: JSON.parse(error.stdout), stderr: error.stderr || '', mode: invocation.mode };
+        return { payload: parse(error.stdout), stderr: error.stderr || '', mode: invocation.mode };
       } catch {
         // Report a useful scanner error below.
       }
@@ -77,4 +88,4 @@ async function runOsv({ workspacePath, mode = 'auto', timeoutMs = 600000, signal
   }
 }
 
-module.exports = { runOsv, resolveInvocation, scanArgs, containsCargoLock, supportedCallAnalysis, dockerArgs };
+module.exports = { runOsv, resolveInvocation, scanArgs, containsCargoLock, supportedCallAnalysis, dockerArgs, containerArgs, OSV_IMAGE };

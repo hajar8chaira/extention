@@ -67,19 +67,34 @@ function dockerImageSbomArgs(imageName) {
   ]);
 }
 
-async function generateSbom({ workspacePath, mode = 'auto', imageName = '', timeoutMs = 300000, signal }) {
-  const useLocal = mode !== 'docker' && await commandExists('trivy');
-  if (mode === 'local' && !useLocal) throw new Error('Trivy local est introuvable. Installez-le ou choisissez le mode Docker.');
-  if (!useLocal && !await commandExists('docker')) throw new Error('Ni Trivy local ni Docker ne sont disponibles.');
+const TRIVY_IMAGE = 'aquasec/trivy:latest';
+const TRIVY_CACHE = Object.freeze(['-v', 'security-center-trivy-cache:/root/.cache/trivy']);
+
+/** CI container run. An image target is pulled from its registry: no Docker socket is ever mounted. */
+function containerArgs(container, command) {
+  return container.runArgs(TRIVY_IMAGE, command, { volumes: TRIVY_CACHE });
+}
+
+async function generateSbom({ workspacePath, mode = 'auto', imageName = '', timeoutMs = 300000, signal, containerRuntime = null }) {
+  const container = containerRuntime ? await containerRuntime.forScanner(TRIVY_IMAGE) : null;
   const targetImage = imageName.trim();
-  const invocation = useLocal
-    ? { executable: 'trivy', args: targetImage ? imageSbomArgs(targetImage) : sbomArgs(workspacePath), cwd: workspacePath, mode: 'local' }
-    : { executable: 'docker', args: targetImage ? dockerImageSbomArgs(targetImage) : dockerSbomArgs(workspacePath), cwd: workspacePath, mode: 'docker' };
+  let invocation;
+  if (container) {
+    invocation = { executable: 'docker', args: containerArgs(container, targetImage ? imageSbomArgs(targetImage) : sbomArgs(container.root)), cwd: workspacePath, mode: 'docker' };
+  } else {
+    const useLocal = mode !== 'docker' && await commandExists('trivy');
+    if (mode === 'local' && !useLocal) throw new Error('Trivy local est introuvable. Installez-le ou choisissez le mode Docker.');
+    if (!useLocal && !await commandExists('docker')) throw new Error('Ni Trivy local ni Docker ne sont disponibles.');
+    invocation = useLocal
+      ? { executable: 'trivy', args: targetImage ? imageSbomArgs(targetImage) : sbomArgs(workspacePath), cwd: workspacePath, mode: 'local' }
+      : { executable: 'docker', args: targetImage ? dockerImageSbomArgs(targetImage) : dockerSbomArgs(workspacePath), cwd: workspacePath, mode: 'docker' };
+  }
+  const exec = container?.exec || execFileAsync;
   try {
-    const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, {
+    const { stdout, stderr } = await exec(invocation.executable, invocation.args, {
       cwd: invocation.cwd, timeout: timeoutMs, maxBuffer: 100 * 1024 * 1024, windowsHide: true, signal
     });
-    const payload = JSON.parse(stdout);
+    const payload = container ? container.mapPaths(JSON.parse(stdout)) : JSON.parse(stdout);
     if (payload.bomFormat !== 'CycloneDX' || !Array.isArray(payload.components)) {
       throw new Error('Trivy n’a pas produit un document CycloneDX valide.');
     }
@@ -91,34 +106,40 @@ async function generateSbom({ workspacePath, mode = 'auto', imageName = '', time
   }
 }
 
-async function resolveInvocation(mode, workspacePath, exclusions = []) {
+async function resolveInvocation(mode, workspacePath, exclusions = [], container = null) {
+  if (container) return { executable: 'docker', args: containerArgs(container, scanArgs(container.root, exclusions)), cwd: workspacePath, mode: 'docker' };
   if (mode !== 'docker' && await commandExists('trivy')) return { executable: 'trivy', args: scanArgs(workspacePath, exclusions), cwd: workspacePath, mode: 'local' };
   if (mode === 'local') throw new Error('Trivy local est introuvable. Installez-le ou choisissez le mode Docker.');
   if (!await commandExists('docker')) throw new Error('Ni Trivy local ni Docker ne sont disponibles.');
   return { executable: 'docker', args: dockerArgs(workspacePath, exclusions), cwd: workspacePath, mode: 'docker' };
 }
 
-async function runTrivy({ workspacePath, mode = 'auto', timeoutMs = 300000, imageName = '', exclusions = [], signal }) {
-  const invocation = await resolveInvocation(mode, workspacePath, exclusions);
+async function runTrivy({ workspacePath, mode = 'auto', timeoutMs = 300000, imageName = '', exclusions = [], signal, containerRuntime = null }) {
+  const container = containerRuntime ? await containerRuntime.forScanner(TRIVY_IMAGE) : null;
+  const invocation = await resolveInvocation(mode, workspacePath, exclusions, container);
+  const exec = container?.exec || execFileAsync;
+  const parse = (text) => (container ? container.mapPaths(JSON.parse(text)) : JSON.parse(text));
   try {
-    const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, {
+    const { stdout, stderr } = await exec(invocation.executable, invocation.args, {
       cwd: invocation.cwd, timeout: timeoutMs, maxBuffer: 100 * 1024 * 1024, windowsHide: true, signal
     });
-    const payload = JSON.parse(stdout);
+    const payload = parse(stdout);
     if (imageName.trim()) {
-      const imageInvocation = invocation.mode === 'docker'
-        ? { executable: 'docker', args: dockerImageArgs(imageName.trim()) }
-        : { executable: 'trivy', args: imageScanArgs(imageName.trim()) };
-      const imageResult = await execFileAsync(imageInvocation.executable, imageInvocation.args, {
+      const imageInvocation = container
+        ? { executable: 'docker', args: containerArgs(container, imageScanArgs(imageName.trim())) }
+        : invocation.mode === 'docker'
+          ? { executable: 'docker', args: dockerImageArgs(imageName.trim()) }
+          : { executable: 'trivy', args: imageScanArgs(imageName.trim()) };
+      const imageResult = await exec(imageInvocation.executable, imageInvocation.args, {
         cwd: invocation.cwd, timeout: timeoutMs, maxBuffer: 100 * 1024 * 1024, windowsHide: true, signal
       });
-      payload.Results = [...(payload.Results || []), ...(JSON.parse(imageResult.stdout).Results || [])];
+      payload.Results = [...(payload.Results || []), ...(parse(imageResult.stdout).Results || [])];
     }
     return { payload, stderr, mode: invocation.mode };
   } catch (error) {
     if (signal?.aborted) throw new Error('Scan Trivy annulé.');
     if (error.stdout) {
-      try { return { payload: JSON.parse(error.stdout), stderr: error.stderr || '', mode: invocation.mode }; }
+      try { return { payload: parse(error.stdout), stderr: error.stderr || '', mode: invocation.mode }; }
       catch { /* handled below */ }
     }
     if (error.killed) throw new Error(`Le scan Trivy a dépassé ${Math.round(timeoutMs / 1000)} secondes.`);
@@ -126,4 +147,4 @@ async function runTrivy({ workspacePath, mode = 'auto', timeoutMs = 300000, imag
   }
 }
 
-module.exports = { runTrivy, generateSbom, resolveInvocation, scanArgs, dockerArgs, imageScanArgs, dockerImageArgs, sbomArgs, dockerSbomArgs, imageSbomArgs, dockerImageSbomArgs };
+module.exports = { runTrivy, generateSbom, resolveInvocation, scanArgs, dockerArgs, imageScanArgs, dockerImageArgs, sbomArgs, dockerSbomArgs, imageSbomArgs, dockerImageSbomArgs, containerArgs, TRIVY_IMAGE };

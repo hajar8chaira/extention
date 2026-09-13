@@ -68,6 +68,38 @@ create or write fails the build with ERROR, naming the variable.
 To roll out a new engine build: publish the new `.tgz` at the URL and update
 `SCENTER_ENGINE_SHA256`. The next build upgrades itself.
 
+## Scanner runtime on the Jenkins node
+
+Under Jenkins, the CI Engine runs the scanners that `security-center.yml`
+selects among Semgrep, Gitleaks, Trivy and OSV-Scanner as ephemeral containers
+(`docker run --rm`) on the Docker daemon the build's execution node can reach.
+Nothing is installed on the node, images stay cached, and projects only choose
+scanners.
+
+- Jenkins directly on a node: the workspace is mounted read-only.
+- Jenkins in a container on that same daemon: scanner containers inherit the
+  Jenkins container's volumes read-only (`--volumes-from`); no host path is
+  guessed.
+- Before any scan, a probe container proves the workspace is visible that way.
+- Scanner containers are never privileged, run with `no-new-privileges`, and
+  never get the Docker socket.
+
+One-time node prerequisite (administrator, not per project):
+
+- the user running the Jenkins agent can run `docker` against a daemon: the
+  docker CLI on the node (inside the Jenkins image when Jenkins runs in Docker)
+  and access to the daemon socket or `DOCKER_HOST`;
+- when Jenkins itself runs in a container, its workspaces are on a Docker volume
+  or bind mount;
+- outbound access to Docker Hub and ghcr.io to pull the scanner images, or the
+  images preloaded on the node.
+
+Otherwise the scan ends with ERROR, for example `SCenter CI runtime
+unavailable: Docker is not accessible from this Jenkins execution node
+(permission denied on the Docker daemon for user jenkins)`. Override the
+automatic choice with `--scanner-runtime container|host` or
+`SCENTER_SCANNER_RUNTIME`.
+
 ## Manual administrator install (alternative)
 
 One-time installation of the Security Center CLI into a Docker-based Jenkins,

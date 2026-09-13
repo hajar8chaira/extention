@@ -9,6 +9,7 @@ const { analyzeWorkspace, mergeIntelligence, runSupplyChainStages, buildPipeline
 const { evaluatePolicyGate, formatGateResult, gateExitCode, policyGateError, STATUS } = require('./intelligence/policy-gate');
 const { signBlob, verifyBlob } = require('./supply-chain/cosign');
 const { buildCiReport, CI_REPORT_FILENAME } = require('./ci-report');
+const { createCiScannerRuntime, scannerRuntimeMode } = require('./ci-scanner-runtime');
 // The installed package identifies the CI Engine in the reports it writes.
 const { name: ENGINE_PACKAGE, version: ENGINE_VERSION } = require('../package.json');
 // The source commit stamped by the Security Center build. Absent in a source
@@ -46,6 +47,7 @@ function parseArgs(argv) {
   }
   if (result.incremental && !String(result.baseRef || '').trim()) throw new Error('--incremental exige --base-ref <SHA ou ref>.');
   if (result.snykMode && !['auto', 'local', 'docker'].includes(String(result.snykMode))) throw new Error('--snyk-mode accepte auto, local ou docker.');
+  if (result.scannerRuntime && !['auto', 'container', 'host'].includes(String(result.scannerRuntime))) throw new Error('--scanner-runtime accepte auto, container ou host.');
   return result;
 }
 
@@ -60,6 +62,18 @@ async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   if (args.help) { process.stdout.write(help()); return 0; }
   const workspacePath = path.resolve(args.workspace);
+  // On a CI execution node, Semgrep, Gitleaks, Trivy and OSV-Scanner run as
+  // ephemeral containers on that node's Docker daemon. Nothing is contacted
+  // until a selected scanner actually needs a container.
+  let containerRuntime = null;
+  try {
+    if (scannerRuntimeMode({ flag: args.scannerRuntime, env: process.env }) === 'container') {
+      containerRuntime = createCiScannerRuntime({ workspacePath, log: (line) => process.stderr.write(`[runtime] ${line}\n`) });
+    }
+  } catch (error) {
+    process.stderr.write(`${error.message}\n\nExit code: 2\n`);
+    return 2;
+  }
   let policy;
   try {
     policy = await loadProjectPolicy(workspacePath);
@@ -93,6 +107,7 @@ async function main(argv = process.argv.slice(2)) {
     workspacePath,
     policy,
     options: {
+      containerRuntime,
       selectedTools, targetUrl: args.targetUrl || 'http://127.0.0.1:3000', zapAuthorized: args.zapAuthorized,
       semgrepConfig: args.semgrepConfig || 'p/security-audit', semgrepTargets: incremental?.sourceFiles || [],
       gitleaksHistory: incremental ? true : undefined, gitleaksSinceCommit: incremental ? args.baseRef : '',
@@ -132,7 +147,7 @@ async function main(argv = process.argv.slice(2)) {
 
     const artifacts = await runSupplyChainStages({
       workspacePath,
-      sbom: args.sbom ? { enabled: true, mode: args.trivyMode || 'auto', outputDirectory: args.artifactDir || '' } : null,
+      sbom: args.sbom ? { enabled: true, mode: args.trivyMode || 'auto', outputDirectory: args.artifactDir || '', ...(containerRuntime ? { containerRuntime } : {}) } : null,
       provenance: args.provenance ? { enabled: true, outputPath: '' } : null,
       scanners: report.scanners,
       policy: analysis.policy,
@@ -193,6 +208,8 @@ async function main(argv = process.argv.slice(2)) {
     };
     report.policyGate = gate;
   }
+
+  await containerRuntime?.cleanup();
 
   // One verdict, computed once: the exit code and the CI report cannot disagree.
   const verdict = verdictOf(report);

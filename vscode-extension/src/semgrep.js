@@ -36,7 +36,15 @@ function dockerArgs(workspacePath, config, exclusions = {}, targets = []) {
   return dockerCliArgs(['run', '--rm', '-v', mount, '-w', '/src', 'semgrep/semgrep', 'semgrep', 'scan', ...scanOptions(config, exclusions), '--json', '--metrics=off', ...(targets.length ? targets : ['.'])]);
 }
 
-async function resolveInvocation(mode, workspacePath, config, exclusions = {}, targets = []) {
+const SEMGREP_IMAGE = 'semgrep/semgrep';
+
+/** CI container run: the same scan command, inside a runtime-managed container. */
+function containerArgs(container, config, exclusions = {}, targets = []) {
+  return container.runArgs(SEMGREP_IMAGE, ['semgrep', ...localArgs(config, exclusions, targets)], { workdir: container.root });
+}
+
+async function resolveInvocation(mode, workspacePath, config, exclusions = {}, targets = [], container = null) {
+  if (container) return { executable: 'docker', args: containerArgs(container, config, exclusions, targets), cwd: workspacePath, mode: 'docker' };
   if (mode !== 'docker' && await commandExists('semgrep')) {
     return { executable: 'semgrep', args: localArgs(config, exclusions, targets), cwd: workspacePath, mode: 'local' };
   }
@@ -45,19 +53,22 @@ async function resolveInvocation(mode, workspacePath, config, exclusions = {}, t
   return { executable: 'docker', args: dockerArgs(workspacePath, config, exclusions, targets), cwd: workspacePath, mode: 'docker' };
 }
 
-async function runSemgrep({ workspacePath, mode = 'auto', config = 'p/security-audit', exclusions = {}, targets = [], timeoutMs = 180000, signal }) {
-  const invocation = await resolveInvocation(mode, workspacePath, config, exclusions, targets);
+async function runSemgrep({ workspacePath, mode = 'auto', config = 'p/security-audit', exclusions = {}, targets = [], timeoutMs = 180000, signal, containerRuntime = null }) {
+  const container = containerRuntime ? await containerRuntime.forScanner(SEMGREP_IMAGE) : null;
+  const invocation = await resolveInvocation(mode, workspacePath, config, exclusions, targets, container);
+  const exec = container?.exec || execFileAsync;
+  const parse = (text) => (container ? container.mapPaths(JSON.parse(text)) : JSON.parse(text));
   try {
-    const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, {
+    const { stdout, stderr } = await exec(invocation.executable, invocation.args, {
       cwd: invocation.cwd, timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, windowsHide: true, signal,
       env: scanEnvironment()
     });
-    return { payload: JSON.parse(stdout), stderr, mode: invocation.mode };
+    return { payload: parse(stdout), stderr, mode: invocation.mode };
   } catch (error) {
     if (signal?.aborted) throw new Error('Scan Semgrep annulé.');
     // Semgrep may return a non-zero status while still producing valid JSON.
     if (error.stdout) {
-      try { return { payload: JSON.parse(error.stdout), stderr: error.stderr || '', mode: invocation.mode }; }
+      try { return { payload: parse(error.stdout), stderr: error.stderr || '', mode: invocation.mode }; }
       catch { /* handled below */ }
     }
     if (error.killed) throw new Error(`Le scan Semgrep a dépassé ${Math.round(timeoutMs / 1000)} secondes.`);
@@ -65,4 +76,4 @@ async function runSemgrep({ workspacePath, mode = 'auto', config = 'p/security-a
   }
 }
 
-module.exports = { runSemgrep, resolveInvocation, scanOptions, scanEnvironment, localArgs, dockerArgs };
+module.exports = { runSemgrep, resolveInvocation, scanOptions, scanEnvironment, localArgs, dockerArgs, containerArgs, SEMGREP_IMAGE };

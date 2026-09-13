@@ -53,11 +53,12 @@ async function generateSbomArtifact({
   fileName = 'sbom.cdx.json',
   timeoutMs = 300000,
   signal,
+  containerRuntime = null,
   generate = generateSbom
 } = {}) {
   const startedAt = new Date().toISOString();
   try {
-    const result = await generate({ workspacePath, mode, imageName, timeoutMs, signal });
+    const result = await generate({ workspacePath, mode, imageName, timeoutMs, signal, ...(containerRuntime ? { containerRuntime } : {}) });
     const serialized = `${JSON.stringify(result.payload, null, 2)}\n`;
     const destination = artifactPath(workspacePath, outputDirectory, fileName);
     await fs.mkdir(path.dirname(destination), { recursive: true });

@@ -407,6 +407,7 @@ async function runSupplyChainStages({
       mode: sbomOptions.mode || 'auto',
       imageName: sbomOptions.imageName || '',
       outputDirectory: sbomOptions.outputDirectory || '',
+      ...(sbomOptions.containerRuntime ? { containerRuntime: sbomOptions.containerRuntime } : {}),
       signal
     });
   }

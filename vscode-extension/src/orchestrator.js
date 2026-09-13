@@ -30,19 +30,19 @@ function defaultOptions(options = {}) {
 function buildScans(workspacePath, policy, options, signal) {
   const scans = [{
     tool: 'Semgrep',
-    execute: () => runSemgrep({ workspacePath, mode: options.semgrepMode, config: [options.semgrepConfig, policy?.semgrepCustomRules].filter(Boolean), exclusions: { files: [...(policy?.exclusions.global_files || []), ...(policy?.exclusions.semgrep_files || [])], rules: policy?.exclusions.semgrep_rules || [] }, targets: options.semgrepTargets || [], timeoutMs: options.timeoutMs, signal }),
+    execute: () => runSemgrep({ workspacePath, mode: options.semgrepMode, config: [options.semgrepConfig, policy?.semgrepCustomRules].filter(Boolean), exclusions: { files: [...(policy?.exclusions.global_files || []), ...(policy?.exclusions.semgrep_files || [])], rules: policy?.exclusions.semgrep_rules || [] }, targets: options.semgrepTargets || [], containerRuntime: options.containerRuntime || null, timeoutMs: options.timeoutMs, signal }),
     normalize: normalizeSemgrepOutput
   }, {
     tool: 'Gitleaks',
-    execute: () => runGitleaks({ workspacePath, mode: options.gitleaksMode, history: options.gitleaksHistory ?? Boolean(policy?.gitleaksHistory), sinceCommit: options.gitleaksSinceCommit || '', configPath: policy?.gitleaksConfig || '', exclusions: policy?.exclusions.global_files || [], timeoutMs: options.timeoutMs, signal }),
+    execute: () => runGitleaks({ workspacePath, mode: options.gitleaksMode, history: options.gitleaksHistory ?? Boolean(policy?.gitleaksHistory), sinceCommit: options.gitleaksSinceCommit || '', configPath: policy?.gitleaksConfig || '', exclusions: policy?.exclusions.global_files || [], containerRuntime: options.containerRuntime || null, timeoutMs: options.timeoutMs, signal }),
     normalize: normalizeGitleaksOutput
   }, {
     tool: 'Trivy',
-    execute: () => runTrivy({ workspacePath, mode: options.trivyMode, imageName: options.trivyImage, exclusions: [...(policy?.exclusions.global_files || []), ...(policy?.exclusions.trivy_files || [])], timeoutMs: options.timeoutMs, signal }),
+    execute: () => runTrivy({ workspacePath, mode: options.trivyMode, imageName: options.trivyImage, exclusions: [...(policy?.exclusions.global_files || []), ...(policy?.exclusions.trivy_files || [])], containerRuntime: options.containerRuntime || null, timeoutMs: options.timeoutMs, signal }),
     normalize: normalizeTrivyOutput
   }, {
     tool: 'OSV-Scanner',
-    execute: () => runOsv({ workspacePath, timeoutMs: options.timeoutMs, signal }),
+    execute: () => runOsv({ workspacePath, containerRuntime: options.containerRuntime || null, timeoutMs: options.timeoutMs, signal }),
     normalize: normalizeOsvOutput
   }];
   // SonarQube joins the static phase and the shared scheduler, but only when it
@@ -117,8 +117,13 @@ async function runSecurityScan(input) {
     }
   };
   const staticScans = scans.filter((scan) => !scan.dynamic);
-  await runWithConcurrency(staticScans, policy?.maxParallelScanners || 2, runOne, controller.signal);
-  for (const scan of scans.filter((item) => item.dynamic)) if (!controller.signal.aborted) await runOne(scan);
+  try {
+    await runWithConcurrency(staticScans, policy?.maxParallelScanners || 2, runOne, controller.signal);
+    for (const scan of scans.filter((item) => item.dynamic)) if (!controller.signal.aborted) await runOne(scan);
+  } finally {
+    // CI containers run with --rm; this removes one left behind by a timeout or an abort.
+    await options.containerRuntime?.cleanup?.();
+  }
   const deduplicated = deduplicateFindings(findings);
   const correlations = correlateFindings(deduplicated);
   const policyResult = evaluatePolicy(deduplicated, policy);
