@@ -111,6 +111,7 @@ const { renderSidebarLauncherHtml } = require('./sidebar-launcher');
 const { scannerToolFromId } = require('./scanner-presentation');
 const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
 const { readProjectConfiguration, saveProjectScanners } = require('./project-configuration');
+const { detectPolicyGitState, describePolicyPublication, PUBLICATION_ACTIONS, SOURCE_CONTROL_COMMAND } = require('./policy-publication');
 const { evaluatePolicyGate, policyGateError, policyResultFromGate, STATUS: GATE_STATUS } = require('./intelligence/policy-gate');
 const { readPolicyGateConfig, savePolicyGate, createStarterPolicy, policyGateHash, policyFilePath } = require('./policy-config');
 const { analyzeLicenses, renderLicenseReportHtml } = require('./license-compliance');
@@ -3792,7 +3793,10 @@ async function activate(context) {
             return;
           }
           const saved = await saveProjectScanners(projectFolder.uri.fsPath, message.tools.map(String));
-          if (saved.ok) vscode.window.showInformationMessage(`Security Center : ${saved.message}`);
+          if (saved.ok) {
+            vscode.window.showInformationMessage(`Security Center : ${saved.message}`);
+            notifyPolicyPublication(policyFilePath(projectFolder.uri.fsPath).filePath).catch(() => {});
+          }
           else vscode.window.showErrorMessage(`Security Center : configuration non enregistrée — ${saved.message}`);
           await refreshProjectConfiguration();
           await renderScannerSetup();
@@ -4126,6 +4130,7 @@ async function activate(context) {
       if (policySaveResult.ok) {
         await auditPolicyChange(policySaveResult, 'Politique de gate enregistrée depuis l’interface.');
         vscode.window.showInformationMessage(`Security Center : ${policySaveResult.message}`);
+        notifyPolicyPublication(policySaveResult.filePath || policyFilePath(folder.uri.fsPath).filePath).catch(() => {});
       } else {
         vscode.window.showErrorMessage(`Security Center : politique non enregistrée — ${policySaveResult.message}`);
       }
@@ -4138,6 +4143,7 @@ async function activate(context) {
       if (policySaveResult.ok) {
         await auditPolicyChange(policySaveResult, 'Politique de départ créée depuis l’interface.');
         await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(policySaveResult.filePath)));
+        notifyPolicyPublication(policySaveResult.filePath).catch(() => {});
       } else vscode.window.showErrorMessage(`Security Center : ${policySaveResult.message}`);
       return renderPipelinePage();
     }
@@ -4348,6 +4354,37 @@ async function activate(context) {
   // it is not stored in settings, not put in a URL and not rendered.
   let deliveryPanel;
   let deliveryStatus = notConfiguredModel({ message: 'No CI/CD provider configured.' });
+
+  /**
+   * Après un enregistrement de security-center.yml : l'état Git du fichier et
+   * l'étape de publication vers la CI. Security Center ne lance jamais git add,
+   * git commit ni git push : il ouvre la vue Source Control native ou copie les
+   * commandes, et l'utilisateur les exécute lui-même.
+   */
+  async function notifyPolicyPublication(filePath) {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder || !filePath) return;
+    const runGit = async (cwd, args) => {
+      try {
+        const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], { windowsHide: true, timeout: 8000 });
+        return { ok: true, stdout };
+      } catch (error) {
+        return { ok: false, stdout: String(error?.stdout || ''), missing: error?.code === 'ENOENT' };
+      }
+    };
+    const publication = describePolicyPublication(await detectPolicyGitState({ workspacePath: folder.uri.fsPath, filePath, runGit }));
+    const actions = [
+      ...(publication.sourceControl ? [PUBLICATION_ACTIONS.sourceControl] : []),
+      ...(publication.commands.length ? [PUBLICATION_ACTIONS.copy] : [])
+    ];
+    const choice = await vscode.window.showInformationMessage(publication.message, ...actions);
+    if (choice === PUBLICATION_ACTIONS.sourceControl) {
+      await vscode.commands.executeCommand(SOURCE_CONTROL_COMMAND);
+    } else if (choice === PUBLICATION_ACTIONS.copy) {
+      await vscode.env.clipboard.writeText(publication.commands.join('\n'));
+      vscode.window.showInformationMessage('Security Center : commandes Git copiées. Vérifiez-les puis exécutez-les vous-même dans un terminal.');
+    }
+  }
 
   async function currentWorkspaceCommit() {
     const folder = vscode.workspace.workspaceFolders?.[0];
