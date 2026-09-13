@@ -57,6 +57,37 @@ function executable(file, content) {
   fs.writeFileSync(file, content, { mode: 0o755 });
 }
 
+/**
+ * The deployment host's PATH, isolated from the machine running the tests:
+ * wrappers for the few system tools the remote scripts use, and nothing else.
+ * A Docker installed where the tests run (GitHub ubuntu runners have one in
+ * /usr/bin) is never on it, so "missing" really is missing for `command -v`
+ * and "ready" can only be the double.
+ */
+const REMOTE_TOOLS = ['sh', 'id', 'grep', 'head', 'cat', 'tr', 'cut', 'tail'];
+let remoteSystem = null;
+function remoteSystemPath() {
+  if (remoteSystem) return remoteSystem;
+  const dir = path.join(root, 'remote-system');
+  for (const name of REMOTE_TOOLS) {
+    const found = spawnSync(BASH, ['-c', `command -v ${name}`], { encoding: 'utf8', env: { PATH: SYSTEM_PATH, SYSTEMROOT: process.env.SYSTEMROOT || '' } });
+    const target = found.status === 0 ? found.stdout.trim() : '';
+    if (!target.startsWith('/')) throw new Error(`${name} introuvable dans ${SYSTEM_PATH}`);
+    executable(path.join(dir, name), `#!/bin/sh\nexec '${target}' "$@"\n`);
+  }
+  remoteSystem = posix(dir);
+  return remoteSystem;
+}
+
+/** A Docker on the machine running the tests, like the runner's own: reaching it is a test failure. */
+function hostDocker(name) {
+  const dir = path.join(root, name, 'host-docker');
+  executable(path.join(dir, 'docker'), '#!/bin/sh\necho "host docker $*" >> "$HOST_DOCKER_LOG"\necho 28.0.4\n');
+  const log = path.join(root, name, 'host-docker.log');
+  fs.writeFileSync(log, '');
+  return { dir, log };
+}
+
 /** Local and remote doubles: ssh runs the remote command here, with a docker double on the remote PATH. */
 function doubles(name) {
   const dir = path.join(root, name);
@@ -113,17 +144,19 @@ function repository(name, { dockerfile = true } = {}) {
 /** Runs the Jenkinsfile deploy script with the job parameters Security Center writes. */
 function deploy(name, { fake = {}, parameters = {}, dockerfile = true } = {}) {
   const tools = doubles(name);
+  const host = hostDocker(name);
   const repo = repository(name, { dockerfile });
   const keyFile = path.join(tools.dir, 'ssh-key');
   fs.writeFileSync(keyFile, `-----BEGIN OPENSSH PRIVATE KEY-----\n${SECRET}\n-----END OPENSSH PRIVATE KEY-----\n`);
   const env = {
     SYSTEMROOT: process.env.SYSTEMROOT || '', HOME: posix(root),
-    PATH: `${posix(tools.local)}:${SYSTEM_PATH}`,
+    PATH: `${posix(tools.local)}:${posix(host.dir)}:${SYSTEM_PATH}`,
     ...jobParameterValues(WHOAMI, HOST_KEY), ...parameters,
     SC_SOURCE_COMMIT: repo.commit,
     SCENTER_DEPLOY_KEY: posix(keyFile),
     FAKE_LOG: posix(tools.log), FAKE_DIR: posix(tools.dir),
-    FAKE_REMOTE_PATH: `${fake.docker === 'missing' ? '' : `${posix(tools.remote)}:`}${SYSTEM_PATH}`,
+    FAKE_REMOTE_PATH: `${fake.docker === 'missing' ? '' : `${posix(tools.remote)}:`}${remoteSystemPath()}`,
+    HOST_DOCKER_LOG: posix(host.log),
     FAKE_SSH: fake.ssh || '', FAKE_DOCKER: fake.docker || '', FAKE_EXISTING: fake.existing || '', FAKE_PORT_OWNER: fake.portOwner || ''
   };
   const result = spawnSync(BASH, ['-c', DEPLOY_SCRIPT], { cwd: repo.dir, encoding: 'utf8', env });
@@ -132,6 +165,7 @@ function deploy(name, { fake = {}, parameters = {}, dockerfile = true } = {}) {
   return {
     ...result, repo, tools,
     log: fs.readFileSync(tools.log, 'utf8'),
+    hostDockerLog: fs.readFileSync(host.log, 'utf8'),
     reason: fs.existsSync(reasonFile) ? fs.readFileSync(reasonFile, 'utf8') : null,
     knownHosts: fs.existsSync(path.join(tools.dir, 'known_hosts.seen')) ? fs.readFileSync(path.join(tools.dir, 'known_hosts.seen'), 'utf8') : ''
   };
@@ -177,6 +211,7 @@ test('PASS -> deployment configuration used: the job parameters are exactly what
   const listing = spawnSync(BASH, ['-c', `tar -tf '${posix(path.join(result.tools.dir, 'context.tar'))}'`], { encoding: 'utf8', env: { PATH: SYSTEM_PATH } });
   assert.deepEqual(listing.stdout.trim().split(/\r?\n/).sort(), ['Dockerfile', 'app.go'], 'the analysed commit is the build context');
   assert.match(result.stdout, /conteneur scenter-whoami déployé/);
+  assert.equal(result.hostDockerLog, '', 'only the Docker double is used, never the Docker of the machine running the tests');
   for (const leftover of ['.scenter-deploy-known-hosts', '.scenter-deploy-context.tar', '.scenter-deploy-ssh.err']) {
     assert.equal(fs.existsSync(path.join(result.repo.dir, leftover)), false, `${leftover} cleaned up`);
   }
@@ -207,8 +242,11 @@ test('Docker unavailable -> precise error, nothing built or started', { skip: SK
     [{ existing: 'foreign' }, "Un conteneur scenter-whoami non déployé par Security Center existe sur 192.168.222.132 : il n'est jamais remplacé."],
     [{ portOwner: 'traefik' }, 'Le port 8088 de 192.168.222.132 est déjà publié par un autre conteneur.']
   ];
+  const lookup = spawnSync(BASH, ['-c', 'export PATH="$REMOTE_PATH"; command -v docker'], { encoding: 'utf8', env: { SYSTEMROOT: process.env.SYSTEMROOT || '', REMOTE_PATH: remoteSystemPath() } });
+  assert.notEqual(lookup.status, 0, `docker must not be resolvable on the simulated host without Docker: ${lookup.stdout}`);
   for (const [fake, expected] of cases) {
     const result = deploy(`fail-${Object.values(fake).join('-')}`, { fake });
+    assert.equal(result.hostDockerLog, '', `${JSON.stringify(fake)}: the Docker of the machine running the tests is never used`);
     assert.equal(result.status, 1, JSON.stringify(fake));
     if (expected instanceof RegExp) assert.match(result.reason, expected);
     else assert.equal(result.reason, expected);
@@ -224,9 +262,15 @@ test('Docker unavailable -> precise error, nothing built or started', { skip: SK
 
 test('the validation check reports Docker facts precisely on the deployment host', { skip: SKIP }, () => {
   const tools = doubles('check');
-  const runCheck = (dockerMode, withDocker = true) => spawnSync(BASH, ['-c', checkScript(WHOAMI)], {
+  const host = hostDocker('check');
+  // PATH is set inside the shell: Git Bash's launcher would otherwise prepend its own directories.
+  const runCheck = (dockerMode, withDocker = true) => spawnSync(BASH, ['-c', 'export PATH="$REMOTE_PATH"; exec sh -c "$CHECK_SCRIPT"'], {
     encoding: 'utf8',
-    env: { SYSTEMROOT: process.env.SYSTEMROOT || '', PATH: `${withDocker ? `${posix(tools.remote)}:` : ''}${SYSTEM_PATH}`, FAKE_LOG: posix(tools.log), FAKE_DIR: posix(tools.dir), FAKE_DOCKER: dockerMode }
+    env: {
+      SYSTEMROOT: process.env.SYSTEMROOT || '', PATH: `${posix(host.dir)}:${SYSTEM_PATH}`,
+      REMOTE_PATH: `${withDocker ? `${posix(tools.remote)}:` : ''}${remoteSystemPath()}`, CHECK_SCRIPT: checkScript(WHOAMI),
+      FAKE_LOG: posix(tools.log), FAKE_DIR: posix(tools.dir), FAKE_DOCKER: dockerMode, HOST_DOCKER_LOG: posix(host.log)
+    }
   }).stdout;
   assert.match(runCheck('', false), /^SCENTER_DEPLOYCHECK_DOCKER=missing$/m);
   assert.match(runCheck('permission'), /^SCENTER_DEPLOYCHECK_DOCKER=permission-denied$/m);
@@ -235,6 +279,7 @@ test('the validation check reports Docker facts precisely on the deployment host
   assert.match(ready, /^SCENTER_DEPLOYCHECK_DOCKER=ready 27\.3\.1$/m);
   assert.match(ready, /^SCENTER_DEPLOYCHECK_CONTAINER=absent$/m);
   assert.match(ready, /^SCENTER_DEPLOYCHECK_DONE=1$/m);
+  assert.equal(fs.readFileSync(host.log, 'utf8'), '', 'the Docker of the machine running the tests is never probed');
 });
 
 // ------------------------------------------------------------ Health Check
