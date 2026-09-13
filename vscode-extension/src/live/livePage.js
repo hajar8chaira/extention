@@ -143,7 +143,7 @@ class LiveSecurityPageProvider {
     // declaree explicitement, sinon `asWebviewUri` produit une URI que le
     // webview refuse de charger.
     const brandingRoot = this.api.Uri.joinPath(this.extensionUri, 'media', 'branding');
-    this.panel = this.api.window.createWebviewPanel('securityCenter.liveSecurity', 'Security Center â€” Live Security', this.api.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetRoot, brandingRoot] });
+    this.panel = this.api.window.createWebviewPanel('securityCenter.liveSecurity', 'Security Center — Live Security', this.api.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [assetRoot, brandingRoot] });
     this.companionImageUri = this.panel.webview.asWebviewUri(this.api.Uri.joinPath(assetRoot, 'security-companion.png')).toString();
     this.brandLogoUri = this.panel.webview.asWebviewUri(this.api.Uri.joinPath(brandingRoot, 'secenter-icon-256.png')).toString();
     this.panel.webview.onDidReceiveMessage((message) => this.handleMessage(message));

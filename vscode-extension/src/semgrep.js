@@ -17,6 +17,16 @@ function scanOptions(config, exclusions = {}) {
   return args;
 }
 
+/**
+ * Semgrep is Python: on Windows it opens rule files with the legacy locale
+ * encoding, so a UTF-8 custom ruleset comes back mojibake — "L’usage" read as
+ * cp1252 becomes "Lâ€™usage" — and that corrupted text lands in the finding
+ * titles. UTF-8 mode makes it read the rules as they were written.
+ */
+function scanEnvironment(baseEnv = process.env) {
+  return { ...baseEnv, PYTHONUTF8: '1' };
+}
+
 function localArgs(config, exclusions = {}, targets = []) {
   return ['scan', ...scanOptions(config, exclusions), '--json', '--metrics=off', ...(targets.length ? targets : ['.'])];
 }
@@ -39,7 +49,8 @@ async function runSemgrep({ workspacePath, mode = 'auto', config = 'p/security-a
   const invocation = await resolveInvocation(mode, workspacePath, config, exclusions, targets);
   try {
     const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, {
-      cwd: invocation.cwd, timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, windowsHide: true, signal
+      cwd: invocation.cwd, timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, windowsHide: true, signal,
+      env: scanEnvironment()
     });
     return { payload: JSON.parse(stdout), stderr, mode: invocation.mode };
   } catch (error) {
@@ -54,4 +65,4 @@ async function runSemgrep({ workspacePath, mode = 'auto', config = 'p/security-a
   }
 }
 
-module.exports = { runSemgrep, resolveInvocation, scanOptions, localArgs, dockerArgs };
+module.exports = { runSemgrep, resolveInvocation, scanOptions, scanEnvironment, localArgs, dockerArgs };

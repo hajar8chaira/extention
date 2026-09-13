@@ -13,7 +13,10 @@ test('détecte une cible dynamique accessible avec un HEAD léger', async (t) =>
 
 test('signale une cible dynamique inaccessible', async () => {
   const result = await checkTargetReachability('http://127.0.0.1:1', 250);
-  assert.equal(result.state, 'unreachable');
+  // Une connexion refusee est nommee comme telle : « refused » dit quoi
+  // corriger la ou « unreachable » ne disait que l'echec.
+  assert.equal(result.state, 'refused');
+  assert.notEqual(result.state, 'online');
 });
 
 test('conserve un état inconnu sans cible configurée', async () => {

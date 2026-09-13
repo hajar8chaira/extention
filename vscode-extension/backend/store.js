@@ -49,7 +49,15 @@ function writeJsonAtomic(file, value) {
   fs.renameSync(temporary, file);
 }
 
-/** The identity of an HTTP scenario: the same exchange captured twice is one scenario. */
+/**
+ * The shape of an exchange, for grouping — never for discarding.
+ *
+ * Two requests with the same method, URL, body and response are the same *kind*
+ * of exchange. That similarity is what endpoint inventories and finding
+ * correlation are built on. It is emphatically not identity: a page loaded
+ * twice produced two requests, and a capture that reported one of them would be
+ * hiding observed traffic.
+ */
 function scenarioFingerprint(scenario) {
   const response = scenario.response;
   const identity = [
@@ -60,6 +68,20 @@ function scenarioFingerprint(scenario) {
     response ? String(response.bodySha256 || '') : ''
   ].join('\n');
   return crypto.createHash('sha256').update(identity, 'utf8').digest('hex');
+}
+
+/**
+ * The identity of a capture *event*, when the capture layer provides one.
+ *
+ * mitmproxy gives every flow a unique id; a re-post of that flow is the same
+ * observation arriving twice, and only that case is collapsed. Sources without
+ * a flow id contribute a new event on every delivery, which is the truthful
+ * reading of « the connector saw this exchange again ».
+ */
+function captureEventKey(scenario) {
+  const flowId = scenario?.capture?.flow_id || scenario?.capture?.flowId;
+  if (!flowId) return '';
+  return `${String(scenario.source || 'capture')}:${String(flowId)}`;
 }
 
 class FileStore {
@@ -183,23 +205,36 @@ class FileStore {
 
   // -------------------------------------------------------------- scenarios
 
+  /**
+   * Records one observed HTTP exchange.
+   *
+   * Every exchange is one event. Two identical requests a minute apart are two
+   * captured requests and one endpoint — the earlier fingerprint-based collapse
+   * answered « two requests? no, one », which is not what the proxy saw.
+   *
+   * Idempotency is still needed, but it belongs to the *transport*, not to the
+   * exchange: a connector that re-posts a flow after a retry must not double it.
+   * So the only thing deduplicated is a re-delivery of the same capture event,
+   * identified by the flow id the capture layer already supplies. A payload
+   * without one is, by definition, a new observation.
+   */
   saveHttpScenario(scenario) {
     const fingerprint = scenarioFingerprint(scenario);
+    const eventKey = captureEventKey(scenario);
     const existing = readJsonLines(this.scenarioFile);
-    const duplicate = existing.filter((entry) => entry.fingerprint === fingerprint).pop();
-    // The same request captured twice from Burp is the same scenario. Returning
-    // the stored one keeps replay history stable instead of growing a duplicate
-    // every time the proxy sees the exchange again.
-    if (duplicate) {
-      const { fingerprint: _ignored, ...payload } = duplicate;
-      return payload;
+    if (eventKey) {
+      const redelivered = existing.filter((entry) => entry.event_key === eventKey).pop();
+      if (redelivered) {
+        const { fingerprint: _ignored, event_key: _key, ...payload } = redelivered;
+        return payload;
+      }
     }
     const stored = {
       scenario_id: this.nextId(existing, 'scenario_id'),
       created_at: new Date().toISOString(),
       ...scenario
     };
-    appendJsonLine(this.scenarioFile, { ...stored, fingerprint });
+    appendJsonLine(this.scenarioFile, { ...stored, fingerprint, ...(eventKey ? { event_key: eventKey } : {}) });
     return stored;
   }
 
@@ -207,7 +242,7 @@ class FileStore {
     return readJsonLines(this.scenarioFile)
       .sort((a, b) => Number(b.scenario_id) - Number(a.scenario_id))
       .slice(0, limit)
-      .map(({ fingerprint: _ignored, ...scenario }) => scenario);
+      .map(({ fingerprint: _ignored, event_key: _key, ...scenario }) => scenario);
   }
 
   /** The scan a route named, or a 404 the service can return unchanged. */
@@ -218,4 +253,4 @@ class FileStore {
   }
 }
 
-module.exports = { FileStore, scenarioFingerprint, readJsonLines };
+module.exports = { FileStore, scenarioFingerprint, captureEventKey, readJsonLines };

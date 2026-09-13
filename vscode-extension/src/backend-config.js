@@ -165,7 +165,7 @@ function isHealthPayload(payload) {
  * service. Never throws — a dependency that is down must degrade its own
  * capability and nothing else.
  */
-async function probeBackend(baseUrl, { check = checkBackend } = {}) {
+async function probeBackend(baseUrl, { check = checkBackend, authorize = null } = {}) {
   let target;
   try {
     target = normalizeBackendUrl(baseUrl);
@@ -180,6 +180,10 @@ async function probeBackend(baseUrl, { check = checkBackend } = {}) {
         message: 'La réponse ne correspond pas au backend Security Center.'
       });
     }
+    // `/health` answered, but it is open to everyone: a backend started with
+    // another key answers it too. When the caller holds a key, the backend must
+    // also accept that key before it counts as ours.
+    if (typeof authorize === 'function') await authorize(target);
     return describeBackend({
       state: BACKEND_STATE.ONLINE, url: target,
       service: String(payload.service || ''), version: String(payload.version || '')

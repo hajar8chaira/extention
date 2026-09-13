@@ -53,13 +53,41 @@ function requestText(target, timeoutMs = 10000) {
         resolve(body);
       });
     });
-    request.on('timeout', () => request.destroy(new Error('Le backend local ne rÃ©pond pas.')));
+    request.on('timeout', () => request.destroy(new Error('Le backend local ne répond pas.')));
     request.on('error', reject);
   });
 }
 
 function checkBackend(baseUrl) {
   return requestJson('GET', backendUrl(baseUrl, 'health'));
+}
+
+/**
+ * Whether the backend at this address accepts this exact key.
+ *
+ * `/health` is open by design, so it cannot tell « our backend » from « a
+ * Security Center backend started with another key » — an orphaned process on
+ * the default port answered it perfectly while refusing every real request.
+ * One authenticated read settles it. The key travels in the header only.
+ */
+function checkBackendKey(baseUrl, apiKey, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(backendUrl(baseUrl, 'api/v1/scans?limit=1'));
+    const transport = url.protocol === 'https:' ? https : http;
+    const request = transport.request(url, {
+      method: 'GET',
+      headers: apiKey ? { 'x-security-center-key': String(apiKey) } : {},
+      timeout: timeoutMs
+    }, (response) => {
+      response.resume();
+      response.on('end', () => ((response.statusCode || 500) >= 400
+        ? reject(new Error(`Backend HTTP ${response.statusCode}: key check`))
+        : resolve(true)));
+    });
+    request.on('timeout', () => request.destroy(new Error('ETIMEDOUT')));
+    request.on('error', reject);
+    request.end();
+  });
 }
 
 async function saveScanResult(baseUrl, result) {
@@ -77,6 +105,11 @@ function listHttpScenarios(baseUrl) {
 
 function getBurpStatus(baseUrl) {
   return requestJson('GET', backendUrl(baseUrl, 'api/v1/integrations/burp/status'), undefined, 10000);
+}
+
+/** Statut du proxy managé, lu sur la même route que celui de Burp. */
+function getMitmproxyStatus(baseUrl) {
+  return requestJson('GET', backendUrl(baseUrl, 'api/v1/integrations/mitmproxy/status'), undefined, 10000);
 }
 
 async function listScans(baseUrl, limit = 50) {
@@ -149,7 +182,7 @@ function scanExportUrl(baseUrl, scanId, format = 'json') {
 }
 
 module.exports = {
-  setApiKey, authenticationHeaders, backendUrl, checkBackend, requestJson, requestText, saveScanResult, saveHttpScenario,
-  listHttpScenarios, getBurpStatus, listScans, getScan, updateFindingStatus, listAuditEvents, createAuditEvent, scanExportUrl,
+  setApiKey, authenticationHeaders, backendUrl, checkBackend, checkBackendKey, requestJson, requestText, saveScanResult, saveHttpScenario,
+  listHttpScenarios, getBurpStatus, getMitmproxyStatus, listScans, getScan, updateFindingStatus, listAuditEvents, createAuditEvent, scanExportUrl,
   normalizeFindingToCamelCase, normalizeScanToCamelCase
 };

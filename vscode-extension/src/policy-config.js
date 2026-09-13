@@ -20,7 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { parsePolicyYaml, validatePolicy, applyGateToPolicyYaml, starterPolicyYaml, STARTER_GATE } = require('./project-policy');
+const { parsePolicyYaml, validatePolicy, applyGateToPolicyYaml, starterPolicyYaml, STARTER_GATE, legacyPolicyNotice } = require('./project-policy');
 
 const POLICY_FILE_NAMES = Object.freeze(['security-center.yml', 'security-center.yaml']);
 
@@ -109,7 +109,10 @@ async function readPolicyGateConfig(workspacePath) {
     const policy = validatePolicy(parsePolicyYaml(text));
     return {
       exists: true, filePath, gate: policy.gate, supplyChain: policy.supplyChain,
-      error: '', hash: policyGateHash(policy), configured: Boolean(policy.gate.configured || policy.supplyChain.configured)
+      error: '', hash: policyGateHash(policy), configured: Boolean(policy.gate.configured || policy.supplyChain.configured),
+      // Legacy thresholds still written in the file are shown as ignored,
+      // never deleted and never applied.
+      legacyNotice: legacyPolicyNotice(policy)
     };
   } catch (error) {
     return { exists: true, filePath, gate: {}, supplyChain: {}, error: error.message, hash: '' };
@@ -134,10 +137,11 @@ async function savePolicyGate(workspacePath, selection = {}) {
     await atomicWrite(filePath, updated);
     const policy = validatePolicy(parsePolicyYaml(updated));
     const configured = Boolean(policy.gate.configured || policy.supplyChain.configured);
+    const legacyNotice = legacyPolicyNotice(policy);
     return {
-      ok: true, filePath, hash: policyGateHash(policy), configured,
+      ok: true, filePath, hash: policyGateHash(policy), configured, legacyNotice,
       message: configured
-        ? 'Les règles ont été écrites dans security-center.yml. Ré-évaluez la politique ou relancez une analyse pour appliquer le nouveau verdict.'
+        ? `Les règles ont été écrites dans security-center.yml. Ré-évaluez la politique ou relancez une analyse pour appliquer le nouveau verdict.${legacyNotice ? ` ${legacyNotice}` : ''}`
         : 'Aucune règle sélectionnée : la section gate a été retirée de security-center.yml. Le Policy Gate redevient non configuré.'
     };
   } catch (error) {

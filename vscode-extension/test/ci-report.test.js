@@ -14,11 +14,20 @@ const {
 } = require('../src/jenkins');
 const { renderDeliveryPageHtml } = require('../src/delivery-page');
 
+// Supply-chain evidence is only reported when its file exists: the fixture
+// points at real files in a throwaway workspace.
+const EVIDENCE_ROOT = fs.mkdtempSync(path.join(require('os').tmpdir(), 'sc-ci-report-'));
+const EVIDENCE_SBOM = path.join(EVIDENCE_ROOT, 'security-center', 'sbom.cdx.json');
+fs.mkdirSync(path.dirname(EVIDENCE_SBOM), { recursive: true });
+for (const file of [EVIDENCE_SBOM, `${EVIDENCE_SBOM}.provenance.json`, `${EVIDENCE_SBOM}.sigstore.json`]) fs.writeFileSync(file, '{}');
+process.on('exit', () => fs.rmSync(EVIDENCE_ROOT, { recursive: true, force: true }));
+
 const SHA = 'abc123def456789012345678901234567890abcd';
 const OTHER = 'def4567890123456789012345678901234567890';
 
 /** A CLI report shaped exactly as `src/cli.js` produces it. */
 const cliReport = (overrides = {}) => ({
+  workspace: EVIDENCE_ROOT,
   findings: [
     { id: 'sg:1', tool: 'Semgrep', rawSeverity: 'CRITICAL', title: 'Injection SQL' },
     { id: 'sg:2', tool: 'Semgrep', rawSeverity: 'HIGH', title: 'Commande système' },
@@ -44,7 +53,11 @@ const cliReport = (overrides = {}) => ({
     correlationSummary: { total: 2 },
     reachabilitySummary: { analysed: true, counts: { statically_reachable: 1 } },
     prioritySummary: { distribution: { P0: 1, P1: 1 } },
-    artifacts: { sbom: { status: 'generated' }, provenance: { status: 'generated' }, signing: { status: 'verified' } }
+    artifacts: {
+      sbom: { status: 'generated', path: EVIDENCE_SBOM },
+      provenance: { status: 'generated', path: `${EVIDENCE_SBOM}.provenance.json` },
+      signing: { status: 'verified', artifact: EVIDENCE_SBOM, signaturePath: `${EVIDENCE_SBOM}.sigstore.json` }
+    }
   },
   ...overrides
 });
@@ -67,7 +80,12 @@ test('le rapport CI est une projection du résultat existant', () => {
   assert.equal(report.policy.reasons[0].priority, 91);
   assert.deepEqual(report.summary, { findings: 3, critical: 1, high: 2, medium: 0, low: 0 });
   assert.equal(report.intelligence.correlation, 2);
-  assert.deepEqual(report.supplyChain, { sbom: 'generated', provenance: 'generated', signature: 'verified', signatureVerified: true });
+  assert.deepEqual(report.supplyChain, {
+    sbom: 'generated', provenance: 'generated', signature: 'verified', signatureVerified: true,
+    sbomPath: 'security-center/sbom.cdx.json',
+    provenancePath: 'security-center/sbom.cdx.json.provenance.json',
+    signaturePath: 'security-center/sbom.cdx.json.sigstore.json'
+  });
 });
 
 test('le statut de chaque scanner et son erreur sont préservés', () => {
@@ -445,7 +463,7 @@ test('le Jenkinsfile produit et archive le rapport CI, même sur un blocage', ()
   const template = fs.readFileSync(path.join(__dirname, '..', 'templates', 'Jenkinsfile'), 'utf8');
   assert.match(template, /--ci-report security-center-report\.json/);
   // L'archivage est dans un `post { always }` de l'étape : il précède l'arrêt.
-  const stage = template.slice(template.indexOf("stage('Security Center')"), template.indexOf("stage('Policy Gate')"));
+  const stage = template.slice(template.indexOf("stage('Security Center Analysis')"), template.indexOf("stage('Policy Gate')"));
   assert.match(stage, /post\s*\{[\s\S]*always\s*\{[\s\S]*archiveArtifacts artifacts: 'security-center-report\.json'/);
   assert.ok(stage.indexOf('post {') > stage.indexOf('returnStatus'), 'le code de sortie est lu, pas propagé');
   // Le gate refuse ensuite, et Deploy reste gardé.

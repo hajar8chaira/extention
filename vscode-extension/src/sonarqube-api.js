@@ -69,7 +69,18 @@ function sonarRequest(hostUrl, apiPath, { token = '', query = {}, timeoutMs = 15
     try { url = sonarUrl(hostUrl, apiPath, query); } catch (error) { return reject(error); }
     const transport = url.protocol === 'https:' ? https : http;
     const headers = { accept: 'application/json' };
-    if (token) headers.authorization = `Bearer ${token}`;
+    // SonarQube authenticates a token as HTTP Basic, with the token as the user
+    // name and an empty password — exactly what `curl -u "<token>:"` sends, and
+    // what every supported server version understands.
+    //
+    // `Bearer` only exists from SonarQube 10.0 onwards. A 9.9 LTS ignores that
+    // header instead of rejecting it, so the call was simply anonymous:
+    // `api/authentication/validate` then answers `{"valid":false}` with HTTP 200
+    // and a perfectly good token was reported as refused.
+    //
+    // The value is trimmed at this boundary too: a stored token that kept a
+    // trailing newline would otherwise be encoded into the credentials.
+    if (token) headers.authorization = `Basic ${Buffer.from(`${String(token).trim()}:`, 'utf8').toString('base64')}`;
     const request = transport.request(url, { method: 'GET', headers, timeout: timeoutMs }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));

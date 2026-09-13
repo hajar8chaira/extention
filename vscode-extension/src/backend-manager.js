@@ -44,6 +44,7 @@ const { readLockFile, removeLockFile, writeDiscoveryFile, registerClient, unregi
 const {
   BACKEND_STATE, DEFAULT_BACKEND_URL, normalizeBackendUrl, probeBackend, describeBackend
 } = require('./backend-config');
+const { checkBackendKey } = require('./backend');
 
 /** How the address of the backend is decided. */
 const BACKEND_MODE = Object.freeze({
@@ -171,15 +172,25 @@ class BackendManager {
     freePort = findFreePort,
     portFree = isPortFree,
     startTimeoutMs = START_TIMEOUT_MS,
+    captureOrigins = () => [],
     log = () => {}
   } = {}) {
+    /** Les origines que le connecteur Burp peut verser, lues à chaque publication. */
+    this.captureOrigins = captureOrigins;
+    /** Le dernier backend publié : ce qu'une republication réécrit. */
+    this.lastAnnouncedStatus = null;
     this.dataDir = dataDir;
     this.getConfiguration = getConfiguration;
     this.apiKey = apiKey;
     this.version = version;
     this.serverPath = serverPath;
     this.execPath = execPath;
-    this.probe = probe;
+    // Le sondage par défaut vérifie aussi la clé : un backend Security Center
+    // lancé avec une autre clé répond à /health, mais n'est pas le nôtre. Le
+    // publier aurait donné à Burp une clé que ce backend refuse.
+    this.probe = probe === probeBackend
+      ? (url) => probeBackend(url, { authorize: this.apiKey ? (target) => checkBackendKey(target, this.apiKey) : null })
+      : probe;
     this.spawnProcess = spawnProcess;
     this.readLock = readLock;
     this.removeLock = removeLock;
@@ -310,13 +321,30 @@ class BackendManager {
    */
   announce(status) {
     if (!this.publishDiscovery) return;
+    this.lastAnnouncedStatus = status;
+    let captureOrigins = [];
+    try { captureOrigins = Array.isArray(this.captureOrigins?.()) ? this.captureOrigins() : []; } catch { captureOrigins = []; }
+    this.lastPublishedOrigins = JSON.stringify(captureOrigins);
     try {
       this.publishDiscovery({
-        url: status.url, mode: status.mode, version: status.version || this.version, apiKey: this.apiKey
+        url: status.url, mode: status.mode, version: status.version || this.version, apiKey: this.apiKey, captureOrigins
       });
     } catch (error) {
       this.log(`Backend : publication de l’adresse impossible — ${error.message}`);
     }
+  }
+
+  /**
+   * Republie le backend actif quand ce que Burp doit savoir a changé — la cible
+   * autorisée, par exemple. Sans backend déjà publié, il n'y a rien à republier.
+   */
+  republishDiscovery() {
+    if (!this.lastAnnouncedStatus) return false;
+    let origins = [];
+    try { origins = Array.isArray(this.captureOrigins?.()) ? this.captureOrigins() : []; } catch { origins = []; }
+    if (JSON.stringify(origins) === this.lastPublishedOrigins) return false;
+    this.announce(this.lastAnnouncedStatus);
+    return true;
   }
 
   /**
@@ -330,7 +358,14 @@ class BackendManager {
     const status = await this.getBackendStatus();
     if (status.online) return status;
     if (this.resolvedMode() !== RESOLVED_MODE.LOCAL) return status;
-    if (status.state === BACKEND_STATE.AUTH_ERROR) return status;
+    if (status.state === BACKEND_STATE.AUTH_ERROR) {
+      // Notre propre backend refuse la clé : c'est une configuration à corriger,
+      // pas une raison d'en lancer un second.
+      if (this.dataDir && this.readLock(this.dataDir)) return status;
+      // Sinon, le port est tenu par un autre backend — orphelin, autre clé. On ne
+      // le tue pas et on ne lui donne pas notre clé : on démarre le nôtre ailleurs.
+      this.log(`Backend : ${status.url} refuse la clé de cette fenêtre — démarrage d’un backend dédié sur un autre port.`);
+    }
     return this.startLocalBackend();
   }
 

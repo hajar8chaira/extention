@@ -47,13 +47,18 @@ test('Security Delivery page is provider-neutral and uses the normalized model',
     model: syntheticDelivery(),
     providers: DELIVERY_PROVIDERS,
     selectedProvider: 'gitlab-ci',
-    selectedProviderDefinition: deliveryProvider('gitlab-ci')
+    selectedProviderDefinition: deliveryProvider('gitlab-ci'),
+    // Les valeurs du modèle vivent désormais dans l'espace dédié du fournisseur ;
+    // le hub ne montre que de quoi choisir.
+    view: 'provider'
   }, 'n', 'light');
 
   assert.match(html, /Security Delivery/);
   assert.match(html, /Provider/);
   assert.match(html, /GitLab CI\/CD/);
-  assert.match(html, /Status/);
+  // « Connexion » a remplacé la tuile « Status » de l'ancienne page, qui
+  // répétait ce que la section Connexion disait déjà.
+  assert.match(html, /Connexion/);
   assert.match(html, /Healthy/);
   assert.match(html, /workflow-77/);
   assert.match(html, /build/);
@@ -67,11 +72,15 @@ test('Security Delivery not configured still renders the selector and implemente
     selectedProvider: 'jenkins',
     selectedProviderDefinition: provider,
     configuration: { url: 'http://ci.local', job: 'security-pipeline', user: 'admin' },
-    secretsConfigured: { token: true }
+    secretsConfigured: { token: true },
+    // Le formulaire s'ouvre à la demande : c'est le geste « Configurer », et non
+    // plus un panneau permanent sur la page principale.
+    view: 'provider', configuring: true
   }, 'n', 'light');
 
-  assert.match(html, /id="delivery-provider"/);
-  assert.match(html, /value="jenkins" selected/);
+  // Le sélecteur déroulant a laissé place au hub : le fournisseur se choisit en
+  // ouvrant sa carte, pas dans une liste au-dessus de son propre formulaire.
+  assert.match(html, /Jenkins/);
   assert.match(html, /URL Jenkins/);
   assert.match(html, /id="delivery-url"/);
   assert.match(html, /id="delivery-job"/);
@@ -86,10 +95,20 @@ test('Test connection and Save configuration are wired on implemented providers 
   assert.match(jenkins, /data-action="deliverySave"/);
   assert.match(jenkins, /data-action="deliveryTest"/);
 
-  const gitlab = renderProviderForm(deliveryProvider('gitlab-ci'));
-  assert.match(gitlab, /aucun adaptateur n’est encore disponible/);
-  assert.doesNotMatch(gitlab, /data-action="deliverySave"/);
-  assert.doesNotMatch(gitlab, /data-action="deliveryTest"/);
+  // GitLab et GitHub ont désormais un adaptateur : ils obtiennent un vrai
+  // formulaire, comme Jenkins.
+  for (const id of ['gitlab-ci', 'github-actions']) {
+    const form = renderProviderForm(deliveryProvider(id));
+    assert.match(form, /data-action="deliverySave"/, id);
+    assert.match(form, /data-action="deliveryTest"/, id);
+    assert.doesNotMatch(form, /aucun adaptateur n’est encore disponible/, id);
+  }
+
+  // Un fournisseur catalogue-only n'obtient ni formulaire ni action.
+  const azure = renderProviderForm(deliveryProvider('azure-pipelines'));
+  assert.match(azure, /aucun adaptateur n’est encore disponible/);
+  assert.doesNotMatch(azure, /data-action="deliverySave"/);
+  assert.doesNotMatch(azure, /data-action="deliveryTest"/);
 });
 
 test('provider-neutral persistence keeps secrets out and preserves false booleans', async () => {

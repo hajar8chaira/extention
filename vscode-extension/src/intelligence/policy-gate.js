@@ -38,8 +38,24 @@ const STATUS_SUMMARY = Object.freeze({
   ERROR: 'La configuration de la politique projet est invalide.'
 });
 
+/**
+ * The severity a gate rule is written against.
+ *
+ * Two finding shapes reach this function. `unifyFindings` produces the canonical
+ * one, where `severity` already holds CRITICAL/HIGH/MEDIUM/LOW. But
+ * `mergeIntelligence` enriches the *normalized* findings in place, and those
+ * keep the findings-layer split: `rawSeverity` carries the scanner scale while
+ * `severity` carries the SARIF level, which collapses CRITICAL and HIGH into a
+ * single « error ». Those are the findings `reevaluatePolicy` feeds back to the
+ * gate after a reload or a policy edit — so reading `severity` first ranked a
+ * CRITICAL finding as ERROR there, and `fail_on_severity: [CRITICAL]` matched
+ * nothing while the same scan blocked on the fresh-scan path.
+ *
+ * `rawSeverity` first reads both shapes correctly, and matches what
+ * `unifiedFinding` and `evaluatePolicy` already do.
+ */
 function severityOf(finding) {
-  return String(finding.severity || finding.rawSeverity || 'UNKNOWN').toUpperCase();
+  return String(finding.rawSeverity || finding.severity || 'UNKNOWN').toUpperCase();
 }
 
 function severityRank(value) {

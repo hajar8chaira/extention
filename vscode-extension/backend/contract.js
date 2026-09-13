@@ -39,7 +39,10 @@ const FINDING_STATUSES = Object.freeze([
 /** The two statuses that close a finding without fixing it, and therefore owe an explanation. */
 const STATUSES_REQUIRING_JUSTIFICATION = Object.freeze(['false_positive', 'accepted']);
 
-const SCENARIO_SOURCES = Object.freeze(['har', 'burp', 'zap', 'manual']);
+// `mitmproxy` rejoint les sources existantes plutôt que d'ouvrir un second
+// modèle : une capture de proxy managé et une capture Burp décrivent le même
+// échange HTTP, et doivent se ranger, se dédoublonner et se rejouer pareil.
+const SCENARIO_SOURCES = Object.freeze(['har', 'burp', 'zap', 'manual', 'mitmproxy']);
 
 /** Keys whose value never reaches the audit journal in clear text. */
 const SENSITIVE_KEYS = Object.freeze([
@@ -182,9 +185,12 @@ function validateHttpScenario(payload) {
   if (!['http:', 'https:'].includes(parsed.protocol)) {
     throw new ValidationError('Only HTTP and HTTPS requests are supported');
   }
-  if (!ALLOWED_SCENARIO_HOSTS.includes(parsed.hostname.replace(/^\[|\]$/g, ''))) {
-    throw new ValidationError('Only local HTTP targets are accepted');
-  }
+  // Storing a captured request sends nothing anywhere: a Burp capture or a HAR
+  // from an authorised test environment is evidence to investigate, not an
+  // action. Whether that origin may be replayed is decided at replay time, per
+  // origin, and is a different question from whether it may be recorded.
+  const scenarioHost = parsed.hostname.replace(/^\[|\]$/g, '');
+  const local = ALLOWED_SCENARIO_HOSTS.includes(scenarioHost);
   const response = isPlainObject(payload.response) ? payload.response : null;
   if (response) {
     const statusCode = Number(response.statusCode === undefined ? response.status_code : response.statusCode);
@@ -195,6 +201,8 @@ function validateHttpScenario(payload) {
   return {
     name,
     source,
+    // What the record is about, so a surface never has to re-parse the URL.
+    scope: local ? 'local' : 'remote',
     request: {
       method: String(request.method === undefined ? 'GET' : request.method),
       url,
@@ -208,7 +216,38 @@ function validateHttpScenario(payload) {
       body: String(response.body === undefined || response.body === null ? '' : response.body),
       bodySha256: String(response.bodySha256 || response.body_sha256 || '')
     } : null,
-    tags: Array.isArray(payload.tags) ? payload.tags : []
+    tags: Array.isArray(payload.tags) ? payload.tags : [],
+    // Horodatage et métadonnées de capture, quand la source les fournit. Sans
+    // eux, la durée d'un échange et la durée d'une session étaient toujours
+    // vides, faute d'être conservées ici. Aucune source n'est obligée de les
+    // envoyer : Burp et HAR restent valides sans.
+    timestamp: payload.timestamp ? String(payload.timestamp).slice(0, 64) : '',
+    capture: captureMetadata(payload.capture)
+  };
+}
+
+/**
+ * Métadonnées d'un échange capturé, réduites à des scalaires bornés.
+ *
+ * Rien de ce bloc n'est repris tel quel : chaque champ est retypé et plafonné,
+ * pour qu'une source ne puisse pas glisser d'objet arbitraire dans le stockage.
+ */
+function captureMetadata(value) {
+  if (!isPlainObject(value)) return null;
+  const positive = (input, maximum) => {
+    const parsed = Number(input);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.min(Math.round(parsed), maximum) : null;
+  };
+  const text = (input, maxLength) => String(input === undefined || input === null ? '' : input).slice(0, maxLength);
+  return {
+    flow_id: text(value.flow_id ?? value.flowId, 128),
+    scheme: text(value.scheme, 16),
+    host: text(value.host, 255),
+    port: positive(value.port, 65535),
+    duration_ms: positive(value.duration_ms ?? value.durationMs, 24 * 60 * 60 * 1000),
+    request_size: positive(value.request_size ?? value.requestSize, Number.MAX_SAFE_INTEGER),
+    response_size: positive(value.response_size ?? value.responseSize, Number.MAX_SAFE_INTEGER),
+    content_type: text(value.content_type ?? value.contentType, 255)
   };
 }
 

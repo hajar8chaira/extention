@@ -348,7 +348,35 @@ function renderSnykCard(snyk, pageBusy, assets = {}) {
     </article>`;
 }
 
-function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {}, confirmation = null, sonar = null, snyk = null, assets = {}) {
+/** Project scanner labels, in the order security-center.yml declares them. */
+const PROJECT_SCANNER_TOOLS = Object.freeze(['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP']);
+
+/**
+ * The project's scanner selection, as security-center.yml declares it.
+ *
+ * A view of the file, never a second copy: the checkboxes are checked from the
+ * file, and nothing is written until the user presses « Enregistrer ». With no
+ * file, nothing is pre-selected — the user chooses.
+ */
+function renderProjectScannersCard(project, busy) {
+  if (!project) return '';
+  const state = project.state || 'NOT_CONFIGURED';
+  const enabled = new Set(project.scanners?.declared ? project.scanners.enabled : []);
+  const intro = state === 'NOT_CONFIGURED'
+    ? `<strong>${escapeHtml(project.message || 'Security Center n’est pas encore configuré pour ce projet.')}</strong><p>Choisissez les scanners du projet. <code>security-center.yml</code> sera créé à l’enregistrement, avec exactement cette sélection.</p>`
+    : state === 'INVALID'
+      ? `<strong>security-center.yml est illisible</strong><p>${escapeHtml(project.error || '')}</p><p>Corrigez le fichier avant d’enregistrer une sélection.</p>`
+      : project.scanners?.declared
+        ? `<strong>Scanners du projet</strong><p>Lus depuis <code>${escapeHtml(project.filePath || 'security-center.yml')}</code>.</p>`
+        : `<strong>Scanners du projet non déclarés</strong><p><code>${escapeHtml(project.filePath || 'security-center.yml')}</code> existe mais ne choisit encore aucun scanner.</p>`;
+  const disabled = busy || state === 'INVALID' ? 'disabled' : '';
+  const boxes = PROJECT_SCANNER_TOOLS.map((tool) => `<label class="project-scanner"><input type="checkbox" data-project-scanner="${escapeHtml(tool)}" ${enabled.has(tool) ? 'checked' : ''} ${disabled}> ${escapeHtml(tool)}</label>`).join('');
+  return `<section class="notice project-scanners" data-project-state="${escapeHtml(state.toLowerCase())}">${intro}
+    <div class="project-scanner-list">${boxes}</div>
+    <div class="actions"><button data-project-scanners-save ${disabled}>Enregistrer les scanners du projet</button></div></section>`;
+}
+
+function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {}, confirmation = null, sonar = null, snyk = null, assets = {}, project = null) {
   const busy = Object.values(operations).some((operation) => operation?.state === 'installing');
   const cards = statuses.map((tool) => renderManagedCard(tool, busy, operations[tool.id], assets)).join('')
     + (sonar ? renderSonarCard(sonar, busy, assets) : '')
@@ -367,6 +395,7 @@ function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {
     subtitle: 'Des analyses locales fiables, sans dépendre de Docker Desktop',
     headerActions: `<button id="install-all" ${busy ? 'disabled' : ''}>Installer les outils manquants</button><button id="refresh" class="secondary" ${busy ? 'disabled' : ''}>Actualiser le diagnostic</button>`,
     content: `
+  ${renderProjectScannersCard(project, busy)}
   <section class="notice"><strong>Vous gardez le contrôle.</strong><p>Aucune installation n’est lancée sans votre confirmation. Les outils sont placés dans le stockage privé de l’extension, sans droits administrateur. Les scanners déjà disponibles sont réutilisés et un échec n’empêche pas les autres analyses.</p></section><section class="grid scanner-config-grid">${cards}</section><p class="footer">Sources officielles uniquement · vérification SHA-256 des binaires · provenance enregistrée · Docker reste disponible comme secours facultatif.</p>
 `,
     // La confirmation d'installation est une modale globale : elle sort du flux
@@ -392,6 +421,8 @@ function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .notice { position: relative; display: grid; gap: 5px; margin-bottom: 18px; padding: 15px 17px; border: 1px solid color-mix(in srgb,var(--accent) 18%,var(--border)); border-left: 3px solid var(--accent); border-radius: 12px; background: linear-gradient(135deg, color-mix(in srgb,var(--accent) 7%,transparent), transparent 52%), color-mix(in srgb,var(--card) 96%, transparent); box-shadow: 0 12px 30px color-mix(in srgb,var(--accent) 8%, transparent); }
     .notice strong { color: var(--text); }
+    .project-scanner-list { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 6px 0 4px; }
+    .project-scanner { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
     .grid, .scanner-config-grid { display: grid; grid-template-columns: 1fr; grid-auto-flow: row dense; gap: 16px; align-items: start; }
     .tool { position: relative; display: flex; flex-direction: column; gap: 13px; min-width: 0; min-height: 100%; background: linear-gradient(145deg, color-mix(in srgb,var(--accent) 3%,transparent), transparent 40%), var(--card); border: 1px solid color-mix(in srgb,var(--accent) 12%,var(--border)); border-radius: 16px; padding: 16px; box-shadow: 0 16px 34px color-mix(in srgb,var(--accent) 7%, transparent), var(--sc-shadow-sm); overflow: hidden; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
     .tool:hover { border-color: color-mix(in srgb,var(--accent) 30%,var(--border)); box-shadow: 0 18px 38px color-mix(in srgb,var(--accent) 10%, transparent), var(--sc-shadow-sm); transform: translateY(-1px); }
@@ -479,14 +510,14 @@ function renderScannerSetupHtml(statuses, nonce, theme = 'light', operations = {
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation: none !important; transition: none !important; }
     }`,
-    script: `const vscode=window.__scShellApi||acquireVsCodeApi();document.getElementById('refresh').onclick=()=>vscode.postMessage({type:'refresh'});document.getElementById('install-all').onclick=()=>vscode.postMessage({type:'requestInstallAll'});document.querySelectorAll('[data-install]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'requestInstall',tool:b.dataset.install}));document.querySelectorAll('[data-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setAuto',tool:b.dataset.mode}));document.querySelectorAll('[data-scanner-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerMode',tool:b.dataset.scanner,mode:b.dataset.scannerMode}));document.querySelectorAll('[data-sonar-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSonarMode',mode:b.dataset.sonarMode}));document.querySelectorAll('[data-scanner-enabled]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerEnabled',tool:b.dataset.scanner,enabled:b.dataset.scannerEnabled==='true'}));document.querySelector('[data-sonar-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSonarEnabled',enabled:e.currentTarget.dataset.sonarEnabled==='true'}));document.querySelector('[data-sonar-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarToken'}));document.querySelectorAll('[data-sonar-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-sonar-server]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'chooseSonarServer',serverType:b.dataset.sonarServer}));document.querySelector('[data-sonar-server-start]')?.addEventListener('click',()=>vscode.postMessage({type:'startSonarServer'}));document.querySelector('[data-sonar-server-stop]')?.addEventListener('click',()=>vscode.postMessage({type:'stopSonarServer'}));document.querySelector('[data-sonar-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'sonarscanner'}));document.querySelector('[data-sonar-server-url]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarHostUrl'}));document.querySelector('[data-sonar-open]')?.addEventListener('click',()=>vscode.postMessage({type:'openSonarServer'}));document.querySelectorAll('[data-snyk-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSnykMode',mode:b.dataset.snykMode}));document.querySelector('[data-snyk-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSnykEnabled',enabled:e.currentTarget.dataset.snykEnabled==='true'}));document.querySelector('[data-snyk-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSnykToken'}));document.querySelector('[data-snyk-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'snyk'}));document.querySelectorAll('[data-snyk-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-install-abort]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'abortInstall',tool:b.dataset.installAbort}));document.querySelectorAll('[data-install-retry]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'retryInstall',tool:b.dataset.installRetry}));document.getElementById('approve-install')?.addEventListener('click',()=>vscode.postMessage({type:'approveInstall'}));document.getElementById('cancel-install')?.addEventListener('click',()=>vscode.postMessage({type:'cancelInstall'}));`,
+    script: `const vscode=window.__scShellApi||acquireVsCodeApi();document.getElementById('refresh').onclick=()=>vscode.postMessage({type:'refresh'});document.querySelector('[data-project-scanners-save]')?.addEventListener('click',()=>vscode.postMessage({type:'saveProjectScanners',tools:[...document.querySelectorAll('[data-project-scanner]:checked')].map(i=>i.dataset.projectScanner)}));document.getElementById('install-all').onclick=()=>vscode.postMessage({type:'requestInstallAll'});document.querySelectorAll('[data-install]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'requestInstall',tool:b.dataset.install}));document.querySelectorAll('[data-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setAuto',tool:b.dataset.mode}));document.querySelectorAll('[data-scanner-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerMode',tool:b.dataset.scanner,mode:b.dataset.scannerMode}));document.querySelectorAll('[data-sonar-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSonarMode',mode:b.dataset.sonarMode}));document.querySelectorAll('[data-scanner-enabled]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setScannerEnabled',tool:b.dataset.scanner,enabled:b.dataset.scannerEnabled==='true'}));document.querySelector('[data-sonar-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSonarEnabled',enabled:e.currentTarget.dataset.sonarEnabled==='true'}));document.querySelector('[data-sonar-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarToken'}));document.querySelectorAll('[data-sonar-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-sonar-server]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'chooseSonarServer',serverType:b.dataset.sonarServer}));document.querySelector('[data-sonar-server-start]')?.addEventListener('click',()=>vscode.postMessage({type:'startSonarServer'}));document.querySelector('[data-sonar-server-stop]')?.addEventListener('click',()=>vscode.postMessage({type:'stopSonarServer'}));document.querySelector('[data-sonar-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'sonarscanner'}));document.querySelector('[data-sonar-server-url]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSonarHostUrl'}));document.querySelector('[data-sonar-open]')?.addEventListener('click',()=>vscode.postMessage({type:'openSonarServer'}));document.querySelectorAll('[data-snyk-mode]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'setSnykMode',mode:b.dataset.snykMode}));document.querySelector('[data-snyk-enabled]')?.addEventListener('click',e=>vscode.postMessage({type:'setSnykEnabled',enabled:e.currentTarget.dataset.snykEnabled==='true'}));document.querySelector('[data-snyk-token]')?.addEventListener('click',()=>vscode.postMessage({type:'configureSnykToken'}));document.querySelector('[data-snyk-install]')?.addEventListener('click',()=>vscode.postMessage({type:'requestInstall',tool:'snyk'}));document.querySelectorAll('[data-snyk-recheck]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'refresh'}));document.querySelectorAll('[data-install-abort]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'abortInstall',tool:b.dataset.installAbort}));document.querySelectorAll('[data-install-retry]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'retryInstall',tool:b.dataset.installRetry}));document.getElementById('approve-install')?.addEventListener('click',()=>vscode.postMessage({type:'approveInstall'}));document.getElementById('cancel-install')?.addEventListener('click',()=>vscode.postMessage({type:'cancelInstall'}));`,
     csp: `default-src 'none'; img-src ${String(assets?.cspSource || '').trim() || 'vscode-resource: vscode-webview-resource: vscode-webview:'} data:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`,
     brandLogoUri: assets?.brandLogoUri || ''
   });
 }
 
 module.exports = {
-  renderScannerSetupHtml, renderManagedCard, renderSonarCard, renderSonarServerSection,
+  renderScannerSetupHtml, renderProjectScannersCard, PROJECT_SCANNER_TOOLS, renderManagedCard, renderSonarCard, renderSonarServerSection,
   renderSnykCard, snykDiagnosis, usedSnykMode, snykCapabilityLabel,
   usedScannerMode, modeButtons, sonarDiagnosis, safeServerUrl, SONAR_MODES, escapeHtml
 };

@@ -365,6 +365,117 @@ function normalizeZapOutput(payload, _workspacePath = '', displayTargetUrl = '')
   return deduplicateFindings(findings);
 }
 
+// Nuclei décrit chaque résultat sur sa propre échelle de sévérité, alignée ici
+// sur celle de Security Center. `unknown` n'est pas de l'information : il
+// signale un template dont l'auteur n'a rien déclaré, et le traiter comme
+// bénin masquerait de vraies alertes.
+const NUCLEI_SEVERITY = Object.freeze({
+  critical: { severity: 'error', rawSeverity: 'CRITICAL' },
+  high: { severity: 'error', rawSeverity: 'HIGH' },
+  medium: { severity: 'warning', rawSeverity: 'MEDIUM' },
+  low: { severity: 'information', rawSeverity: 'LOW' },
+  info: { severity: 'information', rawSeverity: 'INFO' },
+  unknown: { severity: 'warning', rawSeverity: 'UNKNOWN' }
+});
+
+function nucleiSeverity(value) {
+  return NUCLEI_SEVERITY[String(value || '').trim().toLowerCase()] || NUCLEI_SEVERITY.unknown;
+}
+
+/**
+ * Un template Nuclei porte sa classification dans `info.classification`.
+ * CWE arrive sous forme de tableau (`cwe-79`) et CVE sous `cve-id`.
+ */
+function nucleiClassification(info) {
+  const classification = info?.classification || {};
+  const cweValues = [].concat(classification['cwe-id'] || []).map((value) => String(value).toUpperCase());
+  const cwe = cweValues.find((value) => /^CWE-\d+$/.test(value)) || '';
+  const cveValues = [].concat(classification['cve-id'] || []).map((value) => String(value).toUpperCase());
+  return { cwe, aliases: cveValues.filter((value) => /^CVE-\d{4}-\d+$/.test(value)) };
+}
+
+/**
+ * Transforme les lignes JSONL d'un scan Nuclei en findings Security Center.
+ *
+ * Nuclei rend un événement par correspondance, déjà rattaché à une URL : il n'y
+ * a pas de fichier source, donc `file` reprend la convention dynamique
+ * « MÉTHODE URL » utilisée par ZAP pour rester lisible dans la même liste.
+ *
+ * Un même template peut correspondre plusieurs fois sur la même URL, une fois
+ * par contrôle interne : `http-missing-security-headers` a produit huit
+ * événements sur une seule cible, un par en-tête absent. Ils sont regroupés en
+ * un finding qui énumère les contrôles déclenchés, plutôt que huit entrées de
+ * titre identique — que le dédoublonnage global réduirait de toute façon à une
+ * seule, en perdant les sept autres en-têtes au passage.
+ */
+function normalizeNucleiOutput(payload, _workspacePath = '', displayTargetUrl = '') {
+  const grouped = new Map();
+  for (const result of Array.isArray(payload) ? payload : []) {
+    const templateId = String(result['template-id'] || result.templateID || '').trim();
+    if (!templateId) continue;
+    const endpoint = String(result['matched-at'] || result.matched || result.url || displayTargetUrl || '');
+    const method = String(result.type || 'http').toUpperCase();
+    const key = `${templateId}|${method}|${endpoint}`;
+    const entry = grouped.get(key) || { result, templateId, endpoint, method, matchers: [], extracted: [] };
+    const matcher = String(result['matcher-name'] || '').trim();
+    if (matcher && !entry.matchers.includes(matcher)) entry.matchers.push(matcher);
+    for (const value of [].concat(result['extracted-results'] || []).map((item) => String(item)).filter(Boolean)) {
+      if (!entry.extracted.includes(value)) entry.extracted.push(value);
+    }
+    grouped.set(key, entry);
+  }
+
+  const findings = [];
+  for (const { result, templateId, endpoint, method, matchers, extracted } of grouped.values()) {
+    const info = result.info || {};
+    const risk = nucleiSeverity(info.severity);
+    const { cwe, aliases } = nucleiClassification(info);
+    const references = [].concat(info.reference || []).map((value) => String(value)).filter((value) => /^https?:\/\//.test(value));
+    const details = [
+      matchers.length ? `Contrôles déclenchés (${matchers.length}) : ${matchers.join(', ')}` : '',
+      result['extractor-name'] ? `Extracteur : ${result['extractor-name']}` : '',
+      extracted.length ? `Valeurs extraites : ${extracted.slice(0, 10).join(', ')}` : '',
+      info.metadata?.['cvss-score'] ? `Score CVSS : ${info.metadata['cvss-score']}` : ''
+    ].filter(Boolean).join('\n');
+    findings.push({
+      id: `nuclei:${templateId}:${method}:${endpoint}`,
+      tool: 'Nuclei',
+      ruleId: templateId,
+      title: cleanScannerText(info.name || templateId),
+      severity: risk.severity,
+      rawSeverity: risk.rawSeverity,
+      category: 'dynamic',
+      cwe,
+      file: `${method} ${endpoint}`,
+      absolutePath: '',
+      startLine: 0,
+      startColumn: 0,
+      endLine: 0,
+      endColumn: 1,
+      helpUri: references[0] || String(result['template-url'] || ''),
+      sourceContext: 'runtime',
+      // `matcher-status: false` n'apparaît que sur les événements de trace ;
+      // une correspondance exportée est une observation confirmée par le moteur.
+      confidence: result['matcher-status'] === false ? 'low' : 'high',
+      endpoint,
+      method,
+      parameter: matchers.join(', '),
+      evidence: extracted.slice(0, 3).join(', '),
+      technicalDetails: details,
+      vulnerabilityAliases: aliases,
+      packageName: '',
+      installedVersion: '',
+      references: references.slice(0, 10),
+      description: cleanScannerText(info.description),
+      solution: cleanScannerText(info.remediation),
+      developerSummary: cleanScannerText(info.description),
+      developerImpact: '',
+      developerAction: cleanScannerText(info.remediation)
+    });
+  }
+  return deduplicateFindings(findings);
+}
+
 // SonarQube exposes two severity models at the same time. The legacy scale is
 // used when the newer clean-code `impacts` array is absent, so both are mapped
 // explicitly onto the Security Center scale rather than mixed silently.
@@ -827,5 +938,6 @@ module.exports = {
   normalizeSemgrepOutput, normalizeSemgrepResult,
   normalizeGitleaksOutput, normalizeGitleaksResult,
   normalizeTrivyOutput, normalizeTrivyVulnerability, normalizeTrivyMisconfiguration,
-  normalizeZapOutput, normalizeOsvOutput
+  normalizeZapOutput, normalizeOsvOutput,
+  NUCLEI_SEVERITY, nucleiSeverity, nucleiClassification, normalizeNucleiOutput
 };

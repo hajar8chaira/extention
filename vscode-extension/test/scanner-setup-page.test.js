@@ -143,7 +143,11 @@ test('Scanner Configuration garde un fallback uniquement quand aucun logo local 
 
 test('le panneau Scanner Configuration reçoit le même bundle de logos que les autres surfaces', () => {
   const source = extensionSource();
-  assert.match(source, /scannerSetupPanel\.webview\.html = renderScannerSetupHtml\(statuses,[\s\S]*sonar, snyk, companionAssetOptions\(scannerSetupPanel\.webview\)\)/);
+  // Le document passe désormais par le garde-fou de rendu, qui évite de recharger
+  // un webview pour un document identique. L'invariant testé est inchangé : c'est
+  // le même bundle d'assets qui atteint ce panneau.
+  // The project configuration state follows the asset bundle as the last argument.
+  assert.match(source, /applyWebviewHtml\(scannerSetupPanel\.webview, renderScannerSetupHtml\(statuses,[\s\S]*sonar, snyk, companionAssetOptions\(scannerSetupPanel\.webview\)(, projectConfiguration)?\)/);
   for (const logo of ['semgrep.svg', 'gitleaks.svg', 'trivy.svg', 'osv-scanner.svg', 'sonarqube.svg', 'snyk.svg', 'zap.png']) {
     assert.ok(source.includes(logo), `${logo} doit venir du bundle local existant`);
   }
@@ -421,7 +425,9 @@ test('Modale : la logique metier d installation est inchangee', () => {
 
 test('Modale : le preflight ZAP continue d utiliser la meme racine partagee', () => {
   const dashboard = abSource('src/dashboard.js');
-  assert.match(dashboard, /<div id="security-center-modal-root">\$\{zapPreflightModal\}<\/div>/);
+  // La racine reste unique et partagée : le préflight y entre en premier, et le
+  // formulaire du compte de test ZAP y entre par le même endroit.
+  assert.match(dashboard, /<div id="security-center-modal-root">\$\{zapPreflightModal\}\$\{zapAccountModal\}<\/div>/);
   assert.match(dashboard, /position: fixed;\s*inset: 0;/);
   // Les deux surfaces partagent le meme identifiant de racine.
   assert.ok(abSource('src/security-center-shell.js').includes('security-center-modal-root'));

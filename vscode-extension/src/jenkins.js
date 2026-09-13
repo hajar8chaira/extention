@@ -22,7 +22,7 @@
 
 const http = require('http');
 const https = require('https');
-const { validateCiReport, CI_REPORT_FILENAME, MAX_CI_REPORT_BYTES } = require('./ci-report');
+const { validateCiReport, validateDeliveryRecord, CI_REPORT_FILENAME, DELIVERY_RECORD_FILENAME, MAX_CI_REPORT_BYTES } = require('./ci-report');
 
 /** Delivery stages Security Center can honestly speak about. */
 const DELIVERY_STATE = Object.freeze({
@@ -232,7 +232,7 @@ function commitCorrelation(workspaceCommit, buildCommit) {
  */
 function deliveryStatusFrom({
   configured = false, build = null, error = '', workspaceCommit = '',
-  policy = null, artifacts = null, job = '', baseUrl = '', fetchedAt = null, ci = null
+  policy = null, artifacts = null, job = '', baseUrl = '', fetchedAt = null, ci = null, deliveryRecord = null
 } = {}) {
   if (!configured) {
     return {
@@ -272,6 +272,8 @@ function deliveryStatusFrom({
     identity,
     policy: !identity.inconsistent && report ? report.policy : (policy || null),
     artifacts: !identity.inconsistent && report ? report.supplyChain : (artifacts || null),
+    // Deployment and health check, as archived by this build — never inferred.
+    deliveryRecord: deliveryRecord || { state: REPORT_STATE.NOT_REPORTED, record: null, reason: '', artifactPath: null },
     error: '',
     fetchedAt
   };
@@ -299,9 +301,12 @@ async function fetchDeliveryStatus({
     const ci = build
       ? await fetchCiReport({ baseUrl, job, build, user, token, timeoutMs, requestText })
       : { state: REPORT_STATE.NOT_REPORTED, report: null, reason: '', artifactPath: null };
+    const deliveryRecord = build
+      ? await fetchDeliveryRecord({ baseUrl, job, build, user, token, timeoutMs, requestText })
+      : null;
     return deliveryStatusFrom({
       configured: true, build, workspaceCommit,
-      job, baseUrl: normalizeJenkinsUrl(baseUrl), fetchedAt, ci
+      job, baseUrl: normalizeJenkinsUrl(baseUrl), fetchedAt, ci, deliveryRecord
     });
   } catch (error) {
     // A job with no build yet answers 404 on lastBuild; that is « not started »,
@@ -410,6 +415,31 @@ async function fetchCiReport({
 }
 
 /**
+ * Fetches the deployment / health-check record the pipeline archived.
+ *
+ * Same rules as the CI report: located among the build's artefacts, fetched
+ * size-capped, validated; any failure is a described state, never a success.
+ */
+async function fetchDeliveryRecord({
+  baseUrl, job, build, user = '', token = '', timeoutMs = 15000,
+  requestText = requestJenkinsText
+} = {}) {
+  const relative = findReportArtifact(build, DELIVERY_RECORD_FILENAME);
+  if (!relative) return { state: REPORT_STATE.NOT_REPORTED, record: null, reason: '', artifactPath: null };
+  if (!Number.isInteger(Number(build?.number))) {
+    return { state: REPORT_STATE.NOT_REPORTED, record: null, reason: 'Numéro de build inconnu.', artifactPath: relative };
+  }
+  try {
+    const text = await requestText(artifactUrl(baseUrl, job, build.number, relative), { user, token, timeoutMs });
+    const validation = validateDeliveryRecord(text);
+    if (!validation.ok) return { state: REPORT_STATE.INVALID, record: null, reason: validation.reason, artifactPath: relative };
+    return { state: REPORT_STATE.REPORTED, record: validation.record, reason: '', artifactPath: relative };
+  } catch (error) {
+    return { state: REPORT_STATE.UNAVAILABLE, record: null, reason: scrubJenkinsError(error.message), artifactPath: relative };
+  }
+}
+
+/**
  * Three-way commit identity.
  *
  * The workspace, the build and the report must agree. A build whose report was
@@ -471,5 +501,5 @@ module.exports = {
   normalizeJenkinsUrl, jenkinsJobPath, lastBuildUrl, jobUrl, artifactUrl,
   requestJenkins, requestJenkinsText, buildStatusFrom, commitCorrelation, deliveryStatusFrom,
   fetchDeliveryStatus, scrubJenkinsError,
-  findReportArtifact, fetchCiReport, reportIdentity, testJenkinsConnection
+  findReportArtifact, fetchCiReport, fetchDeliveryRecord, reportIdentity, testJenkinsConnection
 };

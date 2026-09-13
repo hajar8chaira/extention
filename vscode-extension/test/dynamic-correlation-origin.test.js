@@ -106,8 +106,11 @@ test('la carte ZAP annonce un compteur ZAP et ouvre la vue filtrée ZAP', () => 
   const html = renderDashboardHtml(buildDashboardModel(findings, [], { httpScenarios: [] }), 'nonce', 'dynamic');
   // Le compteur nomme sa portee...
   assert.match(html, /Findings ZAP<\/span><strong>1<\/strong>/);
-  // ...et le bouton ouvre exactement cet ensemble, pas l'agregat.
-  assert.match(html, /data-dynamic-filter-target="zap"[^>]*>Voir les findings ZAP/);
+  // ...et le bouton ouvre exactement cet ensemble, pas l'agregat : la page
+  // Findings filtree sur ZAP, ou ce finding reste visible quelle que soit sa
+  // severite, et non la section prioritaire qui n'affiche que HIGH et CRITICAL.
+  assert.match(html, /data-command="securityCenter.openZapFindings"[^>]*>Voir les findings ZAP/);
+  assert.ok(!html.includes('data-dynamic-filter-target="zap"'), 'le bouton mene encore a la section prioritaire');
 });
 
 test('la carte Burp sépare l’état de connexion de l’historique conservé', () => {

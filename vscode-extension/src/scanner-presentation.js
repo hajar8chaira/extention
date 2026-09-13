@@ -61,6 +61,36 @@ const SCANNER_PRESENTATION = Object.freeze({
     logoSource: 'https://github.com/simple-icons/simple-icons/blob/develop/icons/snyk.svg',
     license: 'CC0-1.0'
   },
+  Nuclei: {
+    id: 'nuclei',
+    label: 'Nuclei',
+    description: 'Analyse dynamique par templates (DAST)',
+    category: 'DAST',
+    logo: 'nuclei.png',
+    fallbackIcon: 'pulse',
+    logoSource: 'https://github.com/projectdiscovery/nuclei/blob/main/static/nuclei-logo.png',
+    license: 'MIT'
+  },
+  mitmproxy: {
+    id: 'mitmproxy',
+    label: 'mitmproxy',
+    description: 'Capture HTTP(S) managée',
+    category: 'DAST',
+    logo: 'mitmproxy.png',
+    fallbackIcon: 'pulse',
+    logoSource: 'https://github.com/mitmproxy/www/blob/main/src/static/logo-navbar.png',
+    license: 'MIT / mitmproxy website asset provenance'
+  },
+  Burp: {
+    id: 'burp',
+    label: 'Burp Suite',
+    description: 'Capture HTTP externe',
+    category: 'DAST',
+    logo: 'burp-suite.svg',
+    fallbackIcon: 'pulse',
+    logoSource: 'https://portswigger.net/content/images/logos/burpsuite-logo-large.svg',
+    license: 'PortSwigger trademark / vendor website asset'
+  },
   ZAP: {
     id: 'zap',
     label: 'ZAP',

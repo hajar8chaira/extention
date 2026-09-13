@@ -1,0 +1,7 @@
+# The headless CLI entrypoint runs on Linux through its shebang. A CRLF line
+# ending turns it into `#!/usr/bin/env node\r`, which breaks the installed
+# `security-center` command. Always LF, whatever the checkout platform.
+src/cli.js text eol=lf
+# The Jenkins pipeline embeds the CI Engine bootstrap (a bash script) verbatim:
+# a CRLF checkout would break it on the Linux Jenkins agent.
+templates/Jenkinsfile text eol=lf

@@ -22,7 +22,14 @@
  *     anything reads it.
  */
 
-/** Bumped only when the shape changes in a way a reader must know about. */
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Bumped only when the shape changes in a way a reader must know about.
+ * `verdict`, `stages` and the supply-chain paths were added as optional fields:
+ * a reader of schema 1 that ignores them keeps working.
+ */
 const CI_REPORT_SCHEMA = 1;
 
 /** The conventional artefact name the Jenkinsfile archives. */
@@ -77,26 +84,102 @@ function reasonsFrom(gate) {
 
 /** Scanner outcomes, so CI can show which tool never reported. */
 function scannersFrom(report) {
-  return (report.scanners || []).map((scanner) => ({
-    name: String(scanner.tool || ''),
-    status: String(scanner.status || 'unknown'),
-    findings: (report.findings || []).filter((finding) => finding.tool === scanner.tool).length,
-    // A scanner error is a short summary, never a stack trace or a command line.
-    error: scanner.error ? String(scanner.error).slice(0, 300) : ''
+  return (report.scanners || []).map((scanner) => {
+    const status = String(scanner.status || 'unknown');
+    // The orchestrator records a failure's reason in `details`; `error` is kept
+    // for producers that use it. A completed scanner's details are not an error.
+    const reason = scanner.error || (['failed', 'cancelled'].includes(status) ? scanner.details : '');
+    return {
+      name: String(scanner.tool || ''),
+      status,
+      findings: (report.findings || []).filter((finding) => finding.tool === scanner.tool).length,
+      // A scanner error is a short summary, never a stack trace or a command line.
+      error: reason ? String(reason).slice(0, 300) : ''
+    };
+  });
+}
+
+/** The tool a failure names: `{ tool }`, or the orchestrator's « Tool: reason ». */
+function failedScannerName(failure) {
+  if (failure && typeof failure === 'object') return String(failure.tool || '');
+  return String(failure || '').split(':')[0].trim();
+}
+
+/** A path as it appears in the build's workspace, never the agent's absolute path. */
+function workspaceRelative(workspace, file) {
+  const absolute = path.resolve(String(file));
+  if (workspace) {
+    const relative = path.relative(path.resolve(String(workspace)), absolute);
+    if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) return relative.split(path.sep).join('/');
+  }
+  return path.basename(absolute);
+}
+
+/**
+ * One piece of supply-chain evidence.
+ *
+ * A produced status (`generated`, `signed`, `verified`) is only reported when
+ * the file it names exists on disk. Otherwise it is `missing`: a record that
+ * says « signed » about a signature nobody can archive is not evidence.
+ */
+function evidenceFrom(record, files, { workspace, exists }) {
+  if (!record?.status) return { status: null, path: null };
+  const status = String(record.status);
+  if (!['generated', 'signed', 'verified'].includes(status)) return { status, path: null };
+  const paths = files.map((file) => (file ? String(file) : ''));
+  if (!paths[0] || paths.some((file) => !file || !exists(file))) return { status: 'missing', path: null };
+  return { status, path: workspaceRelative(workspace, paths[0]) };
+}
+
+/** Supply-chain statuses, only for stages that ran, backed by real files. */
+function supplyChainFrom(artifacts, { workspace = '', exists = fs.existsSync } = {}) {
+  const empty = { sbom: null, provenance: null, signature: null, signatureVerified: false, sbomPath: null, provenancePath: null, signaturePath: null };
+  if (!artifacts || typeof artifacts !== 'object') return empty;
+  const options = { workspace, exists };
+  const sbom = evidenceFrom(artifacts.sbom, [artifacts.sbom?.path], options);
+  const provenance = evidenceFrom(artifacts.provenance, [artifacts.provenance?.path], options);
+  // A signature is evidence only when the bundle and the file it signs both exist.
+  const signature = evidenceFrom(artifacts.signing, [artifacts.signing?.signaturePath, artifacts.signing?.artifact], options);
+  return {
+    sbom: sbom.status,
+    provenance: provenance.status,
+    signature: signature.status,
+    // Verification the build itself established, on a bundle that exists.
+    signatureVerified: signature.status === 'verified',
+    sbomPath: sbom.path,
+    provenancePath: provenance.path,
+    signaturePath: signature.path
+  };
+}
+
+/** The states `describeStages` produces. Anything else is reported as unknown. */
+const STAGE_STATES = Object.freeze(['not_configured', 'ready', 'running', 'passed', 'warning', 'blocked', 'skipped', 'failed']);
+
+/**
+ * The Security Center stages of this run, copied from `pipeline.stages`.
+ *
+ * These are the engine's own stages (Secrets, SAST, SCA, Policy Gate, SBOM…),
+ * not Jenkins stages. `null` when the pipeline did not run (`--no-intelligence`):
+ * absent stays absent.
+ */
+function stagesFrom(pipeline) {
+  if (!Array.isArray(pipeline?.stages)) return null;
+  return pipeline.stages.slice(0, 30).map((stage) => ({
+    id: String(stage?.id || ''),
+    label: String(stage?.label || stage?.id || ''),
+    kind: String(stage?.kind || ''),
+    state: STAGE_STATES.includes(stage?.state) ? stage.state : 'unknown',
+    count: Number.isFinite(stage?.count) ? stage.count : null,
+    detail: stage?.detail ? String(stage.detail).slice(0, 300) : ''
   }));
 }
 
-/** Supply-chain statuses, only for stages that ran. */
-function supplyChainFrom(artifacts) {
-  if (!artifacts || typeof artifacts !== 'object') return { sbom: null, provenance: null, signature: null };
-  const status = (value) => (value?.status ? String(value.status) : null);
-  return {
-    sbom: status(artifacts.sbom),
-    provenance: status(artifacts.provenance),
-    signature: status(artifacts.signing),
-    // Verification metadata the build itself established, if any.
-    signatureVerified: artifacts.signing?.status === 'verified'
-  };
+/** The CLI verdict names and the exit code each one means. */
+const VERDICT_EXIT_CODES = Object.freeze({ PASS: 0, BLOCK: 1, ERROR: 2 });
+
+function verdictFrom(verdict) {
+  const status = String(verdict?.status || '');
+  return status in VERDICT_EXIT_CODES ? { status, exitCode: VERDICT_EXIT_CODES[status] } : null;
 }
 
 /**
@@ -105,7 +188,10 @@ function supplyChainFrom(artifacts) {
  * `commit` and `branch` are supplied by the caller because git is the caller's
  * concern; when they are unknown they stay `null` rather than being guessed.
  */
-function buildCiReport(report = {}, { commit = '', branch = '', generatedAt = new Date().toISOString() } = {}) {
+function buildCiReport(report = {}, {
+  commit = '', branch = '', generatedAt = new Date().toISOString(),
+  verdict = null, workspace = report.workspace || '', exists = fs.existsSync, engine = null
+} = {}) {
   const gate = report.policyGate || null;
   const pipeline = report.pipeline || null;
   const findings = report.findings || [];
@@ -113,13 +199,19 @@ function buildCiReport(report = {}, { commit = '', branch = '', generatedAt = ne
   return {
     schemaVersion: CI_REPORT_SCHEMA,
     generatedAt,
+    // The CLI's own decision, the one its exit code carries. `null` when the
+    // producer did not state it; never recomputed here.
+    verdict: verdictFrom(verdict),
+    // Which CI Engine wrote this report, so a reader can tell its version.
+    engine: engineFrom(engine),
     execution: {
       scanId: String(pipeline?.scanId || ''),
       // `partial` is a real outcome: some scanner never reported, so the totals
       // below are incomplete and a reader must not treat them as exhaustive.
       status: failures.length ? 'partial' : (pipeline ? String(pipeline.status || 'completed') : 'completed'),
-      failedScanners: failures.map((failure) => String(failure.tool || failure || '')).filter(Boolean)
+      failedScanners: failures.map(failedScannerName).filter(Boolean)
     },
+    stages: stagesFrom(pipeline),
     repository: {
       commit: commit ? String(commit) : null,
       branch: branch ? String(branch) : null
@@ -131,9 +223,11 @@ function buildCiReport(report = {}, { commit = '', branch = '', generatedAt = ne
         blockingCount: (gate.violations || []).length,
         warningCount: (gate.warnings || []).length,
         summary: String(gate.summary || ''),
-        reasons: reasonsFrom(gate)
+        reasons: reasonsFrom(gate),
+        // Legacy rules the gate supersedes, named rather than silently dropped.
+        legacyNotice: String(report.policyNotice || '')
       }
-      : { status: 'NOT_CONFIGURED', configured: false, blockingCount: 0, warningCount: 0, summary: '', reasons: [] },
+      : { status: 'NOT_CONFIGURED', configured: false, blockingCount: 0, warningCount: 0, summary: '', reasons: [], legacyNotice: String(report.policyNotice || '') },
     scanners: scannersFrom(report),
     summary: summarize(findings),
     intelligence: {
@@ -142,7 +236,7 @@ function buildCiReport(report = {}, { commit = '', branch = '', generatedAt = ne
       reachability: pipeline?.reachabilitySummary?.analysed ? pipeline.reachabilitySummary.counts || null : null,
       prioritization: pipeline?.prioritySummary?.distribution || null
     },
-    supplyChain: supplyChainFrom(pipeline?.artifacts)
+    supplyChain: supplyChainFrom(pipeline?.artifacts, { workspace, exists })
   };
 }
 
@@ -195,11 +289,17 @@ function validateCiReport(input, { maxBytes = MAX_CI_REPORT_BYTES } = {}) {
     report: {
       schemaVersion: CI_REPORT_SCHEMA,
       generatedAt: clean.generatedAt ? String(clean.generatedAt) : null,
+      // Optional: reports written before these fields existed stay valid.
+      verdict: verdictFrom(clean.verdict),
+      engine: engineFrom(clean.engine),
       execution: {
         scanId: clean.execution.scanId ? String(clean.execution.scanId) : null,
         status: clean.execution.status ? String(clean.execution.status) : 'unknown',
-        failedScanners: Array.isArray(clean.execution.failedScanners) ? clean.execution.failedScanners.map(String) : []
+        failedScanners: Array.isArray(clean.execution.failedScanners) ? clean.execution.failedScanners.map(String) : [],
+        // Why the execution could not happen (e.g. CI Engine bootstrap failure).
+        error: clean.execution.error ? String(clean.execution.error).slice(0, 300) : ''
       },
+      stages: stagesFrom({ stages: clean.stages }),
       repository: {
         commit: clean.repository?.commit ? String(clean.repository.commit) : null,
         branch: clean.repository?.branch ? String(clean.repository.branch) : null
@@ -210,6 +310,7 @@ function validateCiReport(input, { maxBytes = MAX_CI_REPORT_BYTES } = {}) {
         blockingCount: Number(clean.policy.blockingCount) || 0,
         warningCount: Number(clean.policy.warningCount) || 0,
         summary: String(clean.policy.summary || ''),
+        legacyNotice: String(clean.policy.legacyNotice || '').slice(0, 300),
         reasons: Array.isArray(clean.policy.reasons) ? clean.policy.reasons.slice(0, 50).map((reason) => ({
           code: String(reason?.code || ''), rule: String(reason?.rule || ''),
           title: String(reason?.title || ''), severity: String(reason?.severity || ''),
@@ -233,10 +334,73 @@ function validateCiReport(input, { maxBytes = MAX_CI_REPORT_BYTES } = {}) {
         sbom: clean.supplyChain?.sbom ? String(clean.supplyChain.sbom) : null,
         provenance: clean.supplyChain?.provenance ? String(clean.supplyChain.provenance) : null,
         signature: clean.supplyChain?.signature ? String(clean.supplyChain.signature) : null,
-        signatureVerified: clean.supplyChain?.signatureVerified === true
+        signatureVerified: clean.supplyChain?.signatureVerified === true && clean.supplyChain?.signature === 'verified',
+        sbomPath: archivedPath(clean.supplyChain?.sbomPath),
+        provenancePath: archivedPath(clean.supplyChain?.provenancePath),
+        signaturePath: archivedPath(clean.supplyChain?.signaturePath)
       }
     }
   };
+}
+
+/** The delivery record the Jenkins pipeline archives next to the CI report. */
+const DELIVERY_RECORD_FILENAME = 'security-center-delivery.json';
+const DEPLOYMENT_STATUSES = Object.freeze(['SUCCEEDED', 'FAILED', 'SKIPPED', 'NOT_CONFIGURED']);
+const HEALTH_CHECK_STATUSES = Object.freeze(['PASSED', 'FAILED', 'SKIPPED', 'NOT_CONFIGURED']);
+
+/**
+ * Validates the deployment / health-check record fetched from Jenkins.
+ *
+ * Untrusted input like the CI report: size-capped, parsed defensively, stripped
+ * of polluting keys. An unknown status is rejected or left null — never mapped
+ * to a success.
+ */
+function validateDeliveryRecord(input, { maxBytes = 64 * 1024 } = {}) {
+  if (input === null || input === undefined || input === '') return { ok: false, reason: 'Enregistrement de livraison absent.' };
+  let parsed = input;
+  if (typeof input === 'string') {
+    if (Buffer.byteLength(input, 'utf8') > maxBytes) return { ok: false, reason: 'Enregistrement de livraison trop volumineux.' };
+    try { parsed = JSON.parse(input); } catch { return { ok: false, reason: 'Enregistrement de livraison illisible : JSON invalide.' }; }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'Enregistrement de livraison illisible.' };
+  const clean = stripPollution(parsed);
+  if (Number(clean.schemaVersion) !== 1) {
+    return { ok: false, reason: `Version d’enregistrement de livraison non prise en charge : ${clean.schemaVersion ?? 'absente'}.` };
+  }
+  const deploymentStatus = String(clean.deployment?.status || '');
+  if (!DEPLOYMENT_STATUSES.includes(deploymentStatus)) return { ok: false, reason: 'Statut de déploiement inconnu.' };
+  const healthStatus = String(clean.healthCheck?.status || '');
+  return {
+    ok: true,
+    record: {
+      verdict: verdictFrom({ status: clean.verdict }),
+      engineReady: clean.engineReady === true,
+      deployment: { status: deploymentStatus, reason: String(clean.deployment?.reason || '').slice(0, 300) },
+      healthCheck: HEALTH_CHECK_STATUSES.includes(healthStatus)
+        ? { status: healthStatus, detail: String(clean.healthCheck?.detail || '').slice(0, 300) }
+        : null
+    }
+  };
+}
+
+const ENGINE_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
+/** The engine that wrote the report. An unparsable version stays null, never guessed. */
+function engineFrom(engine) {
+  if (!engine || typeof engine !== 'object') return null;
+  const name = typeof engine.name === 'string' ? engine.name.slice(0, 100) : '';
+  const version = typeof engine.version === 'string' && ENGINE_VERSION_PATTERN.test(engine.version) ? engine.version : null;
+  // The build's source commit, when the engine was built by the Security Center pipeline.
+  const commit = typeof engine.commit === 'string' && /^[0-9a-f]{40}$/.test(engine.commit) ? engine.commit : null;
+  return name || version ? { name, version, commit } : null;
+}
+
+/** A workspace-relative artefact path from untrusted input, or null. */
+function archivedPath(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text || text.length > 300 || path.isAbsolute(text) || /^[A-Za-z]:/.test(text)) return null;
+  if (text.split(/[\\/]/).includes('..')) return null;
+  return text;
 }
 
 /**
@@ -264,5 +428,6 @@ function findForbiddenKeys(value, trail = [], found = []) {
 module.exports = {
   CI_REPORT_SCHEMA, CI_REPORT_FILENAME, MAX_CI_REPORT_BYTES, POLLUTING_KEYS, FORBIDDEN_REPORT_KEY,
   buildCiReport, validateCiReport, stripPollution, summarize, reasonsFrom, scannersFrom,
-  supplyChainFrom, findForbiddenKeys
+  supplyChainFrom, stagesFrom, verdictFrom, engineFrom, archivedPath, findForbiddenKeys, STAGE_STATES, VERDICT_EXIT_CODES,
+  DELIVERY_RECORD_FILENAME, DEPLOYMENT_STATUSES, HEALTH_CHECK_STATUSES, validateDeliveryRecord
 };

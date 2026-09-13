@@ -1,10 +1,16 @@
 const { renderCompanionWidget, companionWidgetCss } = require('./live/companionWidget');
+// Le résumé et l'inventaire d'endpoints sont dérivés une seule fois, dans un
+// module partagé : Burp, HAR et mitmproxy y entrent par la même porte.
+const { sessionSummary, endpointInventory, trafficHost, displayUrl } = require('./traffic-analytics');
 const { renderDynamicSections, dynamicSectionsCss, dynamicSectionsScript } = require('./dynamic-workspace');
 const { remediationCounters } = require('./triage');
+const { restoreZapExecution, zapExecutionSummary, STAGE_STATUS } = require('./zap-execution');
+const { restoreZapRunResults, compareZapRuns } = require('./zap-results');
 const { renderInternalSidebar, renderSecurityCenterAtmosphere, pageAtmosphereKind, compactIcon, shellLayoutCss } = require('./security-center-shell');
 const { buildAssistantCardModel, renderAssistantCard, renderAssistantHeroCard, renderAssistantPanelCard, assistantCardCss, assistantCardScript } = require('./companion-assistant-card');
 const { scannerPresentation, scannerLogoUri, scannerIdForTool } = require('./scanner-presentation');
 const { isTerminalScannerStatus, successfulScannerCount, finishedScannerCount } = require('./security-snapshot');
+const { comparabilityRule } = require('./trends');
 
 function countBy(items, selector) {
   const counts = {};
@@ -88,11 +94,44 @@ function buildDashboardModel(findings = [], scanners = [], options = {}) {
     finishedScanners: finishedScannerCount(scanners),
     httpScenarioCount: Number(options.httpScenarioCount || 0),
     httpScenarios: Array.isArray(options.httpScenarios) ? options.httpScenarios : [],
+    // Le compte de test ZAP enregistré dans SecretStorage, tel que l'extension le
+    // publie : son existence et son identifiant, rien d'autre. Le mot de passe
+    // n'entre jamais dans le modèle, donc jamais dans le HTML rendu. `null`
+    // signifie « pas encore interrogé » et n'affirme ni présence ni absence.
+    zapTestAccount: options.zapTestAccount && typeof options.zapTestAccount === 'object'
+      ? {
+        configured: Boolean(options.zapTestAccount.configured),
+        username: String(options.zapTestAccount.username || ''),
+        // Quand le compte a été enregistré. C'est ce qui situe un refus
+        // d'authentification : celui d'un scan antérieur ne dit rien du compte
+        // courant, qui n'a encore jamais servi.
+        updatedAt: String(options.zapTestAccount.updatedAt || '')
+      }
+      : null,
+    // Le déroulé d'exécution ZAP, tel que l'extension l'a observé. `null`
+    // signifie « aucun run observé » : la carte n'affiche alors aucune étape
+    // plutôt que des étapes en attente qui n'attendent rien.
+    zapExecution: restoreZapExecution(options.zapExecution),
+    // Le dernier run ZAP terminé de chaque mode, par cible : la matière de la
+    // comparaison passif / actif, par empreinte.
+    zapRunResults: restoreZapRunResults(options.zapRunResults),
     burpConnected: Boolean(options.burpConnected),
     burpStatus: options.burpStatus && typeof options.burpStatus === 'object' ? options.burpStatus : {},
     burpEndpoint: options.burpEndpoint || '',
+    // État du proxy de capture managé. `null` signifie « jamais interrogé » et
+    // se rend comme tel : c'est différent de « pas installé ».
+    mitmproxy: options.mitmproxy && typeof options.mitmproxy === 'object' ? options.mitmproxy : null,
+    // État d'installation de Nuclei mesuré par la détection d'outil, la même
+    // que celle de Scanner Configuration. `null` signifie « pas encore
+    // interrogé » et n'affirme rien.
+    nucleiTool: options.nucleiTool && typeof options.nucleiTool === 'object' ? options.nucleiTool : null,
+    // L'état courant des moteurs dynamiques, publié par le socle d'exécution
+    // commun. Absent, les cartes retombent sur leurs dérivations d'origine.
+    dynamicRuntime: options.dynamicRuntime && typeof options.dynamicRuntime === 'object' ? options.dynamicRuntime : null,
     dynamicTargetUrl: options.dynamicTargetUrl || '',
     dynamicTargetState: options.dynamicTargetState || 'unknown',
+    dynamicTargetMode: options.dynamicTargetMode === 'remote' ? 'remote' : 'local',
+    dynamicTargetRemoteAuthorized: options.dynamicTargetRemoteAuthorized === true,
     // How the target state was established, and when. Never fabricated.
     dynamicTargetEvidence: options.dynamicTargetEvidence || null,
     // Modèle de l'espace de travail dynamique (inventaire, couverture, auth,
@@ -109,6 +148,9 @@ function buildDashboardModel(findings = [], scanners = [], options = {}) {
     scanStatus: options.scanStatus || 'idle',
     backendStatus: options.backendStatus || 'unknown',
     policyResult: options.policyResult || null,
+    // What security-center.yml declares (or that it does not exist yet). Read
+    // from the file by the extension; `null` means « not read », never « empty ».
+    projectConfiguration: options.projectConfiguration && typeof options.projectConfiguration === 'object' ? options.projectConfiguration : null,
     snapshotAvailable: Boolean(options.snapshotAvailable),
     activeExecution: options.activeExecution || null,
     lastExecution: options.lastExecution || null,
@@ -144,6 +186,86 @@ function summarizeScannerError(value) {
     return 'L’authentification a été refusée. Vérifiez le compte configuré pour ce scanner.';
   }
   return error.length > 260 ? `${error.slice(0, 257)}…` : error;
+}
+
+/**
+ * Les durées telles qu'un humain les lit. Rien au-delà de ce qui a été mesuré.
+ */
+function formatElapsed(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes} min ${rest} s` : `${minutes} min`;
+}
+
+/** Ce que l'activité observée dit, en un mot. */
+const ZAP_ACTIVITY_LABEL = Object.freeze({
+  PROGRESSING: 'Progresse',
+  WAITING: 'En attente',
+  STALLED: 'Sans progression',
+  DONE: 'Terminé',
+  FAILED: 'Échec',
+  IDLE: 'Inactif'
+});
+
+/** Les métriques d'une étape, nommées pour la carte. */
+const ZAP_METRIC_LABEL = Object.freeze({
+  urls: 'URL découvertes',
+  recordsToScan: 'enregistrements en file',
+  alerts: 'alertes',
+  findings: 'findings'
+});
+
+/**
+ * Le déroulé d'exécution ZAP, replié par défaut.
+ *
+ * Chaque étape montre l'état que le moteur a réellement rapporté. Un
+ * pourcentage n'apparaît que lorsque ZAP en a donné un — `spider/view/status`,
+ * `ascan/view/status`, `pscan/view/recordsToScan` — et une étape sans
+ * pourcentage se lit par son état, jamais par un chiffre inventé.
+ */
+function renderZapExecutionDetails(execution, { now = Date.now } = {}) {
+  if (!execution) return '';
+  const summary = zapExecutionSummary(execution, { now });
+  const metricsText = (metrics = {}) => Object.entries(metrics)
+    .filter(([, value]) => Number.isFinite(value))
+    .map(([key, value]) => `${value} ${ZAP_METRIC_LABEL[key] || key}`)
+    .join(' · ');
+  const rows = execution.stages.map((stage) => {
+    const status = stage.status;
+    const progress = status === STAGE_STATUS.RUNNING || status === STAGE_STATUS.COMPLETED ? stage.progress : null;
+    const measured = metricsText(stage.metrics);
+    // Une étape sautée n'a pas de durée : en afficher une — « 0 s » — laisserait
+    // croire qu'elle s'est exécutée très vite.
+    const elapsed = stage.startedAt && stage.finishedAt && status !== STAGE_STATUS.SKIPPED
+      ? new Date(stage.finishedAt).getTime() - new Date(stage.startedAt).getTime()
+      : null;
+    const duration = elapsed && elapsed >= 1000 ? formatElapsed(elapsed) : '';
+    const detail = [stage.detail, measured, duration].filter(Boolean).join(' · ');
+    return `<li class="zap-stage ${escapeHtml(status.toLowerCase())}">
+      <span class="zap-stage-name">${escapeHtml(stage.label)}</span>
+      <span class="zap-stage-state">${escapeHtml(status)}${progress === null ? '' : ` · ${progress} %`}</span>
+      ${detail ? `<small>${escapeHtml(detail)}</small>` : ''}
+    </li>`;
+  }).join('');
+  const facts = [
+    ['Activité', ZAP_ACTIVITY_LABEL[summary.activity] || summary.activity],
+    ['Étape courante', summary.currentLabel || '—'],
+    ['Écoulé', formatElapsed(summary.elapsedMs) || '—'],
+    ['Dernière activité', summary.lastActivity ? new Date(summary.lastActivity).toLocaleTimeString('fr-FR') : '—'],
+    ['Démarré', summary.startedAt ? new Date(summary.startedAt).toLocaleTimeString('fr-FR') : '—'],
+    ['Moteur', summary.engine || '—'],
+    ['Cible', summary.target || '—'],
+    ['Mode', summary.mode === 'baseline' ? 'Passif baseline' : summary.mode === 'active' ? 'Actif' : summary.mode === 'openapi' ? 'OpenAPI actif' : summary.mode]
+  ];
+  return `<details class="zap-execution-details">
+    <summary>Détails d’exécution<span class="zap-activity ${escapeHtml(String(summary.activity).toLowerCase())}">${escapeHtml(ZAP_ACTIVITY_LABEL[summary.activity] || summary.activity)}</span></summary>
+    <div class="zap-execution-meta">${facts.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join('')}</div>
+    <ol class="zap-stage-list">${rows}</ol>
+    ${execution.failureReason || execution.failureCode ? `<p class="zap-stage-failure">${execution.failureCode ? `<code>${escapeHtml(execution.failureCode)}</code> ` : ''}${escapeHtml(execution.failureReason || '')}</p>` : ''}
+  </details>`;
 }
 
 function renderRows(values, emptyLabel) {
@@ -190,6 +312,15 @@ function renderScannerLogoHtml(tool, status = '', assets = {}) {
     return `<span class="scanner-logo${statusClass}" data-scanner-logo="${escapeHtml(presentation.id)}"><img class="scanner-logo-img" src="${escapeHtml(uri)}" alt="${escapeHtml(presentation.label)} logo" loading="lazy"></span>`;
   }
   return `<span class="scanner-logo fallback${statusClass}" data-scanner-logo="${escapeHtml(presentation.id)}">${compactIcon(presentation.fallbackIcon)}</span>`;
+}
+
+function renderDynamicToolLogoHtml(tool, assets = {}) {
+  const presentation = scannerPresentation(tool);
+  const uri = scannerLogoUri(tool, assets);
+  if (uri) {
+    return `<span class="dynamic-tool-logo" data-dynamic-tool-logo="${escapeHtml(presentation.id)}"><img class="dynamic-tool-logo-img" src="${escapeHtml(uri)}" alt="${escapeHtml(presentation.label)} logo" loading="lazy"></span>`;
+  }
+  return `<span class="dynamic-tool-logo fallback" data-dynamic-tool-logo="${escapeHtml(presentation.id)}">${compactIcon(presentation.fallbackIcon)}</span>`;
 }
 
 function scannerStatusLabel(status) {
@@ -265,6 +396,21 @@ function getConsolidatedFindingsForHistoryEntry(entry) {
     return findings;
   }
   return entry?.findings || [];
+}
+
+/**
+ * What a history entry measured, for comparability.
+ *
+ * A consolidated snapshot carries every tool's last result set, so a ZAP retry
+ * still measures Semgrep too: its coverage is those sets. A plain run covers
+ * only its own scanners. A failure of the run is kept in both cases.
+ */
+function historyEntryCoverage(entry) {
+  const runScanners = Array.isArray(entry?.scanners) ? entry.scanners : [];
+  const resultSets = entry?.dashboardOptions?.snapshotResultSets;
+  if (!resultSets) return runScanners;
+  const failures = runScanners.filter((scanner) => scanner.status === 'failed' || scanner.status === 'cancelled');
+  return [...Object.keys(resultSets).map((tool) => ({ tool, status: 'completed' })), ...failures];
 }
 
 function historyActiveFindings(entry) {
@@ -366,7 +512,13 @@ function generateActivityChart(historyPointsData) {
   const maxTime = Math.max(...timestamps);
   const timeRange = maxTime - minTime;
 
-  const maxActive = Math.max(...activeCounts, 1);
+  // Same rule as Trends. A failed or partial run (e.g. ZAP failed, 0 findings
+  // stored) did not measure the same thing: it keeps its place on the time axis
+  // but never joins the line, so it cannot draw a fake 207 → 0 → 209 drop.
+  const isComparable = comparabilityRule(historyPointsData.map(historyEntryCoverage));
+  const comparableFlags = historyPointsData.map((entry) => isComparable(historyEntryCoverage(entry)));
+
+  const maxActive = Math.max(...activeCounts.filter((_, index) => comparableFlags[index]), 1);
   const { ticks, maxVal } = getYScale(maxActive);
 
   const points = historyPointsData.map((entry, index) => {
@@ -397,6 +549,7 @@ function generateActivityChart(historyPointsData) {
       x,
       y,
       entry,
+      comparable: comparableFlags[index],
       active,
       total,
       critical,
@@ -415,11 +568,12 @@ function generateActivityChart(historyPointsData) {
   }).join('');
 
   const vertLinesHtml = points.map(p => {
-    return `<line x1="${p.x.toFixed(2)}" y1="${paddingTop}" x2="${p.x.toFixed(2)}" y2="${(paddingTop + chartHeight).toFixed(2)}" class="chart-grid-line vertical" />`;
+    return `<line x1="${p.x.toFixed(2)}" y1="${paddingTop}" x2="${p.x.toFixed(2)}" y2="${(paddingTop + chartHeight).toFixed(2)}" class="chart-grid-line vertical${p.comparable ? '' : ' noncomparable'}" />`;
   }).join('');
 
+  const linePoints = points.filter((p) => p.comparable);
   let pathHtml = '';
-  if (N >= 2) {
+  if (linePoints.length >= 2) {
     const getBezierPath = (pts) => {
       let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
       for (let i = 0; i < pts.length - 1; i++) {
@@ -433,8 +587,8 @@ function generateActivityChart(historyPointsData) {
       }
       return d;
     };
-    const bezierD = getBezierPath(points);
-    const areaD = `${bezierD} L ${points[points.length - 1].x.toFixed(2)} ${(paddingTop + chartHeight).toFixed(2)} L ${points[0].x.toFixed(2)} ${(paddingTop + chartHeight).toFixed(2)} Z`;
+    const bezierD = getBezierPath(linePoints);
+    const areaD = `${bezierD} L ${linePoints[linePoints.length - 1].x.toFixed(2)} ${(paddingTop + chartHeight).toFixed(2)} L ${linePoints[0].x.toFixed(2)} ${(paddingTop + chartHeight).toFixed(2)} Z`;
     
     pathHtml = `
       <path d="${areaD}" fill="url(#chart-area-gradient)" />
@@ -538,6 +692,17 @@ function generateActivityChart(historyPointsData) {
   const circles = points.map(p => {
     const date = new Date(p.entry.savedAt);
     const dateStr = formatTooltipTimestamp(date);
+    if (!p.comparable) {
+      // No value is plotted for a run that measured nothing comparable: the
+      // hollow marker sits on the top edge, away from the value scale.
+      const failed = (p.entry.scanners || []).filter((s) => s.status === 'failed' || s.status === 'cancelled').map((s) => `${s.tool} : ${s.status}`);
+      const reason = failed.length ? failed.join(', ') : 'couverture de scanners partielle';
+      return `<circle cx="${p.x.toFixed(2)}" cy="${paddingTop}" r="4" class="chart-dot chart-dot-noncomparable"
+      data-date="${escapeHtml(dateStr)}"
+      data-noncomparable="true"
+      data-reason="${escapeHtml(reason)}"
+    />`;
+    }
     return `<circle cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="4.5" class="chart-dot" 
       data-date="${escapeHtml(dateStr)}"
       data-total="${p.total}"
@@ -576,6 +741,16 @@ function severityCount(findings, severities) {
 function endpointPath(value) {
   try { return new URL(String(value)).pathname.replace(/\/+$/, '') || '/'; }
   catch { return String(value || '').split('?')[0].replace(/\/+$/, '') || '/'; }
+}
+
+/** Famille d'un code de réponse, pour le colorer sans le juger. */
+function httpStatusClass(statusCode) {
+  const code = Number(statusCode);
+  if (!Number.isFinite(code) || code < 100) return '';
+  if (code >= 500) return 'server-error';
+  if (code >= 400) return 'client-error';
+  if (code >= 300) return 'redirect';
+  return 'success';
 }
 
 /**
@@ -782,7 +957,14 @@ function buildSafeHttpPreview(scenario, findings = []) {
   }));
   const body = String(response.body || response.content?.text || '');
   const safeBody = body && !SENSITIVE_HTTP_NAME.test(body) ? body.slice(0, 2000) : body ? '[REDACTED: potentially sensitive response]' : '';
-  const durationMs = Number(scenario.durationMs ?? scenario.duration ?? response.durationMs ?? response.time ?? 0);
+  // La durée mesurée par la capture est la plus fiable : mitmproxy la calcule
+  // sur ses propres horodatages. Le tableau du trafic la lisait déjà ; le
+  // panneau de détail, lui, l'ignorait et affichait « Not available » à côté
+  // d'une ligne qui portait la valeur.
+  const durationMs = Number(
+    scenario.capture?.duration_ms ?? scenario.capture?.durationMs
+    ?? scenario.durationMs ?? scenario.duration ?? response.durationMs ?? response.time ?? 0
+  );
   const contentType = response.headers?.['content-type'] || response.headers?.['Content-Type'] || response.mimeType || response.content?.mimeType || 'Unknown';
   let path = String(request.url || '');
   let safeUrl = path;
@@ -805,7 +987,9 @@ function buildSafeHttpPreview(scenario, findings = []) {
   return {
     method: String(request.method || 'HTTP').toUpperCase(), url: safeUrl, path,
     timestamp: scenario.timestamp || scenario.capturedAt || scenario.startedDateTime || scenario.createdAt || '',
-    source: String(scenario.source || 'capture').toUpperCase(), duration: durationMs > 0 ? formatDuration(durationMs) : 'Not available',
+    // Un échange HTTP se mesure en millisecondes : arrondi à la seconde, une
+    // requête de 32 ms s'affichait « 0 s ».
+    source: String(scenario.source || 'capture').toUpperCase(), duration: durationMs > 0 ? `${Math.round(durationMs)} ms` : 'Not available',
     headers, parameters: safeHttpParameters(scenario), requestBody: requestBody.slice(0, 4000), statusCode: Number(response.statusCode || response.status || 0), responseHeaders,
     responseType: String(contentType), responsePreview: safeBody, linkedFindings: linked,
     safeRequest: `${String(request.method || 'HTTP').toUpperCase()} ${path}\n${headers.map((header) => `${header.name}: ${header.value}`).join('\n')}`.trim()
@@ -1029,6 +1213,70 @@ const SURFACE_TITLES = {
   'scanner-details': ['Scanner Details', 'Résultats détaillés du scanner sélectionné']
 };
 
+/**
+ * Le script du formulaire de compte, posé seulement quand le formulaire est rendu.
+ *
+ * Le code sort du document de toutes les autres pages : une surface sans
+ * dialogue n'a pas à embarquer ce script, et elle n'a pas à contenir le
+ * vocabulaire d'un champ de mot de passe — ce qu'un garde-fou de surface vérifie.
+ */
+function zapAccountModalScript() {
+  return `
+    const zapAccount = document.querySelector('[data-zap-account-id]');
+    if (zapAccount) {
+      const usernameField = zapAccount.querySelector('[data-zap-account-field="username"]');
+      const passwordField = zapAccount.querySelector('[data-zap-account-field="password"]');
+      const errorLine = zapAccount.querySelector('[data-zap-account-error]');
+      // L'existence d'un mot de passe enregistré est portée par le dialogue
+      // lui-même, pas déduite de son texte d'aide.
+      const passwordStored = zapAccount.dataset.zapAccountPasswordStored === 'true';
+      const fail = (message, field) => {
+        errorLine.textContent = message;
+        errorLine.hidden = false;
+        field?.focus?.();
+      };
+      const send = (decision) => {
+        if (zapAccount.dataset.resolved === 'true') return;
+        if (decision === 'save') {
+          if (!usernameField.value.trim()) return fail('Saisissez l’adresse e-mail ou l’identifiant du compte de test.', usernameField);
+          if (!passwordField.value && !passwordStored) return fail('Saisissez le mot de passe du compte de test.', passwordField);
+        }
+        zapAccount.dataset.resolved = 'true';
+        zapAccount.querySelectorAll('[data-zap-account-decision]').forEach((button) => { button.disabled = true; });
+        const payload = { type: 'zapAccountResolved', id: zapAccount.dataset.zapAccountId, decision };
+        if (decision === 'save') {
+          payload.username = usernameField.value;
+          payload.password = passwordField.value;
+        }
+        vscode.postMessage(payload);
+        // Le mot de passe ne reste pas dans le document une fois transmis.
+        passwordField.value = '';
+      };
+      zapAccount.querySelectorAll('[data-zap-account-decision]').forEach((button) => {
+        button.addEventListener('click', () => send(button.dataset.zapAccountDecision || 'cancel'));
+      });
+      [usernameField, passwordField].forEach((field) => {
+        field.addEventListener('input', () => { errorLine.hidden = true; });
+        field.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') { event.preventDefault(); send('save'); }
+        });
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') { event.preventDefault(); send('cancel'); return; }
+        if (event.key !== 'Tab') return;
+        const focusables = [...zapAccount.querySelectorAll('button, input')].filter((item) => !item.disabled && item.offsetParent !== null);
+        if (!focusables.length) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      });
+      usernameField.focus();
+      usernameField.select?.();
+    }
+  `;
+}
+
 function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'light', uiState = {}, assets = {}) {
   const companionImageUri = typeof assets === 'string' ? assets : assets?.companionImageUri || '';
   const cspSource = typeof assets === 'object' ? assets?.cspSource || '' : '';
@@ -1060,9 +1308,48 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       </section>
     </div>`;
   };
+  /**
+   * Le formulaire du compte de test ZAP : les deux champs dans un seul dialogue.
+   *
+   * Le mot de passe enregistré n'arrive jamais jusqu'ici — le formulaire n'en
+   * connaît que l'existence, et son champ part donc toujours vide. Laissé vide,
+   * il conserve le secret déjà stocké ; c'est ce que dit l'aide sous le champ.
+   */
+  const renderZapAccountModal = (form = {}) => {
+    const passwordStored = Boolean(form.passwordStored);
+    return `<div class="sc-modal-overlay sc-modal-backdrop" role="presentation">
+      <section class="sc-zap-preflight sc-zap-account" role="dialog" aria-modal="true" aria-labelledby="zap-account-title" aria-describedby="zap-account-copy" data-zap-account-id="${escapeHtml(form.id || '')}" data-zap-account-password-stored="${passwordStored ? 'true' : 'false'}" tabindex="-1">
+        <div class="sc-zap-modal-head">
+          <div class="sc-zap-modal-logo">${renderScannerLogo('ZAP', 'running')}</div>
+          <div>
+            <span>Dynamic Security · ZAP</span>
+            <h2 id="zap-account-title">Compte de test ZAP authentifié</h2>
+          </div>
+          <button class="sc-modal-close" type="button" data-zap-account-decision="cancel" aria-label="Annuler">×</button>
+        </div>
+        <p id="zap-account-copy" class="sc-zap-modal-copy">Le compte local que ZAP utilise pour tester l’application authentifiée. Le mot de passe est conservé dans VS Code SecretStorage — jamais dans les paramètres, jamais dans le projet.</p>
+        <div class="sc-zap-account-fields">
+          <label for="zap-account-username">E-mail / identifiant</label>
+          <input id="zap-account-username" data-zap-account-field="username" type="text" value="${escapeHtml(form.username || '')}" placeholder="compte@exemple.local" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <label for="zap-account-password">Mot de passe${passwordStored ? ' <em>— mot de passe enregistré</em>' : ''}</label>
+          <input id="zap-account-password" data-zap-account-field="password" type="password" value="" placeholder="${passwordStored ? 'Laisser vide pour conserver le mot de passe enregistré' : 'Mot de passe du compte de test'}" autocomplete="new-password" spellcheck="false">
+          <small>${passwordStored
+        ? 'Un mot de passe est déjà enregistré dans SecretStorage. Laissez ce champ vide pour le conserver, ou saisissez-en un nouveau pour le remplacer.'
+        : 'Le mot de passe sera enregistré dans VS Code SecretStorage et ne sera plus jamais réaffiché.'}</small>
+          <p class="sc-zap-account-error" data-zap-account-error role="alert" hidden></p>
+        </div>
+        <div class="sc-zap-modal-actions">
+          ${passwordStored || form.username ? '<button class="quiet-action" type="button" data-zap-account-decision="remove">Supprimer le compte enregistré</button>' : ''}
+          <button class="secondary" type="button" data-zap-account-decision="cancel">Annuler</button>
+          <button class="primary" type="button" data-zap-account-decision="save">Enregistrer</button>
+        </div>
+      </section>
+    </div>`;
+  };
   const zapPreflightModal = uiState?.zapPreflight ? renderZapPreflightModal(uiState.zapPreflight) : '';
+  const zapAccountModal = uiState?.zapAccount ? renderZapAccountModal(uiState.zapAccount) : '';
   const inShell = SHELLED_SURFACES.has(surface);
-  const modalRoot = `<div id="security-center-modal-root">${zapPreflightModal}</div>`;
+  const modalRoot = `<div id="security-center-modal-root">${zapPreflightModal}${zapAccountModal}</div>`;
   const statusLabels = { new: 'Nouvelle', triaged: 'Triée', probable: 'Probable', confirmed: 'Confirmée', fixed: 'Corrigée — validation en attente', validated: 'Validée par re-scan', false_positive: 'Faux positif', accepted: 'Risque accepté',
     // Verification outcomes. Without these a row would print its raw slug.
     fix_proposed: 'Correction proposée', validating: 'Vérification en cours',
@@ -1077,7 +1364,14 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     && (model.activeExecution || model.scanners.some((scanner) => scanner.currentRun));
   const completedCurrentRunFindings = deduplicateByFingerprint(model.currentRunFindings || []);
   const optionTags = (values) => Object.keys(values).sort().map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join('');
-  const scannerOptionTags = (values) => Object.keys(values).sort().map((tool) => `<option value="${escapeHtml(scannerId(tool))}">${escapeHtml(scannerPresentation(tool).label)}</option>`).join('');
+  // Un filtre Scanner peut arriver préréglé depuis un bouton — « Voir les
+  // findings Nuclei » ouvre la page complète déjà filtrée sur Nuclei, toutes
+  // sévérités. Sans préréglage, le balisage ne change pas.
+  const findingsToolPreset = String(uiState?.findingsTool || '');
+  const scannerOptionTags = (values) => Object.keys(values).sort().map((tool) => {
+    const id = scannerId(tool);
+    return `<option value="${escapeHtml(id)}"${id === findingsToolPreset ? ' selected' : ''}>${escapeHtml(scannerPresentation(tool).label)}</option>`;
+  }).join('');
   const reachabilityFor = (finding) => {
     const status = finding.reachability?.status || finding.reachability?.state;
     if (status) return String(status);
@@ -1109,13 +1403,18 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         const stableScannerId = scannerId(finding.tool);
         const reachability = reachabilityFor(finding);
         const confidence = finding.confidence || finding.reachability?.confidence || finding.priority?.confidence || 'unknown';
-        const searchable = [finding.title, finding.tool, presentation.label, severity, context, status, location, finding.ruleId, finding.cwe, reachability, confidence]
+        // Un finding ZAP dit s'il a été observé en passif ou obtenu en actif.
+        const zapModeLabel = finding.tool === 'ZAP'
+          ? ({ passive: 'ZAP Passif', active: 'ZAP Actif' })[finding.scanMode] || ''
+          : '';
+        const searchable = [finding.title, finding.tool, presentation.label, severity, context, status, location, finding.ruleId, finding.cwe, reachability, confidence, zapModeLabel]
           .filter(Boolean).join(' ').toLowerCase();
         return `<article class="finding-card" tabindex="0"
           data-search="${escapeHtml(searchable)}"
           data-tool="${escapeHtml(finding.tool)}"
           data-tool-id="${escapeHtml(stableScannerId)}"
           data-tool-label="${escapeHtml(presentation.label)}"
+          ${zapModeLabel ? `data-scan-mode="${escapeHtml(finding.scanMode)}" data-run-id="${escapeHtml(finding.runId || '')}"` : ''}
           data-severity="${escapeHtml(severity)}"
           data-status="${escapeHtml(status)}"
           data-context="${escapeHtml(context)}"
@@ -1136,6 +1435,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
               <span class="severity-badge ${semanticClass(severity)}">${escapeHtml(severity)}</span>
               ${factBadge('status', statusLabels[status] || status)}
               ${factBadge('context', context)}
+              ${zapModeLabel ? factBadge(`zap-mode ${finding.scanMode}`, zapModeLabel) : ''}
               ${factBadge('reachability', reachabilityLabel(reachability))}
               ${finding.staleFromPreviousScan ? '<span class="triage-badge">Données du scan précédent</span>' : ''}
             </div>
@@ -1197,10 +1497,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
 
   let trendTop = '—';
   let trendBottom = '';
-  const N = historyPointsData.length;
+  // The variation is measured between comparable runs only, like the graph line.
+  const historyComparable = comparabilityRule(historyPointsData.map(historyEntryCoverage));
+  const comparableHistoryPoints = historyPointsData.filter((entry) => historyComparable(historyEntryCoverage(entry)));
+  const N = comparableHistoryPoints.length;
   if (N >= 2) {
-    const firstVal = historyActiveFindings(historyPointsData[0]).length;
-    const lastVal = historyActiveFindings(historyPointsData[N - 1]).length;
+    const firstVal = historyActiveFindings(comparableHistoryPoints[0]).length;
+    const lastVal = historyActiveFindings(comparableHistoryPoints[N - 1]).length;
     if (firstVal === 0) {
       trendTop = '—';
     } else {
@@ -1391,7 +1694,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const trafficRows = trafficScenarios.length
     ? trafficScenarios.map((scenario, index) => {
       const method = String(scenario.request?.method || 'HTTP').toUpperCase();
-      const url = String(scenario.request?.url || '');
+      // Un jeton passé en paramètre d'URL est un secret comme un autre : il est
+      // masqué avant d'atteindre le tableau, la recherche et les attributs de la
+      // ligne, exactement comme les en-têtes sensibles le sont à la capture.
+      const url = displayUrl(String(scenario.request?.url || ''));
       let endpoint = url;
       try { const parsed = new URL(url); endpoint = `${parsed.pathname || '/'}${parsed.search || ''}`; } catch { /* URL déjà partielle */ }
       const statusCode = Number(scenario.response?.statusCode || scenario.response?.status || 0);
@@ -1402,12 +1708,53 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         || (scenario.tags || []).some((tag) => String(tag).toLowerCase() === 'authenticated');
       const timestampValue = scenario.timestamp || scenario.capturedAt || scenario.startedDateTime || scenario.createdAt || '';
       const timestamp = timestampValue ? new Date(timestampValue).toLocaleString('fr-FR') : 'Not available';
-      const search = `${method} ${endpoint} ${source} ${statusCode}`.toLowerCase();
+      const host = trafficHost(url);
+      // La durée n'apparaît que si la capture l'a réellement mesurée.
+      const durationMs = Number(scenario.capture?.duration_ms ?? scenario.capture?.durationMs ?? NaN);
+      const duration = Number.isFinite(durationMs) && durationMs >= 0 ? `${durationMs} ms` : '—';
+      const search = `${method} ${host} ${endpoint} ${source} ${statusCode}`.toLowerCase();
       return `<button class="traffic-row" data-traffic-index="${index}" data-method="${escapeHtml(method)}" data-authenticated="${authenticated}" data-findings="${linked.length}" data-search="${escapeHtml(search)}" data-endpoint="${escapeHtml(endpoint)}" data-status="${statusCode || '—'}" data-source="${escapeHtml(source)}" data-timestamp="${escapeHtml(timestamp)}">
-        <span class="method">${escapeHtml(method)}</span><strong>${escapeHtml(endpoint || '/')}</strong><span>${statusCode || '—'}</span><span>${escapeHtml(source)}</span><span>${linked.length}</span><time>${escapeHtml(timestamp)}</time>
+        <span class="method">${escapeHtml(method)}</span><strong>${escapeHtml(host ? `${host}${endpoint}` : endpoint || '/')}</strong><span class="traffic-status ${httpStatusClass(statusCode)}">${statusCode || '—'}</span><span class="traffic-auth">${authenticated ? '🔒' : '—'}</span><span class="traffic-source">${escapeHtml(source)}</span><span>${linked.length}</span><span>${escapeHtml(duration)}</span><time>${escapeHtml(timestamp)}</time>
       </button>`;
     }).join('')
-    : '<div class="empty">Aucune requête Burp/HAR capturée.</div>';
+    : '<div class="empty">Aucune requête capturée. Démarrez la capture mitmproxy, connectez Burp ou importez un HAR.</div>';
+  // Résumé et inventaire dérivés du modèle commun : Burp, HAR et mitmproxy y
+  // entrent de la même façon, et seule la source les distingue.
+  const trafficSummary = sessionSummary(model.httpScenarios, {
+    linkFindings: (scenario) => linkedFindingsForScenario(scenario, model.findings)
+  });
+  const trafficSourceCounts = trafficSummary.sources || {};
+  const mitmModel = model.mitmproxy || {};
+  const mitmStateValue = String(mitmModel.state || 'NOT_INSTALLED');
+  const mitmStateLabels = {
+    NOT_INSTALLED: 'NON INSTALLÉ',
+    READY: 'PRÊT',
+    STARTING: 'DÉMARRAGE',
+    CAPTURING: 'CAPTURE ACTIVE',
+    STOPPED: 'ARRÊTÉ',
+    FAILED: 'ÉCHEC'
+  };
+  const mitmStateLabel = mitmStateLabels[mitmStateValue] || mitmStateValue;
+  const mitmScenarios = model.httpScenarios.filter((scenario) => scenario.source === 'mitmproxy');
+  // Ce que la capture en cours a vu, quand il y en a une. Sans exécution
+  // courante, la carte parle de l'historique — c'est tout ce qui existe alors.
+  const mitmRunState = model.dynamicRuntime?.engines?.mitmproxy || null;
+  const mitmRunCount = Number.isFinite(mitmRunState?.execution?.requestCount) ? mitmRunState.execution.requestCount : null;
+  const mitmCapturedCount = mitmRunCount === null ? mitmScenarios.length : mitmRunCount;
+  const mitmCapturing = mitmRunState
+    ? mitmRunState.status === 'RUNNING' || mitmRunState.status === 'STARTING'
+    : mitmStateValue === 'CAPTURING';
+  const mitmTarget = mitmRunState?.execution?.target || model.dynamicTargetUrl || '';
+  const mitmEndpoints = endpointInventory(mitmScenarios).length;
+  const mitmLastActivity = mitmModel.lastActivity ? new Date(mitmModel.lastActivity).toLocaleString('fr-FR') : 'Aucune';
+  // « Proxy démarré » et « HTTPS intercepté » sont deux choses distinctes, et la
+  // carte ne les confond jamais : le HTTP capture sans aucun certificat.
+  const mitmHttpsLabels = {
+    CERTIFICATE_GENERATED: 'Autorité générée — à approuver côté client',
+    CERTIFICATE_REQUIRED: 'Certificat requis — non configuré',
+    UNAVAILABLE: 'Indisponible'
+  };
+  const mitmHttpsLabel = mitmHttpsLabels[String(mitmModel.httpsState || 'CERTIFICATE_REQUIRED')] || 'Certificat requis';
   const inactiveStatuses = new Set(['false_positive', 'fixed', 'validated', 'accepted']);
   const dynamicFindings = model.findings
     .map((finding, index) => ({ finding, index }))
@@ -1415,12 +1762,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       const tool = String(finding.tool || '').toLowerCase();
       const context = String(finding.sourceContext || finding.context || '').toLowerCase();
       const source = String(finding.source || finding.evidenceSource || '').toLowerCase();
-      // Le domaine Dynamic Security, ce sont ses deux sources : ZAP et Burp.
-      // `context === 'runtime'` faisait entrer ici des findings de supervision
-      // d'execution, qui appartiennent a un autre domaine et a une autre page.
+      // Le domaine Dynamic Security, ce sont ses sources d'execution : ZAP,
+      // Nuclei et les investigations Burp/replay. `context === 'runtime'`
+      // faisait entrer ici des findings de supervision d'execution, qui
+      // appartiennent a un autre domaine et a une autre page.
       return !inactiveStatuses.has(finding.triageStatus)
         && ['CRITICAL', 'ERROR', 'HIGH'].includes(String(finding.rawSeverity || finding.severity || '').toUpperCase())
-        && (tool === 'zap' || tool === 'burp' || context === 'dynamic' || source.includes('replay'));
+        && (tool === 'zap' || tool === 'nuclei' || tool === 'burp' || context === 'dynamic' || source.includes('replay'));
     })
     .sort((left, right) => {
       const rank = { CRITICAL: 0, ERROR: 0, HIGH: 1 };
@@ -1431,6 +1779,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   // valeur, ce qui evite qu'un compteur annonce un ensemble et qu'un bouton en
   // ouvre un autre.
   const dynamicZapCount = dynamicFindings.filter(({ finding }) => String(finding.tool || '').toLowerCase() === 'zap').length;
+  const dynamicNucleiCount = dynamicFindings.filter(({ finding }) => String(finding.tool || '').toLowerCase() === 'nuclei').length;
+  // Totaux par source, toutes sévérités confondues. La section ne montre que les
+  // priorités ; elle doit dire combien de findings existent réellement derrière,
+  // sinon « Nuclei 0 » contredit une carte qui annonce 12 findings.
+  const dynamicToolTotal = (tool) => model.findings.filter((finding) => String(finding.tool || '').toLowerCase() === tool).length;
+  const dynamicZapTotal = dynamicToolTotal('zap');
+  const dynamicNucleiTotal = dynamicToolTotal('nuclei');
   const dynamicBurpCount = dynamicFindings.filter(({ finding }) => String(finding.tool || '').toLowerCase() === 'burp'
     || burpScenarios.some((scenario) => linkedFindingsForScenario(scenario, [finding]).length > 0)).length;
   const dynamicFindingRows = dynamicFindings
@@ -1462,17 +1817,21 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       // jamais deduite de sa position dans la liste.
       const originTool = String(finding.tool || '').toLowerCase() === 'zap'
         ? 'zap'
-        : (String(finding.tool || '').toLowerCase() === 'burp' || matchingBurpScenario) ? 'burp' : 'other';
+        : String(finding.tool || '').toLowerCase() === 'nuclei'
+          ? 'nuclei'
+          : (String(finding.tool || '').toLowerCase() === 'burp' || matchingBurpScenario) ? 'burp' : 'other';
       return `<article class="dynamic-finding-row" data-dynamic-source="${originTool}">
-        <span class="dynamic-source-chip ${originTool}">${escapeHtml(originTool === 'zap' ? 'ZAP' : originTool === 'burp' ? 'Burp' : 'Dynamique')}</span>
+        <span class="dynamic-source-chip ${originTool}">${escapeHtml(originTool === 'zap' ? 'ZAP' : originTool === 'nuclei' ? 'Nuclei' : originTool === 'burp' ? 'Burp' : 'Dynamique')}</span>
         <span class="dynamic-severity ${semanticClass(severity)}">${escapeHtml(severity)}</span>
         <div class="dynamic-finding-copy"><strong>${escapeHtml(finding.title || finding.ruleId || 'Alerte dynamique')}</strong><small>${escapeHtml(method + endpoint)}</small><span>${escapeHtml(sourceLabel)}${correlationLabel}</span>${sourceEvidence}</div>
         <span class="triage-badge">${escapeHtml(statusLabels[status] || status)}</span>
         <button class="quiet-action" data-finding-index="${index}">Investigate</button>
       </article>`;
     })
-    .join('') || '<div class="empty">Aucun finding dynamique HIGH ou CRITICAL actif.</div>';
-  const recentDynamicRows = model.httpScenarios.slice(0, 8).map((scenario) => `<div class="dynamic-row"><div><strong>${escapeHtml(scenario.name || `${scenario.request?.method || 'HTTP'} ${endpointPath(scenario.request?.url)}`)}</strong><small>${escapeHtml(scenario.request?.method || 'HTTP')} • ${escapeHtml(scenario.request?.url || 'URL non fournie')} • ${escapeHtml(scenario.source || 'capture')}</small></div></div>`).join('') || '<div class="empty">Aucun test dynamique récent.</div>';
+    .join('') || '<div class="empty">Aucun finding dynamique HIGH ou CRITICAL actif. Les findings de sévérité moindre restent visibles dans la page Findings.</div>';
+  // Le nom d'un scénario est composé à la capture et peut contenir la chaîne de
+  // requête : il passe par le même masquage que l'URL.
+  const recentDynamicRows = model.httpScenarios.slice(0, 8).map((scenario) => `<div class="dynamic-row"><div><strong>${escapeHtml(displayUrl(scenario.name || `${scenario.request?.method || 'HTTP'} ${endpointPath(scenario.request?.url)}`))}</strong><small>${escapeHtml(scenario.request?.method || 'HTTP')} • ${escapeHtml(scenario.request?.url ? displayUrl(scenario.request.url) : 'URL non fournie')} • ${escapeHtml(scenario.source || 'capture')}</small></div></div>`).join('') || '<div class="empty">Aucun test dynamique récent.</div>';
   const scannerRows = model.scanners.length
     ? model.scanners.map((scanner) => {
       const count = currentScannerResultCount(scanner, currentFindings);
@@ -1631,12 +1990,41 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const riskClass = displayedRiskScore >= 80 ? 'critical' : displayedRiskScore >= 55 ? 'high' : displayedRiskScore >= 25 ? 'medium' : 'low';
   const zapScanner = model.scanners.find((scanner) => scanner.tool === 'ZAP');
   const zapPolicy = model.policyResult?.policy;
-  const effectiveZapMode = zapScanner?.mode || (zapPolicy?.zapOpenapi ? 'openapi' : zapPolicy?.zapActive ? 'active' : 'baseline');
+  // Le mode vient du moteur lui-même dès qu'il l'a annoncé. La carte affichait
+  // « Passif baseline » pendant que le déroulé d'exécution disait « Actif » : deux
+  // sources, deux réponses, alors qu'une seule analyse tournait. Le déroulé porte
+  // le mode que ZAP a réellement exécuté, et c'est donc lui qui fait foi.
+  const executedZapMode = model.zapExecution?.mode || '';
+  const effectiveZapMode = executedZapMode || zapScanner?.mode || (zapPolicy?.zapOpenapi ? 'openapi' : zapPolicy?.zapActive ? 'active' : 'baseline');
   const zapMode = effectiveZapMode === 'openapi' ? 'OpenAPI actif' : effectiveZapMode === 'active' ? 'Actif' : 'Passif baseline';
-  const zapAuthenticated = zapScanner?.authenticated ?? Boolean(zapPolicy?.zapAuth?.login || zapPolicy?.zapContext);
+  // « Authentifié » est un constat du run, jamais une configuration : un login
+  // déclaré dans la politique n'est pas une session. Seul le scanner qui a
+  // réellement transmis une session vérifiée à ZAP peut l'affirmer.
+  const zapAuthenticated = zapScanner?.authenticated === true;
   const zapAuth = zapAuthenticated ? 'Authentifié' : 'Non authentifié';
-  const zapAuthenticationFailed = zapScanner?.status === 'failed'
+  // Ce que le dernier scan ZAP a constaté, et s'il l'a constaté avant ou après
+  // l'enregistrement du compte courant. Un refus antérieur au compte actuel n'a
+  // jamais porté sur ces identifiants : le présenter comme un échec courant
+  // ferait croire qu'un compte tout juste enregistré a déjà échoué.
+  const zapAuthRefusedByLastScan = zapScanner?.status === 'failed'
     && /authentification|login.*(?:refus|401)|http\s*401/i.test(String(zapScanner?.error || ''));
+  const zapAccountSavedAfterLastScan = Boolean(model.zapTestAccount?.updatedAt)
+    && (!zapScanner?.completedAt
+      || new Date(model.zapTestAccount.updatedAt).getTime() > new Date(zapScanner.completedAt).getTime());
+  const zapAuthFailureHistorical = zapAuthRefusedByLastScan && zapAccountSavedAfterLastScan;
+  const zapAuthenticationFailed = zapAuthRefusedByLastScan && !zapAuthFailureHistorical;
+  // Ce que Dynamic Security peut dire du compte de test, sans jamais citer le
+  // mot de passe : un compte enregistré est une information que la carte ne
+  // possédait pas, et son absence explique un refus d'authentification mieux que
+  // l'erreur du scanner seule.
+  const zapTestAccount = model.zapTestAccount;
+  const zapAccountConfigured = Boolean(zapTestAccount?.configured);
+  const zapAccountLabel = zapAccountConfigured
+    ? 'Compte de test authentifié configuré'
+    : zapTestAccount ? 'Aucun compte de test enregistré' : 'Compte de test non vérifié';
+  const zapAccountDetail = zapAccountConfigured
+    ? `${zapTestAccount.username} · mot de passe stocké de manière sécurisée`
+    : zapTestAccount ? 'Configurez le compte ZAP pour les scans authentifiés' : '';
   const zapFindingCount = model.findings.filter((finding) => finding.tool === 'ZAP').length;
   const zapTestedUrls = new Set(model.findings.filter((finding) => finding.tool === 'ZAP' && finding.endpoint).map((finding) => finding.endpoint)).size;
   const burpUniqueEndpoints = new Set(burpScenarios.map((scenario) => endpointPath(scenario.request?.url))).size;
@@ -1644,21 +2032,189 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   const burpLastSeen = model.burpStatus.last_seen ? new Date(model.burpStatus.last_seen).toLocaleString('fr-FR') : 'Not available';
   const burpStoredRequests = Number.isFinite(Number(model.burpStatus.received_requests)) ? Number(model.burpStatus.received_requests) : burpScenarios.length;
   const zapState = !zapScanner ? 'jamais exécuté' : zapScanner.status;
-  const targetUrl = model.dynamicTargetUrl || model.findings.find((finding) => finding.tool === 'ZAP' && finding.endpoint)?.endpoint || model.httpScenarios.find((scenario) => scenario.request?.url)?.request?.url || '';
+  // À défaut de cible configurée, elle est déduite de ce qui a été observé — mais
+  // seulement son origine. Reprendre l'URL complète d'une requête capturée
+  // proposait un chemin et une chaîne de requête comme adresse d'application, et
+  // affichait au passage un éventuel jeton d'URL dans le champ.
+  const observedTarget = model.findings.find((finding) => finding.tool === 'ZAP' && finding.endpoint)?.endpoint
+    || model.httpScenarios.find((scenario) => scenario.request?.url)?.request?.url
+    || '';
+  const targetUrl = model.dynamicTargetUrl
+    || (() => { try { return new URL(observedTarget).origin; } catch { return observedTarget; } })();
   let targetOrigin = '';
   try { targetOrigin = new URL(targetUrl).origin; } catch { targetOrigin = targetUrl; }
   const targetState = model.dynamicTargetState || 'unknown';
-  const targetStatus = targetState === 'online' ? '● En ligne' : targetState === 'unreachable' ? '⚠ Cible inaccessible' : 'Inconnue / non vérifiée';
+  // Chaque etat de sonde a son propre libelle : « refusee », « nom introuvable »
+  // et « TLS » n'appellent pas la meme correction.
+  const TARGET_STATUS_LABELS = {
+    online: '● En ligne',
+    unreachable: '⚠ Cible inaccessible',
+    refused: '⚠ Connexion refusée',
+    timeout: '⚠ Délai dépassé',
+    'dns-error': '⚠ Nom introuvable',
+    'tls-error': '⚠ Erreur TLS'
+  };
+  const targetStatus = TARGET_STATUS_LABELS[targetState] || 'Inconnue / non vérifiée';
+  const targetRemote = String(model.dynamicTargetMode || 'local') === 'remote';
+  const targetModeLabel = targetRemote ? 'Cible distante' : 'Cible locale';
+  const targetAuthorizedLabel = targetRemote
+    ? (model.dynamicTargetRemoteAuthorized ? 'Autorisation confirmée' : 'Autorisation non confirmée — analyse dynamique bloquée')
+    : '';
   // The badge says how it knows. « En ligne » with no evidence would be a claim
   // without a source, and « non vérifiée » beside a finished scan was a
   // contradiction.
   const targetEvidence = model.dynamicTargetEvidence;
+  // Le code de réponse est déjà porté par la preuve de sonde ; il n'apparaissait
+  // nulle part sur la page, alors que c'est lui qui rend l'état vérifiable.
+  const targetEvidenceCode = Number(targetEvidence?.statusCode) > 0 ? `HTTP ${Number(targetEvidence.statusCode)} · ` : '';
   const targetEvidenceLabel = targetEvidence
-    ? `${targetEvidence.source === 'zap-scan' ? 'Confirmée par l’analyse ZAP' : 'Vérifiée directement'} le ${new Date(targetEvidence.at).toLocaleString('fr-FR')}`
+    ? `${targetEvidenceCode}${targetEvidence.source === 'zap-scan' ? 'Confirmée par l’analyse ZAP' : 'Vérifiée directement'} le ${new Date(targetEvidence.at).toLocaleString('fr-FR')}`
     : '';
   const zapCurrentCount = currentScannerResultCount(zapScanner, currentFindings);
+  // Passif et actif, comparés par empreinte sur la même cible. Rien n'est
+  // affiché tant que les deux runs n'ont pas été terminés pour cette cible.
+  const zapModeComparison = compareZapRuns(model.zapRunResults, targetOrigin || targetUrl);
+  const zapComparisonTitles = (observations) => observations.slice(0, 3).map((observation) => observation.title).filter(Boolean).join(' · ');
+  // Une ligne par défaut ; le détail des cinq ensembles se déplie à la demande,
+  // pour que la comparaison n'allonge pas la carte ZAP en permanence.
+  const zapComparisonSummary = zapModeComparison
+    ? `Passive ${zapModeComparison.passive.observations} · Active ${zapModeComparison.active.observations} · New in Active ${zapModeComparison.newInActive.length}`
+    : '';
+  const zapComparisonHtml = zapModeComparison ? `<details class="zap-mode-comparison">
+            <summary aria-label="Comparaison des résultats passifs et actifs : ${escapeHtml(zapComparisonSummary)}"><span class="zap-mode-summary-label">Passive / Active</span><span class="zap-mode-summary">${escapeHtml(zapComparisonSummary)}</span></summary>
+            <div class="tool-facts zap-mode-comparison-details">
+              <div><span>Passive observations</span><strong>${escapeHtml(zapModeComparison.passive.observations)}</strong><small>${escapeHtml(zapModeComparison.passive.runId || 'run passif')}</small></div>
+              <div><span>Active observations</span><strong>${escapeHtml(zapModeComparison.active.observations)}</strong><small>${escapeHtml(zapModeComparison.active.runId || 'run actif')}</small></div>
+              <div><span>Common findings</span><strong>${escapeHtml(zapModeComparison.common.length)}</strong></div>
+              <div><span>New in Active</span><strong>${escapeHtml(zapModeComparison.newInActive.length)}</strong>${zapComparisonTitles(zapModeComparison.newInActive) ? `<small>${escapeHtml(zapComparisonTitles(zapModeComparison.newInActive))}</small>` : ''}</div>
+              <div><span>Only in Passive</span><strong>${escapeHtml(zapModeComparison.onlyInPassive.length)}</strong>${zapComparisonTitles(zapModeComparison.onlyInPassive) ? `<small>${escapeHtml(zapComparisonTitles(zapModeComparison.onlyInPassive))}</small>` : ''}</div>
+            </div>
+          </details>` : '';
   const zapDuration = zapScanner?.durationMs ? formatDuration(zapScanner.durationMs) : '';
   const zapLastScan = zapScanner?.completedAt ? new Date(zapScanner.completedAt).toLocaleString('fr-FR') : '';
+  const zapDetails = zapAuthFailureHistorical
+    ? 'Refus d’authentification du scan précédent, antérieur au compte de test enregistré depuis. Relancez une analyse ZAP pour vérifier les identifiants actuels.'
+    : zapScanner?.error ? summarizeScannerError(zapScanner.error) : (zapScanner?.details || scannerResultSummary(zapScanner, currentFindings));
+  // Une note historique reste lisible sans se présenter comme une alerte en cours.
+  const zapNoteIsError = Boolean(zapScanner?.error) && !zapAuthFailureHistorical;
+  const zapEngineResolved = zapScanner?.engine || zapScanner?.currentRun?.engine || '';
+  const nucleiScanner = model.scanners.find((scanner) => scanner.tool === 'Nuclei');
+  const nucleiDisabled = model.disabledScanners.includes('Nuclei');
+  const nucleiCurrentCount = currentScannerResultCount(nucleiScanner, currentFindings);
+  const nucleiFindingCount = model.findings.filter((finding) => finding.tool === 'Nuclei').length;
+  const nucleiDuration = nucleiScanner?.durationMs ? formatDuration(nucleiScanner.durationMs) : '';
+  const nucleiLastScan = nucleiScanner?.completedAt ? new Date(nucleiScanner.completedAt).toLocaleString('fr-FR') : '';
+  // L'installation vient de la détection d'outil, jamais de l'historique de
+  // scans : `model.scanners` décrit ce qui a été exécuté, pas ce qui est
+  // installé. Un Nuclei installé mais jamais lancé n'y figure pas, et la carte
+  // annonçait alors « NOT INSTALLED » alors que Scanner Configuration, qui
+  // interroge la détection réelle, affichait « Prêt ».
+  // ------------------------------------------------ socle d'exécution commun
+  //
+  // Quand il est publié, c'est lui qui dit ce que chaque moteur fait — pas
+  // l'historique de scans, qui décrit ce qui a été trouvé. Les dérivations
+  // d'origine restent comme repli pour un modèle rendu sans runtime.
+  const runtimeOf = (engine) => model.dynamicRuntime?.engines?.[engine] || null;
+  const engineStatusClass = (state, fallback) => (state ? String(state.status || '').toLowerCase().replace(/_/g, '-') : fallback);
+  const engineStatusLabel = (state, fallback) => (state ? state.statusLabel || state.status : fallback);
+  /** Ce qu'une carte doit dire quand l'état courant ne se suffit pas à lui-même. */
+  const engineNote = (state) => {
+    if (!state) return '';
+    if (state.reason) return state.reason;
+    // Jamais lancé n'est pas une panne : c'est un fait, et il se dit.
+    if (state.execution?.neverExecuted) return 'Jamais exécuté.';
+    if (state.execution?.phase) return state.execution.phase;
+    return '';
+  };
+  const engineNoteHtml = (state) => {
+    const note = engineNote(state);
+    if (!note) return '';
+    const failed = state?.status === 'FAILED' || state?.status === 'UNAVAILABLE';
+    return `<p class="tool-note${failed ? ' error' : ''}" ${failed ? 'role="alert"' : ''}>${escapeHtml(note)}</p>`;
+  };
+  const zapRuntime = runtimeOf('zap');
+  /**
+   * Ce qui décide de l'action principale de la carte ZAP.
+   *
+   * L'échec du dernier run remplaçait le bouton d'analyse par « Configurer ZAP ».
+   * Or un scan qui dépasse son délai, une cible momentanément injoignable ou un
+   * moteur interrompu ne sont pas des problèmes de configuration : la carte
+   * restait sans aucun moyen de relancer, alors que ZAP était prêt — l'état
+   * mesuré disait READY et l'action proposée parlait d'installation.
+   *
+   * L'action suit donc la disponibilité du moment, et l'issue du run précédent ne
+   * décide plus que du libellé : réessayer est un geste différent de lancer.
+   * L'échec lui-même reste visible dans la note de la carte et dans le déroulé
+   * d'exécution, comme information historique.
+   *
+   * `zapRuntime` absent signifie « pas encore mesuré » : cela n'autorise pas à
+   * déclarer le moteur indisponible.
+   */
+  const zapEngineUnusable = zapRuntime ? zapRuntime.status === 'UNAVAILABLE' : false;
+  /**
+   * Si une analyse ZAP est réellement en cours, donc interruptible.
+   *
+   * L'état du socle d'exécution compte autant que celui du scanner : un démon en
+   * cours de démarrage est à l'état STARTING, sans scanner « running » encore
+   * enregistré, et c'est précisément le moment où l'on veut pouvoir arrêter.
+   */
+  const zapRunInterruptible = ['STARTING', 'RUNNING', 'STOPPING'].includes(String(zapRuntime?.execution?.status || ''))
+    || ['running', 'refreshing'].includes(String(zapScanner?.status || ''));
+  const zapScanRunning = zapScanner?.status === 'running' || zapScanner?.status === 'refreshing';
+  const zapPreviousRunFailed = zapScanner?.status === 'failed';
+  const zapScanActionLabel = zapScanRunning
+    ? 'Analyse ZAP en cours…'
+    : zapPreviousRunFailed ? 'Réessayer l’analyse' : 'Run security scan';
+  // Quel moteur ZAP va s'exécuter — ou vient de s'exécuter. « Local ZAP or
+  // Docker » était le seul texte possible tant que rien ne le mesurait.
+  const zapEngineDetail = zapRuntime?.availability?.detail || '';
+  const nucleiRuntime = runtimeOf('nuclei');
+  const mitmRuntime = runtimeOf('mitmproxy');
+  const burpRuntime = runtimeOf('burp');
+
+  const nucleiTool = model.nucleiTool;
+  const nucleiInstalled = nucleiTool?.installed === true;
+  const nucleiVersion = nucleiTool?.version || nucleiScanner?.version || nucleiScanner?.currentRun?.version || '';
+  const nucleiTemplates = nucleiTool?.templatesVersion
+    || nucleiScanner?.templatesVersion || nucleiScanner?.templates?.version || nucleiScanner?.currentRun?.templatesVersion || '';
+  // Un run en cours ou terminé décrit mieux l'instant que « prêt » ; sinon
+  // l'état de l'outil fait foi.
+  const nucleiStatusValue = nucleiScanner?.status
+    || (nucleiDisabled ? 'disabled' : nucleiInstalled ? 'ready' : 'not-installed');
+  const nucleiStatusLabel = nucleiScanner
+    ? scannerStatusLabel(nucleiScanner.status)
+    : nucleiDisabled ? 'NOT CONFIGURED' : nucleiInstalled ? 'PRÊT' : 'NOT INSTALLED';
+  const nucleiDetails = nucleiScanner?.error ? summarizeScannerError(nucleiScanner.error) : (nucleiScanner?.details || scannerResultSummary(nucleiScanner, currentFindings));
+  // Nuclei est une analyse finie : une fois terminée, l'exécution commune remet
+  // l'outil à « prêt », et c'est la dernière exécution qui dit comment elle s'est
+  // terminée. La carte l'affiche, au lieu d'un « prêt » qui cachait un échec.
+  const nucleiLastRun = nucleiRuntime?.execution?.lastRun || null;
+  const nucleiActive = ['STARTING', 'RUNNING', 'STOPPING'].includes(nucleiRuntime?.status);
+  const nucleiRunning = nucleiRuntime ? nucleiActive : nucleiScanner?.status === 'running';
+  const nucleiChip = nucleiRuntime && nucleiRuntime.status === 'READY' && nucleiLastRun
+    ? { ...nucleiRuntime, status: nucleiLastRun.status, statusLabel: nucleiLastRun.status === 'FAILED' ? 'ÉCHEC' : 'TERMINÉ' }
+    : nucleiRuntime;
+  const nucleiClock = (value) => (value ? new Date(value).toLocaleTimeString('fr-FR') : '');
+  const nucleiRunNote = (() => {
+    const execution = nucleiRuntime?.execution || {};
+    if (nucleiActive) {
+      const parts = [execution.phase || 'Scan Nuclei en cours'];
+      if (Number.isFinite(execution.progress)) parts.push(`${execution.progress} %`);
+      if (execution.startedAt) parts.push(`démarré à ${nucleiClock(execution.startedAt)}`);
+      if (execution.lastActivity) parts.push(`dernière activité ${nucleiClock(execution.lastActivity)}`);
+      return `<p class="tool-note">${escapeHtml(parts.join(' · '))}</p>`;
+    }
+    if (nucleiLastRun?.status === 'FAILED') {
+      return `<p class="tool-note error" role="alert">${escapeHtml(`Échec (${nucleiLastRun.errorCode || 'SCAN_FAILED'}) : ${nucleiLastRun.errorReason || 'raison non communiquée'}`)}</p>`;
+    }
+    if (nucleiLastRun?.status === 'COMPLETED') {
+      const count = Number.isFinite(nucleiLastRun.findingCount) ? nucleiLastRun.findingCount : 0;
+      return `<p class="tool-note">${escapeHtml(`Terminé à ${nucleiClock(nucleiLastRun.finishedAt)} · ${count} finding(s)`)}</p>`;
+    }
+    return '';
+  })();
+  const nucleiLegacyNote = `${engineNoteHtml(nucleiRuntime)}${nucleiDetails ? `<p class="tool-note${nucleiScanner?.error ? ' error' : ''}" ${nucleiScanner?.error ? 'role="alert"' : ''}>${escapeHtml(nucleiDetails)}</p>` : !nucleiInstalled && !nucleiScanner ? '<p class="tool-note">Install Nuclei from Scanner Configuration. The managed install includes the binary and official templates.</p>' : ''}`;
+  const nucleiCardNote = nucleiRuntime && (nucleiActive || nucleiLastRun) ? nucleiRunNote : nucleiLegacyNote;
   const zapCard = surface === 'scans'
     ? `<section class="zap-card zap-execution-card ${escapeHtml(zapScanner?.status || 'idle')}">
       <div class="zap-execution-head">
@@ -1671,10 +2227,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         ${zapDuration ? `<div class="zap-execution-fact"><span>Last scan</span><strong>${escapeHtml(zapDuration)}</strong>${zapLastScan ? `<small>${escapeHtml(zapLastScan)}</small>` : ''}</div>` : ''}
         ${targetOrigin ? `<div class="zap-execution-fact target"><span>Target</span><strong>${escapeHtml(targetOrigin)}</strong>${targetEvidenceLabel ? `<small>${escapeHtml(targetEvidenceLabel)}</small>` : ''}</div>` : ''}
       </div>
-      ${zapScanner?.error ? `<p class="zap-execution-error">${escapeHtml(summarizeScannerError(zapScanner.error))}</p>` : ''}
+      ${zapScanner?.error ? `<p class="zap-execution-error${zapAuthFailureHistorical ? ' historical' : ''}">${escapeHtml(zapDetails)}</p>` : ''}
       <div class="zap-meta"><span class="scan-status-chip ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(scannerStatusLabel(zapScanner?.status || 'pending'))}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Configurer</button></div>
     </section>`
-    : `<section class="zap-card ${escapeHtml(zapScanner?.status || 'idle')}"><div><span class="zap-kicker">Analyse dynamique</span><h4>ZAP — ${escapeHtml(zapMode)}</h4><p>${escapeHtml(zapScanner?.error ? summarizeScannerError(zapScanner.error) : `${zapFindingCount} alerte(s) runtime • ${zapAuth}`)}</p></div><div class="zap-meta"><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP uniquement</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Installer / configurer ZAP</button></div></section>`;
+    : `<section class="zap-card ${escapeHtml(zapScanner?.status || 'idle')}"><div><span class="zap-kicker">Analyse dynamique</span><h4>ZAP — ${escapeHtml(zapMode)}</h4><p>${escapeHtml(zapScanner?.error ? zapDetails : `${zapFindingCount} alerte(s) runtime • ${zapAuth}`)}</p></div><div class="zap-meta"><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span><button class="secondary" data-command="securityCenter.scanZap">Relancer ZAP uniquement</button><button class="secondary" data-command="securityCenter.configureZapCredentials">Compte ZAP</button><button class="secondary" data-command="securityCenter.configureZap">Installer / configurer ZAP</button></div></section>`;
   const scanSuccessCount = model.scanners.filter((scanner) => scanner.status === 'completed').length;
   const scanWaitingCount = model.scanners.filter((scanner) => ['pending', 'running', 'refreshing'].includes(scanner.status)).length;
   const scansCurrentFindingTotal = model.scanners.reduce((sum, scanner) => {
@@ -1725,7 +2281,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       <div class="sc-topbar-title"><h1>${escapeHtml(surfaceTitle)}</h1><p>${shellSubtitle}</p></div>
       <div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend ${backendTone}">Backend ${escapeHtml(model.backendStatus)}</span></div></div>
     </header>`
-    : `<div class="header"><div><h2>Secenter</h2><div class="workspace">${escapeHtml(model.workspace)}</div></div><div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend ${backendTone}">Backend ${escapeHtml(model.backendStatus)}</span></div></div></div>`;
+    : `<div class="header"><div><h2>SCenter</h2><div class="workspace">${escapeHtml(model.workspace)}</div></div><div class="header-actions">${themeToggleButton}${scanChronoBadge}${fullHeaderAction}<div class="header-status"><span class="status-pill ${statusClass}">${escapeHtml(scanStatusLabel)}</span><span class="backend ${backendTone}">Backend ${escapeHtml(model.backendStatus)}</span></div></div></div>`;
 
   // Zones les plus exposees : un regroupement de `currentActiveFindings`, la
   // liste que la page affiche deja. Aucune analyse supplementaire.
@@ -1800,11 +2356,26 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     ['Medium', prioritySummary.medium, 'medium'],
     ['Low', prioritySummary.low, 'low']
   ].map(([label, value, tone]) => `<div class="overview-kpi hero-metric ${tone}"><span class="hero-metric-label"><i class="hero-metric-dot ${tone}"></i>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
-  const scannerTotal = model.scanners.length;
+  // Coverage counts the scanners that ran. Before any scan it counts what
+  // security-center.yml declares: a configured project never reads « 0 / 0 ».
+  const project = model.projectConfiguration;
+  const declaredScanners = project?.scanners?.declared ? project.scanners.enabled.length : 0;
+  const scannerTotal = model.scanners.length || declaredScanners;
   const scannerCoveragePercent = scannerTotal > 0 ? Math.round(model.completedScanners / scannerTotal * 100) : 0;
-  const scannerCoverageLabel = scannerTotal > 0
+  const scannerCoverageLabel = model.scanners.length
     ? `${model.completedScanners} completed${failedTools.length ? ` · ${failedTools.length} failed` : ''}`
-    : 'No scanners configured';
+    : project?.state === 'NOT_CONFIGURED' ? 'Project not configured'
+      : project?.state === 'INVALID' ? 'security-center.yml is invalid'
+        : declaredScanners ? `${declaredScanners} configured · not scanned yet`
+          : project?.state === 'CONFIGURED' ? (project.scanners?.declared ? 'No scanner enabled in security-center.yml' : 'Scanners not selected yet')
+            : 'No scanners configured';
+  // First use: say the project is not configured, and where to configure it.
+  // Nothing is created by showing this — the file comes from an explicit save.
+  const projectFirstUse = surface === 'history' || !project || project.state === 'CONFIGURED'
+    ? ''
+    : project.state === 'INVALID'
+      ? `<section class="project-first-use invalid" data-project-state="invalid"><div><strong>security-center.yml est illisible</strong><p>${escapeHtml(project.error || '')}</p></div><button data-command="securityCenter.openProjectPolicy">Ouvrir security-center.yml</button></section>`
+      : `<section class="project-first-use" data-project-state="not-configured"><div><strong>${escapeHtml(project.message || 'Security Center n’est pas encore configuré pour ce projet.')}</strong><p>Choisissez les scanners, le Policy Gate et les exigences supply chain : security-center.yml sera créé à votre premier enregistrement.</p></div><button data-command="securityCenter.openScannerSetup">Configurer le projet</button></section>`;
   const operationsHeroMetrics = `<div class="overview-kpi hero-metric production"><span class="hero-metric-label">${compactIcon('play')}Production</span><strong>${escapeHtml(currentProductionPriority)}</strong><small>priority findings</small></div>
     <div class="overview-kpi hero-metric scanners"><div class="scanner-coverage-head"><span class="hero-metric-label">${compactIcon('pulse')}Scanner coverage</span><b>${scannerCoveragePercent}%</b></div><strong>${escapeHtml(`${model.completedScanners} / ${scannerTotal}`)}</strong><div class="scanner-coverage-bar" aria-hidden="true"><span style="width: ${scannerCoveragePercent}%"></span></div><small>${escapeHtml(scannerCoverageLabel)}</small></div>`;
   const heroMetrics = `<div class="hero-metric-panel">
@@ -1812,7 +2383,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     <div class="hero-metric-group hero-severity-grid">${severityHeroMetrics}</div>
     <div class="hero-metric-group hero-operations-grid">${operationsHeroMetrics}</div>
   </div>`;
+  // Signature de marque du hero : le hibou en bas a droite, tres en retrait.
+  // Rendu seulement si l'URI est resolue — sans image, pas de cadre vide.
+  const heroBrandWatermark = assets?.brandLogoUri
+    ? `<img class="hero-brand-watermark" src="${escapeHtml(assets.brandLogoUri)}" alt="" aria-hidden="true" decoding="async">`
+    : '';
   const securityCenterHero = `<section class="overview-summary security-center-hero">
+    ${heroBrandWatermark}
     <div class="security-hero-motif" aria-hidden="true">
       <span></span><span></span><span></span>
       <svg viewBox="0 0 420 220" focusable="false"><path d="M18 168 C90 90 126 184 198 94 S328 90 398 34"></path><path d="M42 48 H138 L184 92 H286 L350 154"></path><circle cx="42" cy="48" r="4"></circle><circle cx="184" cy="92" r="4"></circle><circle cx="350" cy="154" r="4"></circle></svg>
@@ -1820,13 +2397,13 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     <div class="hero security-hero-copy ${riskClass}">
       <div class="security-product-mark">
         <div class="security-shield${assets?.brandLogoUri ? ' security-shield-logo' : ''}">${assets?.brandLogoUri
-          ? `<img src="${escapeHtml(assets.brandLogoUri)}" alt="Secenter" decoding="async">`
+          ? `<img src="${escapeHtml(assets.brandLogoUri)}" alt="Security Center" decoding="async">`
           : compactIcon('shield')}</div>
         <div class="risk-ring"><svg viewBox="0 0 100 100" aria-hidden="true"><circle class="risk-track" cx="50" cy="50" r="42"></circle><circle class="risk-progress" cx="50" cy="50" r="42" pathLength="100" stroke-dasharray="${displayedRiskScore} 100"></circle></svg><strong>${displayedRiskScore}</strong></div>
       </div>
       <div class="risk-copy">
         <div class="security-product-badge">Security Center DevSecOps</div>
-        <h2>Secenter</h2>
+        <h2>Security Center</h2>
         <p class="security-workspace">Vue de sécurité du workspace <strong>${escapeHtml(model.workspace)}</strong></p>
         <span class="risk-explanation">Surveillez, analysez et corrigez les risques de sécurité en continu.</span>
         <span class="risk-calculation-note">${riskExplanation}</span>
@@ -2077,6 +2654,9 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .status-pill.running, .status.running { color: #79c0ff; background: rgba(56,139,253,.16); }
     .status.pending { color: var(--vscode-descriptionForeground); background: var(--vscode-editor-inactiveSelectionBackground); }
     .operational-banner { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; border: 1px solid var(--vscode-widget-border); border-radius: 9px; padding: 11px 13px; margin-bottom: 12px; }
+    .project-first-use { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid var(--vscode-widget-border); border-left: 3px solid var(--vscode-button-background); border-radius: 9px; padding: 12px 14px; margin-bottom: 12px; }
+    .project-first-use p { margin: 4px 0 0; color: var(--vscode-descriptionForeground); }
+    .project-first-use.invalid { border-left-color: var(--vscode-editorError-foreground, #d94b40); }
     .operational-banner.danger { border-color: rgba(255,59,48,.75); background: rgba(255,59,48,.13); }
     .operational-banner.success { border-color: rgba(46,160,67,.55); background: rgba(46,160,67,.09); }
     .operational-icon { font-size: 19px; font-weight: 900; color: var(--vscode-descriptionForeground); }
@@ -2189,6 +2769,54 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .sc-zap-warning { display: grid; gap: 3px; padding: 11px 13px; border: 1px solid rgba(255,159,10,.34); border-radius: 12px; background: rgba(255,159,10,.08); }
     .sc-zap-warning strong { color: var(--sc-warning); font-size: 12px; }
     .sc-zap-warning span { color: var(--sc-muted); font-size: 12px; line-height: 1.45; }
+    /* L'arrêt d'une analyse : une action secondaire, mais qui se distingue. */
+    .dynamic-actions .secondary.danger { color: var(--sc-danger, #dc2626); border-color: color-mix(in srgb, var(--sc-danger, #dc2626) 40%, var(--sc-border)); }
+    .zap-stage-failure code { font-family: var(--vscode-editor-font-family, monospace); font-size: 10.5px; }
+
+    /* Le déroulé d'exécution : replié, dense, lisible d'un coup d'œil. */
+    .zap-execution-details { margin-top: 10px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); background: color-mix(in srgb, var(--sc-surface) 97%, var(--sc-primary) 3%); }
+    .zap-execution-details > summary { display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; color: var(--sc-text); font-size: 11.5px; font-weight: 800; }
+    .zap-mode-comparison { border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); background: color-mix(in srgb, var(--sc-surface) 97%, var(--sc-primary) 3%); }
+    .zap-mode-comparison > summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; padding: 8px 10px; cursor: pointer; color: var(--sc-text); font-size: 11.5px; font-weight: 800; }
+    .zap-mode-comparison > summary .zap-mode-summary-label { color: var(--sc-muted); font-size: 9px; font-weight: 850; letter-spacing: .45px; text-transform: uppercase; }
+    .zap-mode-comparison > .tool-facts { margin: 0 10px 10px; }
+    .zap-activity { margin-left: auto; padding: 1px 7px; border-radius: 999px; font-size: 9.5px; font-weight: 850; letter-spacing: .4px; text-transform: uppercase; color: var(--sc-muted); background: color-mix(in srgb, var(--sc-muted) 14%, transparent); }
+    .zap-activity.progressing { color: var(--sc-success, #16a34a); background: color-mix(in srgb, var(--sc-success, #16a34a) 14%, transparent); }
+    .zap-activity.stalled, .zap-activity.failed { color: var(--sc-danger, #dc2626); background: color-mix(in srgb, var(--sc-danger, #dc2626) 14%, transparent); }
+    .zap-activity.waiting { color: var(--sc-warning, #d97706); background: color-mix(in srgb, var(--sc-warning, #d97706) 14%, transparent); }
+    .zap-execution-meta { display: grid; grid-template-columns: repeat(auto-fit,minmax(130px,1fr)); gap: 6px; padding: 0 10px 8px; }
+    .zap-execution-meta span { display: block; color: var(--sc-muted); font-size: 9px; font-weight: 850; letter-spacing: .4px; text-transform: uppercase; }
+    .zap-execution-meta strong { display: block; color: var(--sc-text); font-size: 11.5px; overflow-wrap: anywhere; }
+    .zap-stage-list { margin: 0; padding: 0 10px 10px 10px; list-style: none; display: grid; gap: 4px; }
+    .zap-stage { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 5px 8px; border-left: 2px solid var(--sc-border); border-radius: 0 var(--sc-radius-sm, 4px) var(--sc-radius-sm, 4px) 0; background: color-mix(in srgb, var(--sc-surface) 92%, transparent); }
+    .zap-stage small { grid-column: 1 / -1; color: var(--sc-muted); font-size: 10px; overflow-wrap: anywhere; }
+    .zap-stage-name { color: var(--sc-text); font-size: 11.5px; }
+    .zap-stage-state { color: var(--sc-muted); font-size: 9.5px; font-weight: 850; letter-spacing: .4px; }
+    .zap-stage.running { border-left-color: var(--sc-primary); }
+    .zap-stage.running .zap-stage-state { color: var(--sc-primary); }
+    .zap-stage.completed { border-left-color: var(--sc-success, #16a34a); }
+    .zap-stage.completed .zap-stage-state { color: var(--sc-success, #16a34a); }
+    .zap-stage.skipped { border-left-color: var(--sc-muted); }
+    .zap-stage.failed { border-left-color: var(--sc-danger, #dc2626); }
+    .zap-stage.failed .zap-stage-state { color: var(--sc-danger, #dc2626); }
+    .zap-stage.pending { opacity: .62; }
+    .zap-stage-failure { margin: 0 10px 10px; color: var(--sc-danger, #dc2626); font-size: 11px; font-weight: 700; }
+
+    /* Le formulaire du compte : deux champs dans le dialogue, rien de plus. */
+    .sc-zap-account-fields { display: grid; gap: 6px; margin: 14px 0 4px; }
+    .sc-zap-account-fields label { color: var(--sc-muted); font-size: 10px; font-weight: 850; letter-spacing: .45px; text-transform: uppercase; }
+    .sc-zap-account-fields label em { font-style: normal; color: var(--sc-success, #16a34a); text-transform: none; letter-spacing: 0; font-weight: 700; }
+    .sc-zap-account-fields input {
+      width: 100%; box-sizing: border-box; padding: 9px 10px; margin-bottom: 4px;
+      border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md);
+      background: var(--sc-surface); color: var(--sc-text); font: inherit; font-size: 13px;
+    }
+    .sc-zap-account-fields input:focus-visible { outline: 2px solid var(--sc-primary); outline-offset: 1px; }
+    .sc-zap-account-fields small { color: var(--sc-muted); font-size: 10.5px; line-height: 1.4; }
+    .sc-zap-account-error { margin: 8px 0 0; color: var(--sc-danger, #dc2626); font-size: 11px; font-weight: 700; }
+    .sc-zap-account-error[hidden] { display: none; }
+    /* Une note datée d'un scan antérieur : lisible, mais pas une alerte en cours. */
+    .tool-note.historical { color: var(--sc-muted); border-left: 2px solid var(--sc-border); padding-left: 8px; }
     .sc-zap-modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
     .sc-zap-modal-actions button { width: auto; min-height: 34px; padding-inline: 13px; }
     .sc-zap-modal-actions .primary { color: #fff; background: var(--sc-primary); border-color: var(--sc-primary); }
@@ -2196,65 +2824,283 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .sc-zap-modal-actions .secondary { color: var(--sc-primary); background: var(--sc-surface); border-color: color-mix(in srgb, var(--sc-primary) 36%, var(--sc-border)); }
     .sc-zap-modal-actions .quiet-action { color: var(--sc-muted); }
     .sc-zap-modal-actions button:focus-visible, .sc-modal-close:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
-    .dynamic-page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin: 6px 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--vscode-widget-border); }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .dynamic-page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin: 6px 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--sc-border); }
     .dynamic-page-header h1 { margin: 0; font-size: 22px; }
-    .dynamic-page-header p { margin: 5px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
-    .dynamic-section { margin: 0 0 10px; padding: 12px 14px; border: 1px solid var(--vscode-widget-border); border-radius: 6px; background: var(--vscode-editor-background); }
-    .dynamic-section-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
-    .dynamic-section-head h2 { font-size: 12px; letter-spacing: .2px; }
-    .dynamic-section-head span { color: var(--vscode-descriptionForeground); font-size: 10px; }
-    .dynamic-status-grid { display: grid; gap: 10px; }
+    .dynamic-page-header p { margin: 5px 0 0; color: var(--sc-muted); font-size: 11px; }
+    .page-dynamic { display: grid; gap: 12px; }
+    .dynamic-section { margin: 0; padding: 14px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-lg); background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); min-width: 0; }
+    .dynamic-section-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
+    .dynamic-section-head h2 { margin: 2px 0 0; color: var(--sc-text); font-size: 14px; letter-spacing: 0; }
+    .dynamic-section-head > span { color: var(--sc-muted); font-size: 10px; line-height: 1.4; text-align: right; }
+    .dynamic-kicker { display: block; color: var(--sc-primary); font-size: 9.5px; font-weight: 850; letter-spacing: .7px; text-transform: uppercase; }
+    .dynamic-workflow { display: grid; grid-template-columns: auto minmax(18px,1fr) auto minmax(18px,1fr) auto minmax(18px,1fr) auto; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--sc-primary) 18%, var(--sc-border)); border-radius: var(--sc-radius-md); background: color-mix(in srgb, var(--sc-surface) 94%, var(--sc-primary) 6%); color: var(--sc-muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .35px; }
+    .dynamic-workflow i { height: 1px; background: color-mix(in srgb, var(--sc-primary) 28%, var(--sc-border)); }
+    /* Chaque carte garde sa hauteur naturelle, alignée en haut : une carte ZAP
+       plus haute ne doit pas étirer Nuclei en colonne vide. */
+    .dynamic-status-grid { display: grid; gap: 12px; align-items: start; }
+    .target-mode-switch { display: inline-flex; gap: 4px; padding: 4px; margin-bottom: 10px; border: 1px solid var(--sc-border); border-radius: 999px; background: var(--sc-surface-soft); }
+    .target-mode-switch button { width: auto; min-height: 0; padding: 5px 10px; border: 0; border-radius: 999px; color: var(--sc-muted); background: transparent; font-size: 10px; font-weight: 800; box-shadow: none; }
+    .target-mode-switch button:hover { color: var(--sc-primary); background: color-mix(in srgb, var(--sc-primary) 8%, transparent); }
+    .target-mode-switch button.selected { color: var(--sc-primary); background: var(--sc-surface); box-shadow: var(--sc-shadow-sm); }
+    .target-url-field { display: grid; gap: 5px; }
+    .target-url-field span { color: var(--sc-muted); font-size: 10px; font-weight: 850; letter-spacing: .5px; text-transform: uppercase; }
+    .target-url-field input { width: 100%; min-width: 0; box-sizing: border-box; padding: 9px 10px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); color: var(--sc-text); background: var(--sc-surface-soft); font: inherit; font-size: 12px; }
+    .target-summary, .tool-facts { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: 8px; margin-top: 10px; }
+    .target-summary > div, .tool-facts > div { min-width: 0; padding: 9px 10px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); background: color-mix(in srgb, var(--sc-surface) 96%, var(--sc-primary) 4%); }
+    .target-summary span, .tool-facts span { display: block; color: var(--sc-muted); font-size: 9px; font-weight: 850; letter-spacing: .45px; text-transform: uppercase; }
+    .target-summary strong, .tool-facts strong { display: block; margin-top: 3px; color: var(--sc-text); font-size: 12px; overflow-wrap: anywhere; }
+    .target-summary small, .tool-facts small { display: block; margin-top: 3px; color: var(--sc-muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+    .dynamic-tool-card { display: grid; gap: 9px; align-content: start; padding: 13px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-lg); background: var(--sc-surface); min-width: 0; }
+    .tool-card-head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 11px; align-items: start; }
+    .tool-card-head .scanner-logo { width: 42px; height: 42px; border-radius: 11px; }
+    .dynamic-tool-logo { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid color-mix(in srgb, var(--sc-primary) 16%, var(--sc-border)); border-radius: 11px; background: var(--sc-surface-soft); overflow: hidden; }
+    .dynamic-tool-logo-img { display: block; max-width: 32px; max-height: 32px; width: auto; height: auto; object-fit: contain; }
+    .dynamic-tool-logo[data-dynamic-tool-logo="nuclei"] .dynamic-tool-logo-img { max-width: 38px; max-height: 24px; }
+    .dynamic-tool-logo[data-dynamic-tool-logo="mitmproxy"],
+    .dynamic-tool-logo[data-dynamic-tool-logo="burp"] { width: 76px; }
+    .dynamic-tool-logo[data-dynamic-tool-logo="mitmproxy"] .dynamic-tool-logo-img,
+    .dynamic-tool-logo[data-dynamic-tool-logo="burp"] .dynamic-tool-logo-img { max-width: 68px; max-height: 28px; }
+    .dynamic-tool-logo.fallback { color: var(--sc-primary); background: var(--sc-primary-soft); }
+    .tool-card-head h2 { margin: 0; font-size: 15px; }
+    .tool-card-head p { margin: 2px 0 0; color: var(--sc-text); font-size: 12px; font-weight: 750; }
+    .tool-card-head small { display: block; margin-top: 3px; color: var(--sc-muted); font-size: 11px; line-height: 1.4; }
+    .tool-status { padding: 5px 8px; border-radius: 999px; color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 9px; font-weight: 900; letter-spacing: .45px; white-space: nowrap; }
+    .tool-status.completed { color: var(--sc-success); background: color-mix(in srgb, var(--sc-success) 12%, transparent); }
+    .tool-status.running, .tool-status.refreshing { color: var(--sc-primary); background: var(--sc-primary-soft); }
+    .tool-status.failed { color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 10%, transparent); }
+    .tool-note { margin: 0; color: var(--sc-muted); font-size: 11px; line-height: 1.45; }
+    .tool-note.error { padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--sc-critical) 28%, var(--sc-border)); border-radius: var(--sc-radius-md); color: var(--sc-critical); background: color-mix(in srgb, var(--sc-critical) 7%, var(--sc-surface)); }
+
+    /* ---------------------------------------- Dynamic Security : hiérarchie
+       L'état de connectivité et les valeurs opérationnelles sont ce qu'on vient
+       lire sur cette page ; ils étaient rendus dans le gris secondaire de 9 à
+       10 px réservé aux libellés. Ici l'étiquette reste discrète et c'est la
+       valeur qui porte le poids. Le vert ne sert qu'aux états sains, le rouge
+       qu'aux échecs réels : aucun autre élément de la page n'est recoloré. */
+
+    /* Le vert et le rouge de la charte sont faits pour du texte sur fond neutre.
+       Posés sur leur propre teinte claire, ils tombent sous le seuil AA — le vert
+       mesuré à 2,88:1. Mélangés à la couleur du texte, ils gardent leur identité
+       et repassent au-dessus de 4,5:1. En thème sombre le mélange éclaircit au
+       lieu d'assombrir, puisque la couleur de texte y est claire : le contraste
+       tient dans les deux sens. */
+    .page-dynamic, .page-findings {
+      --sc-on-success: color-mix(in srgb, var(--sc-success) 65%, var(--sc-text));
+      --sc-on-critical: color-mix(in srgb, var(--sc-critical) 80%, var(--sc-text));
+    }
+
+    /* Pastille d'état en tête de section : « ● En ligne » doit se voir. */
+    .dynamic-section-head > span.target-state,
+    .dynamic-section-head > span.burp-connection {
+      /* align-self garde la pastille compacte quand l'en-tête passe en colonne
+         sous 560 px : étirée sur toute la largeur, elle deviendrait la bannière
+         de succès que cette page ne doit pas avoir. */
+      display: inline-flex; align-items: center; align-self: flex-start; padding: 5px 11px;
+      border: 1px solid var(--sc-border); border-radius: 999px;
+      background: var(--sc-surface-soft); color: var(--sc-muted);
+      font-size: 11.5px; font-weight: 850; letter-spacing: .2px;
+      line-height: 1.3; text-align: left; white-space: nowrap;
+    }
+    .dynamic-section-head > span.target-state.online,
+    .dynamic-section-head > span.burp-connection.connected {
+      color: var(--sc-on-success);
+      border-color: color-mix(in srgb, var(--sc-success) 38%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-success) 12%, var(--sc-surface));
+    }
+    .dynamic-section-head > span.target-state.unreachable,
+    .dynamic-section-head > span.target-state.refused,
+    .dynamic-section-head > span.target-state.timeout,
+    .dynamic-section-head > span.target-state.dns-error,
+    .dynamic-section-head > span.target-state.tls-error {
+      color: var(--sc-on-critical);
+      border-color: color-mix(in srgb, var(--sc-critical) 34%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-critical) 9%, var(--sc-surface));
+    }
+
+    /* La valeur prime sur son étiquette, sans alourdir la carte. */
+    .target-summary strong, .tool-facts strong { margin-top: 4px; font-size: 14px; font-weight: 800; line-height: 1.3; }
+    .target-summary small, .tool-facts small { margin-top: 4px; }
+    /* Une URL a besoin de la largeur d'une ligne pour ne pas se couper n'importe où. */
+    .tool-facts > div.fact-wide { grid-column: 1 / -1; }
+    .tool-facts > div.fact-wide strong { font-size: 13.5px; }
+    /* Un compte de test enregistré est un état acquis : il se distingue des
+       métadonnées voisines sans pour autant crier comme une alerte. */
+    .tool-facts > div.zap-test-account.configured {
+      border-color: color-mix(in srgb, var(--sc-success, #2e9e6b) 45%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-surface) 92%, var(--sc-success, #2e9e6b) 8%);
+    }
+    .tool-facts > div.zap-test-account.configured strong { color: var(--sc-success, #2e9e6b); }
+
+    /* Connectivité et portée : ce sont des états, pas des métadonnées. */
+    .target-summary > div.target-connectivity, .target-summary > div.target-scope {
+      border-color: color-mix(in srgb, var(--sc-primary) 22%, var(--sc-border));
+    }
+    .target-summary > div.target-connectivity.online {
+      border-color: color-mix(in srgb, var(--sc-success) 36%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-success) 8%, var(--sc-surface));
+    }
+    .target-summary > div.target-connectivity.online strong { color: var(--sc-on-success); }
+    .target-summary > div.target-connectivity.unreachable,
+    .target-summary > div.target-connectivity.refused,
+    .target-summary > div.target-connectivity.timeout,
+    .target-summary > div.target-connectivity.dns-error,
+    .target-summary > div.target-connectivity.tls-error {
+      border-color: color-mix(in srgb, var(--sc-critical) 32%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-critical) 7%, var(--sc-surface));
+    }
+    .target-summary > div.target-connectivity.unreachable strong,
+    .target-summary > div.target-connectivity.refused strong,
+    .target-summary > div.target-connectivity.timeout strong,
+    .target-summary > div.target-connectivity.dns-error strong,
+    .target-summary > div.target-connectivity.tls-error strong { color: var(--sc-on-critical); }
+    /* Une cible distante non confirmée bloque l'analyse : elle doit le dire. */
+    .target-summary > div.target-scope.blocked {
+      border-color: color-mix(in srgb, var(--sc-critical) 32%, var(--sc-border));
+      background: color-mix(in srgb, var(--sc-critical) 7%, var(--sc-surface));
+    }
+    .target-summary > div.target-scope.blocked small { color: var(--sc-on-critical); }
+
+    /* Le code de réponse porte la preuve : il reste secondaire mais lisible. */
+    .target-summary > div.target-connectivity small { color: var(--sc-text); font-weight: 600; opacity: .74; }
+
+    /* Le sous-titre d'un outil reste au second plan derrière son nom. */
+    .tool-card-head p { color: var(--sc-muted); font-weight: 650; }
+
+    /* Titres de section, URL de la cible et badges d'outil : un cran au-dessus. */
+    .dynamic-section-head h2 { font-size: 15.5px; font-weight: 800; }
+    .target-url-field input { font-size: 13.5px; font-weight: 650; }
+    .tool-card-head h2 { font-size: 16.5px; font-weight: 800; }
+    .tool-status { padding: 6px 10px; font-size: 10.5px; letter-spacing: .4px; }
+    /* Une capture qui reçoit vraiment du trafic est un état sain, au même titre
+       qu'un scan terminé. « Prêt » et « arrêté » restent neutres : le proxy est
+       installé, mais rien ne le traverse. */
+    .page-dynamic .tool-status.capturing { color: var(--sc-on-success); background: color-mix(in srgb, var(--sc-success) 12%, transparent); border: 1px solid color-mix(in srgb, var(--sc-success) 34%, transparent); }
+    .page-dynamic .tool-status.starting { color: var(--sc-primary); background: var(--sc-primary-soft); }
+    .page-dynamic .tool-status.completed { color: var(--sc-on-success); border: 1px solid color-mix(in srgb, var(--sc-success) 34%, transparent); }
+    .page-dynamic .tool-status.failed { color: var(--sc-on-critical); border: 1px solid color-mix(in srgb, var(--sc-critical) 32%, transparent); }
+    /* Les états du socle d'exécution commun. « En cours » et « prêt » se lisent
+       du premier coup d'œil ; « en attente » et « indisponible » restent sobres,
+       parce qu'aucun des deux n'est une alarme. */
+    .page-dynamic .tool-status.running { color: var(--sc-on-success); background: color-mix(in srgb, var(--sc-success) 12%, transparent); border: 1px solid color-mix(in srgb, var(--sc-success) 34%, transparent); }
+    .page-dynamic .tool-status.ready { color: var(--sc-primary); background: var(--sc-primary-soft); border: 1px solid color-mix(in srgb, var(--sc-primary) 28%, transparent); }
+    .page-dynamic .tool-status.stopping { color: var(--sc-primary); background: var(--sc-primary-soft); }
+    .page-dynamic .tool-status.waiting-external, .page-dynamic .tool-status.idle { color: var(--sc-muted); background: var(--sc-surface-soft); border: 1px solid var(--sc-border); }
+    .page-dynamic .tool-status.unavailable { color: var(--sc-muted); background: var(--sc-surface-soft); border: 1px dashed var(--sc-border); }
+    .page-dynamic .dynamic-priority-note { margin: 5px 0 0; color: var(--sc-muted); font-size: 11px; line-height: 1.45; }
+
+    .zap-phase-strip { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 6px; }
+    .zap-phase-strip span { padding: 7px 8px; border-radius: var(--sc-radius-md); color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 10px; font-weight: 750; text-align: center; }
+    .dynamic-advanced { margin-top: 0; border-top: 1px solid var(--sc-border); padding-top: 8px; }
+    .dynamic-advanced summary { cursor: pointer; color: var(--sc-muted); font-size: 11px; font-weight: 800; }
     .dynamic-status-copy strong, .dynamic-status-copy span, .dynamic-status-copy small { display: block; }
-    .dynamic-status-copy span { margin-top: 4px; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
-    .dynamic-status-copy small { margin-top: 5px; color: var(--vscode-descriptionForeground); }
-    .dynamic-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
-    .dynamic-purpose { margin: -5px 0 10px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+    .dynamic-status-copy span { margin-top: 4px; color: var(--sc-muted); overflow-wrap: anywhere; }
+    .dynamic-status-copy small { margin-top: 5px; color: var(--sc-muted); }
+    .page-dynamic .dynamic-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+    .dynamic-purpose { margin: -5px 0 10px; color: var(--sc-muted); font-size: 11px; }
     .dynamic-facts { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px 14px; }
     .dynamic-fact span, .dynamic-fact strong { display: block; }
-    .dynamic-fact span { color: var(--vscode-descriptionForeground); font-size: 9px; text-transform: uppercase; letter-spacing: .4px; }
+    .dynamic-fact span { color: var(--sc-muted); font-size: 9px; text-transform: uppercase; letter-spacing: .4px; }
     .dynamic-fact strong { margin-top: 2px; font-size: 11px; overflow-wrap: anywhere; }
     .dynamic-settings { margin-left: auto; padding-inline: 8px; }
-    .dynamic-actions button { width: auto; }
+    .page-dynamic .dynamic-actions button {
+      width: auto;
+      min-height: 32px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.2;
+      text-align: center;
+      box-shadow: none;
+    }
+    .page-dynamic .dynamic-actions button.primary {
+      color: #fff;
+      background: color-mix(in srgb, var(--sc-primary) 88%, var(--sc-surface) 12%);
+      border-color: color-mix(in srgb, var(--sc-primary) 82%, var(--sc-border) 18%);
+    }
+    .page-dynamic .dynamic-actions button.primary:hover {
+      background: color-mix(in srgb, var(--sc-primary-hover) 88%, var(--sc-surface) 12%);
+      border-color: color-mix(in srgb, var(--sc-primary-hover) 84%, var(--sc-border) 16%);
+    }
+    .page-dynamic .dynamic-actions button.secondary {
+      color: var(--sc-text);
+      background: var(--sc-surface);
+      border-color: color-mix(in srgb, var(--sc-border) 78%, var(--sc-primary) 22%);
+    }
+    .page-dynamic .dynamic-actions button.secondary:hover {
+      color: var(--sc-primary);
+      background: color-mix(in srgb, var(--sc-primary) 6%, var(--sc-surface));
+      border-color: color-mix(in srgb, var(--sc-primary) 34%, var(--sc-border));
+    }
+    .page-dynamic .dynamic-actions button.quiet-action {
+      min-height: 28px;
+      padding: 4px 6px;
+      border-color: transparent;
+      color: var(--sc-primary);
+      background: transparent;
+      font-size: 11px;
+      font-weight: 700;
+      text-align: left;
+    }
+    .page-dynamic .dynamic-actions button.quiet-action:hover {
+      color: var(--sc-primary-hover);
+      background: color-mix(in srgb, var(--sc-primary) 7%, transparent);
+    }
     .dynamic-list { display: grid; gap: 0; }
-    .dynamic-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--vscode-widget-border); }
+    .dynamic-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--sc-border); }
     .dynamic-row:last-child { border-bottom: 0; }
     .dynamic-row strong, .dynamic-row small { display: block; overflow-wrap: anywhere; }
-    .dynamic-row small { margin-top: 3px; color: var(--vscode-descriptionForeground); }
+    .dynamic-row small { margin-top: 3px; color: var(--sc-muted); }
     .dynamic-row button { width: auto; }
-    .dynamic-finding-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; gap: 10px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--vscode-widget-border); }
+    .dynamic-finding-row { display: grid; grid-template-columns: auto auto minmax(0,1fr) auto auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--sc-border); }
     .dynamic-finding-row:last-child { border-bottom: 0; }
     .dynamic-severity { min-width: 54px; font-size: 9px; font-weight: 800; letter-spacing: .5px; }
     .dynamic-severity.danger { color: var(--vscode-errorForeground); }
     .dynamic-finding-copy strong, .dynamic-finding-copy small, .dynamic-finding-copy span { display: block; overflow-wrap: anywhere; }
-    .dynamic-finding-copy small, .dynamic-finding-copy span { margin-top: 2px; color: var(--vscode-descriptionForeground); font-size: 9px; }
+    .dynamic-finding-copy small, .dynamic-finding-copy span { margin-top: 2px; color: var(--sc-muted); font-size: 10px; }
     .dynamic-correlation { display: inline !important; margin-left: 6px !important; color: var(--vscode-textLink-foreground) !important; }
-    .dynamic-source { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 5px; font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .dynamic-source { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 5px; font-size: 11px; color: var(--sc-muted); }
     .dynamic-source span { font-weight: 700; color: var(--vscode-foreground); }
-    .dynamic-source.medium span { color: var(--vscode-descriptionForeground); }
+    .dynamic-source.medium span { color: var(--sc-muted); }
     .dynamic-source code { padding: 1px 4px; border-radius: 3px; background: var(--vscode-textCodeBlock-background, var(--vscode-editor-inactiveSelectionBackground)); color: var(--vscode-textLink-foreground); overflow-wrap: anywhere; }
     .dynamic-source button { padding: 2px 5px; font-size: 10px; }
-    .settings-list { display: grid; border: 1px solid var(--vscode-widget-border); border-radius: 6px; overflow: hidden; }
-    .settings-row { display: grid; grid-template-columns: minmax(130px, .45fr) minmax(0, 1fr); gap: 12px; padding: 9px 11px; border-bottom: 1px solid var(--vscode-widget-border); }
+    .settings-list { display: grid; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); overflow: hidden; }
+    .settings-row { display: grid; grid-template-columns: minmax(130px, .45fr) minmax(0, 1fr); gap: 12px; padding: 9px 11px; border-bottom: 1px solid var(--sc-border); }
     .settings-row:last-child { border-bottom: 0; }
-    .settings-row span { color: var(--vscode-descriptionForeground); }
+    .settings-row span { color: var(--sc-muted); }
     .settings-row strong, .settings-row code { overflow-wrap: anywhere; }
     .dynamic-finding-row button { width: auto; }
     .traffic-controls { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
     .traffic-controls input { min-width: 210px; flex: 1; }
-    .traffic-filter { width: auto; padding: 5px 9px; }
-    .traffic-filter.active { color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+    .traffic-filter { width: auto; padding: 5px 9px; border-radius: 999px; }
+    .traffic-filter.active { color: var(--sc-primary); border-color: color-mix(in srgb, var(--sc-primary) 36%, var(--sc-border)); background: var(--sc-primary-soft); }
     .traffic-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: 12px; min-width: 0; }
-    .traffic-table { min-width: 650px; }
-    .traffic-scroll { overflow: auto; border: 1px solid var(--vscode-widget-border); border-radius: 5px; }
-    .traffic-head, .traffic-row { display: grid; grid-template-columns: 65px minmax(210px,1fr) 65px 80px 65px 145px; gap: 8px; align-items: center; width: 100%; padding: 7px 9px; text-align: left; }
-    .traffic-head { color: var(--vscode-descriptionForeground); background: var(--vscode-editor-inactiveSelectionBackground); font-size: 9px; font-weight: 700; text-transform: uppercase; }
+    .traffic-table { min-width: 840px; }
+
+    /* ------------------------------- capture HTTP : résumé, source, statut
+       Le tableau porte désormais l'authentification, la source et la durée, qui
+       sont les trois choses qu'on cherche d'abord en investiguant. */
+    .traffic-summary { display: grid; grid-template-columns: repeat(auto-fit,minmax(110px,1fr)); gap: 8px; margin-bottom: 10px; }
+    .traffic-summary > div { padding: 8px 10px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); background: color-mix(in srgb, var(--sc-surface) 96%, var(--sc-primary) 4%); }
+    .traffic-summary span { display: block; color: var(--sc-muted); font-size: 9px; font-weight: 850; letter-spacing: .45px; text-transform: uppercase; }
+    .traffic-summary strong { display: block; margin-top: 3px; color: var(--sc-text); font-size: 16px; font-weight: 800; }
+    .traffic-source { font-size: 9px; font-weight: 800; letter-spacing: .3px; text-transform: uppercase; color: var(--sc-muted); }
+    .traffic-auth { text-align: center; }
+    /* Le code de réponse est un fait, pas un verdict : il est teinté, jamais alarmiste. */
+    .traffic-status { font-weight: 800; }
+    .traffic-status.success { color: var(--sc-on-success, var(--sc-success)); }
+    .traffic-status.client-error, .traffic-status.server-error { color: var(--sc-on-critical, var(--sc-critical)); }
+    .traffic-scroll { overflow: auto; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); }
+    .traffic-head, .traffic-row { display: grid; grid-template-columns: 62px minmax(200px,1fr) 58px 46px 78px 62px 68px 140px; gap: 8px; align-items: center; width: 100%; padding: 7px 9px; text-align: left; }
+    .traffic-head { color: var(--sc-muted); background: var(--sc-surface-soft); font-size: 9px; font-weight: 800; text-transform: uppercase; }
     .traffic-row { color: var(--vscode-foreground); background: transparent; border: 0; border-top: 1px solid var(--vscode-widget-border); border-radius: 0; font-size: 10px; }
     .traffic-row:hover { background: var(--vscode-list-hoverBackground, var(--vscode-editor-inactiveSelectionBackground)); }
     .traffic-row.selected { color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)); background: var(--vscode-list-activeSelectionBackground, var(--vscode-editor-inactiveSelectionBackground)); outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
     .traffic-row:focus-visible, .traffic-filter:focus-visible, .dynamic-actions button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
     .traffic-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .traffic-row[hidden] { display: none; }
-    .traffic-preview { padding: 11px; border: 1px solid var(--vscode-widget-border); border-radius: 5px; background: var(--vscode-editor-background); align-self: start; }
+    .traffic-preview { padding: 12px; border: 1px solid var(--sc-border); border-radius: var(--sc-radius-md); background: var(--sc-surface-soft); align-self: start; }
     .traffic-preview h3 { margin: 0 0 8px; }
     .traffic-preview strong, .traffic-preview span { display: block; overflow-wrap: anywhere; }
     .traffic-preview span { margin-top: 5px; color: var(--vscode-descriptionForeground); font-size: 9px; }
@@ -2273,10 +3119,11 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .dynamic-source-controls { margin: 0 0 10px; }
     .dynamic-source-chip { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--sc-border); color: var(--sc-muted); align-self: start; }
     .dynamic-source-chip.zap { border-color: var(--sc-accent, #6c5ce7); color: var(--sc-accent, #6c5ce7); }
+    .dynamic-source-chip.nuclei { border-color: var(--sc-primary); color: var(--sc-primary); }
     .dynamic-source-chip.burp { border-color: var(--sc-medium, #d29922); color: var(--sc-medium, #d29922); }
     .traffic-empty-filter { padding: 14px; color: var(--vscode-descriptionForeground); font-style: italic; }
     @media (max-width: 900px) { .traffic-layout { grid-template-columns: 1fr; } .traffic-preview { position: static; } }
-    @media (max-width: 560px) { .dynamic-page-header, .dynamic-section-head { align-items: stretch; flex-direction: column; } .dynamic-facts { grid-template-columns: 1fr; } .dynamic-finding-row { grid-template-columns: auto minmax(0,1fr); } .dynamic-finding-row > .triage-badge, .dynamic-finding-row > button { grid-column: 2; justify-self: start; } .settings-row { grid-template-columns: 1fr; gap: 3px; } .traffic-controls input { min-width: 100%; } }
+    @media (max-width: 560px) { .dynamic-page-header, .dynamic-section-head { align-items: stretch; flex-direction: column; } .dynamic-workflow { grid-template-columns: 1fr; } .dynamic-workflow i { display: none; } .tool-card-head { grid-template-columns: auto minmax(0,1fr); } .tool-status { grid-column: 2; justify-self: start; } .dynamic-facts, .zap-phase-strip { grid-template-columns: 1fr; } .dynamic-finding-row { grid-template-columns: auto minmax(0,1fr); } .dynamic-finding-row > .dynamic-severity, .dynamic-finding-row > .triage-badge, .dynamic-finding-row > button { grid-column: 2; justify-self: start; } .settings-row { grid-template-columns: 1fr; gap: 3px; } .traffic-controls input { min-width: 100%; } }
     @media (min-width: 760px) { .dynamic-status-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
     .overview-pages { display: grid; gap: 9px; margin: 14px 0; }
     .overview-link { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 12px; border: 1px solid var(--vscode-widget-border); border-radius: 9px; background: color-mix(in srgb, var(--vscode-editor-inactiveSelectionBackground) 48%, transparent); }
@@ -2407,6 +3254,16 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       r: 4;
       cursor: pointer;
       transition: r 0.1s ease, fill 0.1s ease, stroke-width 0.1s ease;
+    }
+    .activity-chart .chart-dot.chart-dot-noncomparable {
+      fill: transparent;
+      stroke: var(--vscode-descriptionForeground, #8b949e);
+      stroke-width: 1.5;
+      stroke-dasharray: 3, 2;
+    }
+    .activity-chart .chart-grid-line.noncomparable {
+      stroke-dasharray: 3, 3;
+      opacity: 0.5;
     }
     .activity-chart .chart-dot:hover {
       r: 6;
@@ -2782,6 +3639,12 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     body.surface-full .security-center-hero::before { content: ''; position: absolute; inset: 12px auto auto 16px; width: 230px; height: 230px; border: 1px solid color-mix(in srgb, var(--sc-primary) 12%, transparent); border-radius: 40px; opacity: .28; transform: rotate(12deg); pointer-events: none; }
     body.surface-full .security-center-hero::after { content: ''; position: absolute; left: 4%; right: 44%; bottom: 18px; height: 86px; opacity: .12; pointer-events: none; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--sc-primary) 42%, transparent), transparent), repeating-linear-gradient(90deg, color-mix(in srgb, var(--sc-primary) 26%, transparent) 0 1px, transparent 1px 30px); mask-image: linear-gradient(90deg, transparent, rgb(0 0 0) 18%, rgb(0 0 0) 82%, transparent); }
     .security-hero-motif { position: absolute; inset: 0; pointer-events: none; opacity: .28; overflow: hidden; }
+    /* Filigrane de marque du hero. Un element positionne peint au-dessus du
+       contenu en flux : il est donc explicitement renvoye au fond (z-index 0)
+       et le texte remonte a 1. Sans cela le hibou passerait devant les chiffres. */
+    .hero-brand-watermark { position: absolute; right: clamp(18px, 2.2vw, 38px); bottom: clamp(10px, 1.4vw, 24px); z-index: 0; width: clamp(150px, 15vw, 230px); height: auto; opacity: .06; pointer-events: none; user-select: none; }
+    body.theme-dark .hero-brand-watermark { opacity: .09; }
+    .security-hero-copy, .security-hero-metrics { position: relative; z-index: 1; }
     .security-hero-motif svg { position: absolute; left: 74px; top: 16px; width: min(39%, 360px); height: auto; color: var(--sc-primary); opacity: .18; }
     .security-hero-motif path { fill: none; stroke: currentColor; stroke-width: 1.15; stroke-linecap: round; stroke-dasharray: 5 13; }
     .security-hero-motif circle { fill: currentColor; fill-opacity: .72; }
@@ -3805,12 +4668,12 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .scanner-filter-bar {
       display: flex;
       flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 16px;
-      padding: 12px;
+      gap: 10px;
+      margin-bottom: 14px;
+      padding: 10px;
       border: 1px solid var(--sc-border);
-      border-radius: 14px;
-      background: var(--sc-surface);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--sc-surface) 92%, var(--sc-primary) 8%);
       box-shadow: var(--sc-shadow-sm);
     }
     .scanner-filter-bar .filter-group {
@@ -3826,11 +4689,12 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     }
     .scanner-filter-bar input, .scanner-filter-bar select {
       flex: 1 1 auto;
-      padding: 6px 10px;
+      min-height: 34px;
+      padding: 7px 10px;
       border: 1px solid var(--vscode-input-border, var(--sc-border));
-      border-radius: 10px;
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--sc-surface) 96%, var(--sc-primary) 4%);
+      color: var(--sc-text);
     }
     .scanner-tabs {
       display: flex;
@@ -3859,12 +4723,12 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .scanner-findings-list {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 8px;
     }
     .scanner-finding-card {
-      border: 1px solid var(--sc-border);
+      border: 1px solid color-mix(in srgb, var(--sc-border) 82%, var(--sc-primary) 18%);
       border-radius: 12px;
-      background: var(--sc-surface);
+      background: color-mix(in srgb, var(--sc-surface) 98%, var(--sc-primary) 2%);
       overflow: hidden;
       transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
     }
@@ -3874,28 +4738,31 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       box-shadow: 0 10px 24px color-mix(in srgb, var(--sc-primary) 10%, transparent);
     }
     .scanner-finding-card.expanded {
-      border-color: color-mix(in srgb, var(--sc-primary) 42%, var(--sc-border));
+      border-color: color-mix(in srgb, var(--sc-primary) 46%, var(--sc-border));
+      box-shadow: 0 12px 28px color-mix(in srgb, var(--sc-primary) 9%, transparent);
     }
     .finding-card-header {
       display: grid;
-      grid-template-columns: auto minmax(180px, 1fr) minmax(120px, .75fr) minmax(130px, .8fr) auto;
+      grid-template-columns: auto minmax(180px, 1.25fr) minmax(150px, .85fr) minmax(150px, .85fr) auto;
       align-items: center;
-      padding: 10px 14px;
+      padding: 9px 12px;
       cursor: pointer;
-      gap: 12px;
+      gap: 10px;
       user-select: none;
       min-width: 0;
     }
     .finding-card-header:hover {
-      background: var(--sc-surface-soft);
+      background: color-mix(in srgb, var(--sc-primary) 5%, var(--sc-surface));
     }
     .finding-card-title {
       min-width: 0;
-      font-weight: 600;
+      font-weight: 750;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       font-size: 13px;
+      line-height: 1.25;
+      color: var(--sc-text);
     }
     .finding-card-meta {
       display: flex;
@@ -3906,19 +4773,24 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     .finding-card-meta small {
       max-width: 100%;
       padding: 3px 7px;
+      border: 1px solid color-mix(in srgb, var(--sc-primary) 18%, var(--sc-border));
       border-radius: 999px;
-      color: var(--sc-muted);
-      background: var(--sc-surface-soft);
+      color: color-mix(in srgb, var(--sc-text) 80%, var(--sc-primary) 20%);
+      background: color-mix(in srgb, var(--sc-surface) 90%, var(--sc-primary) 10%);
       font-size: 9px;
-      font-weight: 700;
+      font-weight: 800;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
     .finding-card-file-line {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
+      padding: 3px 7px;
+      border: 1px solid color-mix(in srgb, var(--sc-border) 78%, var(--sc-primary) 22%);
+      border-radius: 7px;
+      font-size: 10.5px;
+      color: var(--sc-text);
       font-family: var(--vscode-editor-font-family, monospace);
+      background: color-mix(in srgb, var(--sc-surface) 94%, var(--sc-primary) 6%);
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -3936,7 +4808,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       display: none;
       padding: 0;
       border-top: 1px solid var(--sc-border);
-      background: linear-gradient(180deg, color-mix(in srgb, var(--sc-primary) 3%, var(--sc-surface)), var(--sc-surface));
+      background: color-mix(in srgb, var(--sc-surface) 96%, var(--sc-primary) 4%);
     }
     .scanner-finding-card.expanded .finding-card-details {
       display: block;
@@ -3946,41 +4818,44 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     }
     .evidence-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 10px;
-      padding: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 8px;
+      padding: 10px 12px;
     }
     .detail-row {
       min-width: 0;
       margin: 0;
-      padding: 11px 12px;
-      border: 1px solid var(--sc-border);
-      border-radius: 12px;
-      background: color-mix(in srgb, var(--sc-surface) 86%, transparent);
+      padding: 9px 10px;
+      border: 1px solid color-mix(in srgb, var(--sc-border) 76%, var(--sc-primary) 24%);
+      border-radius: 9px;
+      background: color-mix(in srgb, var(--sc-surface) 97%, var(--sc-primary) 3%);
     }
     .detail-row span {
       display: block;
-      font-size: 11px;
+      font-size: 9.5px;
       text-transform: uppercase;
-      color: var(--vscode-descriptionForeground);
-      margin-bottom: 3px;
+      color: var(--sc-muted);
+      margin-bottom: 4px;
       font-weight: 800;
-      letter-spacing: .45px;
+      letter-spacing: .5px;
     }
     .detail-row code, .detail-row pre {
       font-family: var(--vscode-editor-font-family, monospace);
-      background: var(--vscode-textCodeBlock-background, var(--sc-surface-soft));
-      border-radius: 6px;
+      color: var(--sc-text);
+      background: color-mix(in srgb, var(--sc-surface) 90%, var(--sc-primary) 10%);
+      border: 1px solid color-mix(in srgb, var(--sc-border) 70%, var(--sc-primary) 30%);
+      border-radius: 7px;
       overflow-wrap: anywhere;
     }
     .detail-row code {
       display: inline-block;
       max-width: 100%;
-      padding: 3px 6px;
-      font-size: 12px;
+      padding: 4px 7px;
+      font-size: 11.5px;
+      line-height: 1.35;
     }
     .detail-row pre {
-      padding: 8px 12px;
+      padding: 8px 10px;
       overflow-x: auto;
       margin: 4px 0 0;
     }
@@ -3994,9 +4869,11 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       border-left: 3px solid var(--vscode-focusBorder);
     }
     .masked-secret {
-      letter-spacing: 2px;
-      color: var(--vscode-errorForeground, #ff7b72);
-      font-weight: bold;
+      letter-spacing: 1px;
+      color: color-mix(in srgb, var(--sc-critical) 82%, var(--sc-text) 18%);
+      font-weight: 800;
+      background: color-mix(in srgb, var(--sc-critical) 9%, var(--sc-surface));
+      border-color: color-mix(in srgb, var(--sc-critical) 28%, var(--sc-border));
     }
     .dataflow-steps ol {
       margin: 4px 0 0;
@@ -4015,8 +4892,8 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       gap: 8px;
       margin: 0;
       border-top: 1px solid var(--sc-border);
-      padding: 12px 14px;
-      background: color-mix(in srgb, var(--sc-surface) 92%, transparent);
+      padding: 10px 12px;
+      background: color-mix(in srgb, var(--sc-surface) 94%, var(--sc-primary) 6%);
     }
     .scanner-finding-card .finding-card-actions button, .zap-actions-row button {
       min-height: 34px;
@@ -4024,9 +4901,47 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       align-items: center;
       justify-content: center;
       gap: 6px;
-      border-radius: 10px;
+      border-radius: 9px;
+      padding: 7px 12px;
       font-size: 11px;
       font-weight: 800;
+      line-height: 1;
+      width: auto;
+      text-align: center;
+      transition: background .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease, transform .16s ease;
+    }
+    .scanner-finding-card .finding-card-actions .action-open-details {
+      color: #ffffff;
+      background: var(--sc-primary);
+      border-color: var(--sc-primary);
+      box-shadow: 0 6px 14px color-mix(in srgb, var(--sc-primary) 18%, transparent);
+    }
+    .scanner-finding-card .finding-card-actions .action-open-details:hover {
+      background: var(--sc-primary-hover);
+      border-color: var(--sc-primary-hover);
+      transform: translateY(-1px);
+    }
+    .scanner-finding-card .finding-card-actions .action-open-file {
+      color: var(--sc-primary);
+      background: var(--sc-surface);
+      border-color: color-mix(in srgb, var(--sc-primary) 36%, var(--sc-border));
+    }
+    .scanner-finding-card .finding-card-actions .action-open-file:hover {
+      color: var(--sc-primary-hover);
+      background: var(--sc-primary-soft);
+      border-color: color-mix(in srgb, var(--sc-primary) 58%, var(--sc-border));
+      transform: translateY(-1px);
+    }
+    .scanner-finding-card .finding-card-actions .action-apply-fix {
+      color: var(--sc-success);
+      background: color-mix(in srgb, var(--sc-success) 10%, var(--sc-surface));
+      border-color: color-mix(in srgb, var(--sc-success) 34%, var(--sc-border));
+      box-shadow: none;
+    }
+    .scanner-finding-card .finding-card-actions .action-apply-fix:hover {
+      background: color-mix(in srgb, var(--sc-success) 15%, var(--sc-surface));
+      border-color: color-mix(in srgb, var(--sc-success) 52%, var(--sc-border));
+      transform: translateY(-1px);
     }
     .zap-actions-row {
       border-top: none;
@@ -4036,13 +4951,14 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     }
     .severity-badge {
       display: inline-block;
-      padding: 2px 6px;
-      font-size: 10px;
-      font-weight: bold;
+      padding: 3px 8px;
+      font-size: 9.5px;
+      font-weight: 850;
       text-transform: uppercase;
-      border-radius: 4px;
+      border-radius: 999px;
       text-align: center;
-      min-width: 60px;
+      min-width: 58px;
+      letter-spacing: .35px;
     }
     .severity-badge.error {
       background: #cf222e;
@@ -4100,9 +5016,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     }
   </style>
 </head>
-<body class="surface-${escapeHtml(surface)}${inShell ? ' sc-shelled' : ''}${zapPreflightModal ? ' sc-modal-open' : ''} theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
+<body class="surface-${escapeHtml(surface)}${inShell ? ' sc-shelled' : ''}${zapPreflightModal || zapAccountModal ? ' sc-modal-open' : ''} theme-${selectedTheme === 'dark' ? 'dark' : 'light'}">
   ${fullShellOpen}
   ${headerBar}
+  ${projectFirstUse}
   ${surface === 'history' ? '<div class="history-readonly"><strong>Scan historique — lecture seule</strong><br>Cette vue indépendante ne remplace pas le scan actuellement affiché.</div>' : ''}
   <div class="operational-banner ${operationalState}"><span class="operational-icon">${operationalState === 'danger' ? '!' : operationalState === 'success' ? '✓' : 'i'}</span><div class="operational-copy"><strong>${escapeHtml(operationalTitle)}</strong><span>${escapeHtml(operationalDetails)}</span></div></div>
   ${failureDiagnostics}
@@ -4171,21 +5088,120 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
   <h3>Suivi de correction</h3>${renderMetricRows(model.byStatus, 'Aucun statut')}
   <h3>Corrélations multi-outils</h3>${correlationRows}</section>
   <section class="page-dynamic">
-    <section class="dynamic-section dynamic-target"><div class="dynamic-section-head"><h2>Cible</h2><span class="target-state ${escapeHtml(targetState)}">${escapeHtml(targetStatus)}</span></div><div class="dynamic-status-copy"><strong>${escapeHtml(targetOrigin || 'Aucune cible configurée')}</strong>${targetState === 'unreachable' ? '<span>Démarrez l’application avant de lancer une analyse dynamique.</span>' : targetState === 'unknown' && targetOrigin ? '<span>La cible n’a pas encore été vérifiée.</span>' : targetEvidenceLabel ? `<span>${escapeHtml(targetEvidenceLabel)}</span>` : ''}</div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.checkDynamicTarget" ${targetOrigin ? '' : 'disabled'}>Vérifier</button><button class="secondary" data-command="securityCenter.changeDynamicTarget">Modifier la cible</button></div></section>
-    <div class="dynamic-status-grid">
-      <section class="dynamic-section"><div class="dynamic-section-head"><h2>ZAP</h2><span class="status ${escapeHtml(zapScanner?.status || 'pending')}">${escapeHtml(zapState)}</span></div><p class="dynamic-purpose">Analyse dynamique automatisée</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Dernière analyse</span><strong>${zapScanner ? escapeHtml(zapState) : 'Jamais exécutée'}</strong></div><div class="dynamic-fact"><span>URL testées</span><strong>${zapTestedUrls || 'Non disponible'}</strong></div><div class="dynamic-fact"><span>Findings ZAP</span><strong>${zapFindingCount}</strong></div><div class="dynamic-fact"><span>Durée</span><strong>${zapScanner?.durationMs ? escapeHtml(formatDuration(zapScanner.durationMs)) : 'Non disponible'}</strong></div></div>${zapScanner?.error ? `<div class="dynamic-status-copy" role="alert"><span>${escapeHtml(summarizeScannerError(zapScanner.error))}</span></div>` : ''}<div class="dynamic-actions">${zapAuthenticationFailed ? '<button class="primary" data-command="securityCenter.configureZapCredentials">Configurer le compte ZAP</button><button class="quiet-action" data-command="securityCenter.configureZap">Paramètres ZAP</button>' : zapScanner?.status === 'failed' ? '<button class="primary" data-command="securityCenter.configureZap">Configurer ZAP</button>' : `<button class="primary" data-command="securityCenter.scanZap" ${zapScanner?.status === 'running' ? 'disabled aria-busy="true"' : ''}>${zapScanner?.status === 'running' ? 'Analyse ZAP en cours…' : 'Lancer ZAP'}</button>`}<button class="quiet-action anchor-action" data-target="dynamic-findings" data-dynamic-filter-target="zap">Voir les findings ZAP</button></div></section>
-      <section class="dynamic-section"><div class="dynamic-section-head"><h2>Burp</h2><span class="burp-connection ${model.burpConnected ? 'connected' : 'disconnected'}">${model.burpConnected ? '● Connecté' : '○ Déconnecté'}</span></div><p class="dynamic-purpose">Capture et investigation du trafic HTTP</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Connexion actuelle</span><strong>${model.burpConnected ? 'Connectée' : 'Déconnectée'}</strong></div></div><p class="dynamic-purpose">Historique capturé — conservé indépendamment de la connexion</p><div class="dynamic-facts"><div class="dynamic-fact"><span>Requêtes conservées</span><strong>${burpScenarios.length}</strong></div><div class="dynamic-fact"><span>Endpoints uniques</span><strong>${burpUniqueEndpoints || 'Aucun'}</strong></div><div class="dynamic-fact"><span>Findings liés</span><strong>${burpLinkedFindings}</strong></div></div><div class="dynamic-actions"><button class="secondary" data-command="securityCenter.openBurpSettingsPage">Paramètres</button></div></section>
-    </div>
-    <section id="dynamic-findings" class="dynamic-section"><div class="dynamic-section-head"><h2>Findings dynamiques</h2><span><strong id="dynamic-visible-count">${dynamicFindings.length}</strong> prioritaire(s) · ZAP ${dynamicZapCount} · Burp ${dynamicBurpCount}</span></div>
-      <div class="traffic-controls dynamic-source-controls"><button class="traffic-filter active" data-dynamic-filter="all">Tous</button><button class="traffic-filter" data-dynamic-filter="zap">ZAP</button><button class="traffic-filter" data-dynamic-filter="burp">Burp</button></div>
+    <section class="dynamic-section dynamic-target"><div class="dynamic-section-head"><div><span class="dynamic-kicker">Target</span><h2>Cible</h2></div><span class="target-state ${escapeHtml(targetState)}">${escapeHtml(targetStatus)}</span></div>
+      <div class="target-mode-switch" aria-label="Mode de cible"><button type="button" class="${targetRemote ? '' : 'selected'}" data-dynamic-target-mode="local" aria-pressed="${targetRemote ? 'false' : 'true'}">Local</button><button type="button" class="${targetRemote ? 'selected' : ''}" data-dynamic-target-mode="remote" aria-pressed="${targetRemote ? 'true' : 'false'}">Remote environment</button></div>
+      <label class="target-url-field"><span>Application URL</span><input id="dynamic-target-url" type="text" value="${escapeHtml(targetUrl || '')}" placeholder="Aucune cible configurée"></label>
+      <div class="target-summary">
+        <div class="target-connectivity ${escapeHtml(targetState)}"><span>Connectivity</span><strong>${escapeHtml(targetStatus)}</strong>${targetEvidenceLabel ? `<small>${escapeHtml(targetEvidenceLabel)}</small>` : targetState === 'unknown' && targetOrigin ? '<small>La cible n’a pas encore été vérifiée.</small>' : targetState === 'unreachable' ? '<small>Démarrez l’application avant de lancer une analyse dynamique.</small>' : ''}</div>
+        <div class="target-scope ${targetRemote && !model.dynamicTargetRemoteAuthorized ? 'blocked' : ''}"><span>Scope</span><strong>${escapeHtml(targetModeLabel)}</strong>${targetAuthorizedLabel ? `<small>${escapeHtml(targetAuthorizedLabel)}</small>` : '<small>Local targets are allowed by default.</small>'}</div>
+      </div>
+      <div class="dynamic-actions"><button class="secondary" data-command="securityCenter.checkDynamicTarget" ${targetOrigin ? '' : 'disabled'}>Test target</button><button class="secondary" data-dynamic-target-action="save" data-dynamic-target-command="securityCenter.changeDynamicTarget">Save / Change</button></div></section>
+    <section class="dynamic-workflow" aria-label="Dynamic Security workflow"><span>Target</span><i></i><span>Automated testing</span><i></i><span>Findings / traffic</span><i></i><span>Investigation</span></section>
+    <section class="dynamic-section automated-testing"><div class="dynamic-section-head"><div><span class="dynamic-kicker">Automated security testing</span><h2>Automated Security Testing</h2></div><span>ZAP ${escapeHtml(scannerStatusLabel(zapScanner?.status || 'pending'))} · Nuclei ${escapeHtml(nucleiStatusLabel)}</span></div>
+      <div class="dynamic-status-grid">
+        <article class="dynamic-tool-card zap ${escapeHtml(zapScanner?.status || 'idle')}">
+          <div class="tool-card-head">${renderDynamicToolLogoHtml('ZAP', assets)}<div><div class="sr-only"><h2>ZAP</h2></div><h2>OWASP ZAP</h2><p>Automated application security testing</p><span class="sr-only">Analyse dynamique automatisée</span><small>Crawls and dynamically analyzes application behavior.</small></div><span class="tool-status ${escapeHtml(engineStatusClass(zapRuntime, zapScanner?.status || 'pending'))}">${escapeHtml(engineStatusLabel(zapRuntime, scannerStatusLabel(zapScanner?.status || 'pending')))}</span></div>
+          <div class="tool-facts">
+            <div><span>Engine</span><strong>${escapeHtml(zapEngineResolved || 'Automatic')}</strong><small>${escapeHtml(zapEngineDetail || 'Local ZAP or Docker')}</small></div>
+            <div><span>Scan mode</span><strong>${escapeHtml(zapMode)}</strong><small>${escapeHtml(zapAuth)}</small></div>
+            <div class="fact-wide zap-test-account ${zapAccountConfigured ? 'configured' : ''}"><span>Test account</span><strong>${escapeHtml(zapAccountLabel)}</strong>${zapAccountDetail ? `<small>${escapeHtml(zapAccountDetail)}</small>` : ''}</div>
+            <div class="fact-wide"><span>Target</span><strong>${escapeHtml(targetOrigin || 'Not configured')}</strong></div>
+            <div><span>Last scan</span><strong>${escapeHtml(zapLastScan || 'Never')}</strong>${zapDuration ? `<small>${escapeHtml(zapDuration)}</small>` : ''}</div>
+            <div><span>Findings ZAP</span><strong>${zapCurrentCount === null ? escapeHtml(zapFindingCount) : escapeHtml(zapCurrentCount)}</strong><small>${escapeHtml(zapScanner?.status === 'completed' ? 'current run' : 'known ZAP findings')}</small></div>
+          </div>
+          ${zapScanner?.status === 'running' || zapScanner?.status === 'refreshing' ? `<div class="zap-phase-strip"><span>Spidering</span><span>Passive analysis</span><span>${effectiveZapMode === 'active' ? 'Active scanning' : 'Active scanning optional'}</span><span>Collecting results</span></div>` : ''}
+          ${engineNoteHtml(zapRuntime)}${zapDetails ? `<p class="tool-note${zapNoteIsError ? ' error' : ''}${zapAuthFailureHistorical ? ' historical' : ''}" ${zapNoteIsError ? 'role="alert"' : ''}>${escapeHtml(zapDetails)}</p>` : ''}
+          <div class="dynamic-actions">${zapEngineUnusable ? '<button class="primary" data-command="securityCenter.configureZap">Configurer ZAP</button>' : zapAuthenticationFailed ? `<button class="primary" data-command="securityCenter.configureZapCredentials">${zapAccountConfigured ? 'Modifier le compte ZAP' : 'Configurer le compte ZAP'}</button><button class="quiet-action" data-command="securityCenter.configureZap">Paramètres ZAP</button>` : `<button class="primary" data-command="securityCenter.scanZap" aria-label="Lancer ZAP" ${zapScanRunning ? 'disabled aria-busy="true"' : ''}>${zapScanActionLabel}</button>${zapAuthFailureHistorical ? '<button class="secondary" data-command="securityCenter.configureZapCredentials">Modifier le compte ZAP</button>' : ''}`}${zapRunInterruptible ? '<button class="secondary danger" data-command="securityCenter.stopZapScan">Arrêter l’analyse ZAP</button>' : ''}<button class="secondary" data-command="securityCenter.configureZap">Configuration</button><button class="quiet-action" data-command="securityCenter.openZapFindings">Voir les findings ZAP</button></div>
+          ${zapComparisonHtml}
+          ${renderZapExecutionDetails(model.zapExecution)}
+          <details class="dynamic-advanced"><summary>Advanced</summary><div class="settings-list"><div class="settings-row"><span>Engine preference</span><strong>Automatic</strong></div><div class="settings-row"><span>Technical configuration</span><strong>Managed in ZAP configuration</strong></div></div></details>
+        </article>
+        <article class="dynamic-tool-card nuclei ${escapeHtml(nucleiStatusValue)}">
+          <div class="tool-card-head">${renderDynamicToolLogoHtml('Nuclei', assets)}<div><h2>Nuclei</h2><p>Template-based security checks</p><small>Runs targeted security checks from verified templates.</small></div><span class="tool-status ${escapeHtml(engineStatusClass(nucleiChip, nucleiStatusValue))}">${escapeHtml(engineStatusLabel(nucleiChip, nucleiStatusLabel))}</span></div>
+          <div class="tool-facts">
+            <div><span>Version</span><strong>${escapeHtml(nucleiVersion || 'Not reported')}</strong></div>
+            <div><span>Templates</span><strong>${escapeHtml(nucleiTemplates || (nucleiInstalled || nucleiScanner ? 'Managed official templates' : 'Install with Nuclei'))}</strong>${nucleiTool?.templatesCount ? `<small>${escapeHtml(nucleiTool.templatesCount)} templates</small>` : ''}</div>
+            <div class="fact-wide"><span>Target</span><strong>${escapeHtml(targetOrigin || 'Not configured')}</strong></div>
+            <div><span>Last scan</span><strong>${escapeHtml(nucleiLastScan || 'Never')}</strong>${nucleiDuration ? `<small>${escapeHtml(nucleiDuration)}</small>` : ''}</div>
+            <div><span>Findings</span><strong>${nucleiCurrentCount === null ? escapeHtml(nucleiFindingCount) : escapeHtml(nucleiCurrentCount)}</strong><small>${escapeHtml(nucleiScanner?.status === 'completed' ? 'current run' : 'known Nuclei findings')}</small></div>
+          </div>
+          ${nucleiCardNote}
+          <div class="dynamic-actions">${nucleiInstalled || nucleiScanner ? `<button class="primary" data-command="securityCenter.scanNuclei" ${nucleiRunning ? 'disabled aria-busy="true"' : ''}>${nucleiRunning ? 'Nuclei running…' : 'Run Nuclei scan'}</button>` : '<button class="primary" data-command="securityCenter.openScannerSetup">Install Nuclei</button>'}<button class="secondary" data-command="securityCenter.openScannerSetup">Configuration</button><button class="quiet-action" data-command="securityCenter.openNucleiFindings">Voir les findings Nuclei</button></div>
+        </article>
+      </div>
+    </section>
+    <section class="dynamic-section traffic-investigation"><div class="dynamic-section-head"><div><span class="dynamic-kicker">HTTP traffic investigation</span><h2>Capture du trafic HTTP</h2></div><span>${trafficSummary.totalRequests} requête(s) · ${trafficSummary.uniqueEndpoints} endpoint(s)</span></div>
+      <div class="dynamic-status-grid">
+        <article class="dynamic-tool-card mitmproxy ${escapeHtml(mitmStateValue.toLowerCase())}">
+          <div class="tool-card-head">${renderDynamicToolLogoHtml('mitmproxy', assets)}<div><h2>mitmproxy</h2><p>Capture managée et headless</p><small>Security Center installe et pilote le proxy ; aucune interface à ouvrir.</small></div><span class="tool-status ${escapeHtml(engineStatusClass(mitmRuntime, mitmStateValue.toLowerCase()))}">${escapeHtml(engineStatusLabel(mitmRuntime, mitmStateLabel))}</span></div>
+          <div class="tool-facts">
+            <div><span>Version</span><strong>${escapeHtml(mitmModel.version || 'Non installé')}</strong></div>
+            <div><span>Requêtes capturées</span><strong>${mitmCapturedCount}</strong><small>${
+              // Une capture démarrée qui n'a encore rien vu n'est pas un échec :
+              // elle attend que du trafic la traverse, et le dit.
+              mitmCapturing && mitmCapturedCount === 0
+                ? 'En attente de trafic…'
+                : mitmRunCount !== null
+                  // Pendant une capture, le compte est celui de cette session ;
+                  // l'historique complet reste lisible à côté.
+                  ? `${mitmEndpoints} endpoint(s) · ${mitmScenarios.length} au total`
+                  : `${mitmEndpoints} endpoint(s)`
+            }</small></div>
+            <div class="fact-wide"><span>Cible</span><strong>${escapeHtml(mitmTarget || 'Non configurée')}</strong></div>
+            <div class="fact-wide"><span>Proxy</span><strong>${escapeHtml(mitmModel.proxyUrl || 'Non démarré')}</strong>${mitmModel.proxyUrl ? '<small>Ouvrez un navigateur de capture, ou pointez votre client sur cette adresse.</small>' : ''}</div>
+            <div class="fact-wide"><span>Interception HTTPS</span><strong>${escapeHtml(mitmHttpsLabel)}</strong><small>La capture HTTP fonctionne sans aucun certificat.</small></div>
+            <div><span>Dernière activité</span><strong>${escapeHtml(mitmLastActivity)}</strong></div>
+          </div>
+          ${mitmModel.error ? `<p class="tool-note error" role="alert">${escapeHtml(mitmModel.error)}</p>` : engineNoteHtml(mitmRuntime)}
+          <div class="dynamic-actions">${mitmStateValue === 'NOT_INSTALLED'
+            ? '<button class="primary" data-command="securityCenter.installMitmproxy">Installer mitmproxy</button>'
+            : mitmStateValue === 'CAPTURING' || mitmStateValue === 'STARTING'
+              ? '<button class="primary" data-command="securityCenter.stopMitmproxyCapture">Arrêter la capture</button>'
+              : '<button class="primary" data-command="securityCenter.startMitmproxyCapture">Démarrer la capture</button>'}${
+            // Un navigateur de capture isolé évite toute ligne de commande, et
+            // laisse le navigateur habituel de l'utilisateur intact.
+            mitmStateValue === 'CAPTURING' ? '<button class="secondary" data-command="securityCenter.openMitmproxyBrowser">Ouvrir un navigateur de capture</button>' : ''
+          }<button class="secondary" data-command="securityCenter.refreshHttpTraffic">Actualiser</button><button class="quiet-action anchor-action" data-target="http-traffic">Voir le trafic</button></div>
+        </article>
+        <article class="dynamic-tool-card burp ${model.burpConnected ? 'connected' : 'disconnected'}">
+          <div class="tool-card-head">${renderDynamicToolLogoHtml('Burp', assets)}<div><h2>Burp Suite</h2><p>Connecteur de trafic externe</p><small>Chargez le connecteur SCenter dans Burp pour y verser son trafic.</small></div><span class="tool-status ${escapeHtml(engineStatusClass(burpRuntime, model.burpConnected ? 'completed' : 'idle'))}">${escapeHtml(burpRuntime?.status === 'RUNNING' ? 'CONNECTÉ' : engineStatusLabel(burpRuntime, model.burpConnected ? 'CONNECTÉ' : 'DÉCONNECTÉ'))}</span></div>
+          <div class="tool-facts">
+            <div><span>Requêtes capturées</span><strong>${burpScenarios.length}</strong></div>
+            <div><span>Endpoints uniques</span><strong>${burpUniqueEndpoints || 0}</strong></div>
+            <div><span>Findings liés</span><strong>${burpLinkedFindings}</strong></div>
+            <div><span>Dernière activité</span><strong>${escapeHtml(burpLastSeen)}</strong></div>
+          </div>
+          ${engineNoteHtml(burpRuntime)}
+          <p class="sr-only">Capture et investigation du trafic HTTP</p>
+          <div class="sr-only"><span>Connexion actuelle</span><strong>${model.burpConnected ? 'Connectée' : 'Déconnectée'}</strong><span>Historique capturé</span><span>Requêtes conservées</span><strong>${burpScenarios.length}</strong><span>Endpoints uniques</span><strong>${burpUniqueEndpoints || 'Aucun'}</strong></div>
+          <div class="dynamic-actions"><button class="primary" data-command="securityCenter.openBurpSettingsPage" aria-label="Connect / Configure Burp">Configurer / Connecter</button><button class="secondary" data-command="securityCenter.importHttpCapture">Importer un HAR</button><button class="quiet-action anchor-action" data-target="http-traffic">Voir le trafic</button></div>
+        </article>
+      </div></section>
+    <section id="dynamic-findings" class="dynamic-section"><div class="dynamic-section-head"><div><span class="dynamic-kicker">Findings prioritaires</span><h2>Dynamic Findings</h2><p class="dynamic-priority-note">Findings prioritaires HIGH / CRITICAL. Les autres sévérités restent visibles dans la page Findings.</p><span class="sr-only">Findings dynamiques prioritaires HIGH ou CRITICAL</span></div><span><strong id="dynamic-visible-count">${dynamicFindings.length}</strong> HIGH/CRITICAL · ZAP ${dynamicZapCount}/${dynamicZapTotal} · Nuclei ${dynamicNucleiCount}/${dynamicNucleiTotal} · Burp ${dynamicBurpCount}<span class="sr-only">ZAP ${dynamicZapCount} · Burp ${dynamicBurpCount}</span></span></div>
+      <div class="traffic-controls dynamic-source-controls"><button class="traffic-filter active" data-dynamic-filter="all">All</button><button class="traffic-filter" data-dynamic-filter="zap">ZAP</button><button class="traffic-filter" data-dynamic-filter="nuclei">Nuclei</button><button class="traffic-filter" data-dynamic-filter="burp">Burp-linked</button></div>
       <div class="dynamic-list">${dynamicFindingRows}</div>
       <div id="dynamic-findings-empty" class="traffic-empty-filter" hidden>Aucun finding dynamique pour cette source.</div>
       <div class="dynamic-actions"><button class="quiet-action" data-command="securityCenter.openFindingsPage">Voir tous les findings dynamiques →</button></div></section>
-    <section id="http-traffic" class="dynamic-section dynamic-traffic"><div class="dynamic-section-head"><h2>Trafic HTTP</h2><span><strong id="visible-traffic">${trafficScenarios.length}</strong> / ${model.httpScenarios.length} requête(s)</span></div>
-      <div class="traffic-controls"><input id="traffic-search" type="search" placeholder="Rechercher un endpoint ou chemin…" aria-label="Rechercher dans le trafic HTTP"><button class="traffic-filter active" data-traffic-filter="all">Toutes</button><button class="traffic-filter" data-traffic-filter="GET">GET</button><button class="traffic-filter" data-traffic-filter="POST">POST</button><button class="traffic-filter" data-traffic-filter="authenticated">Authentifiées</button><button class="traffic-filter" data-traffic-filter="findings">Avec findings</button></div>
-      <div class="traffic-layout"><div class="traffic-scroll"><div class="traffic-table"><div class="traffic-head"><span>Méthode</span><span>Endpoint</span><span>Statut</span><span>Source</span><span>Findings</span><span>Horodatage</span></div>${trafficRows}<div id="traffic-empty-filter" class="traffic-empty-filter" hidden>Aucune requête ne correspond aux filtres.</div></div></div><aside class="traffic-preview" aria-live="polite" aria-busy="false"><h3>Détails de la requête</h3><div id="traffic-preview-content"><strong>Sélectionnez une requête</strong><span>Les détails assainis seront chargés à la demande.</span></div></aside></div>
+    <section id="http-traffic" class="dynamic-section dynamic-traffic"><div class="dynamic-section-head"><div><span class="dynamic-kicker">Investigation</span><h2>HTTP Traffic</h2><span class="sr-only">Trafic HTTP</span></div><span><strong id="visible-traffic">${trafficScenarios.length}</strong> / ${model.httpScenarios.length} requête(s)</span></div>
+      <div class="traffic-summary">
+        <div><span>Requêtes</span><strong>${trafficSummary.totalRequests}</strong></div>
+        <div><span>Endpoints</span><strong>${trafficSummary.uniqueEndpoints}</strong></div>
+        <div><span>Hôtes</span><strong>${trafficSummary.uniqueHosts}</strong></div>
+        <div><span>Authentifiées</span><strong>${trafficSummary.authenticatedRequests}</strong></div>
+        <div><span>Findings liés</span><strong>${trafficSummary.linkedFindings}</strong></div>
+      </div>
+      <div class="traffic-controls"><input id="traffic-search" type="search" placeholder="Rechercher un hôte, un endpoint ou un chemin…" aria-label="Rechercher dans le trafic HTTP"><button class="traffic-filter active" data-traffic-filter="all">Toutes</button><button class="traffic-filter" data-traffic-filter="GET">GET</button><button class="traffic-filter" data-traffic-filter="POST">POST</button><button class="traffic-filter" data-traffic-filter="authenticated">Authentifiées</button><button class="traffic-filter" data-traffic-filter="findings">Avec findings</button>${
+        // Un filtre de source n'apparaît que si cette source a réellement capturé
+        // quelque chose : proposer « mitmproxy » sur un historique sans mitmproxy
+        // serait un bouton qui ne filtre rien.
+        Object.entries({ mitmproxy: 'mitmproxy', burp: 'Burp', har: 'HAR' })
+          .filter(([source]) => Number(trafficSourceCounts[source] || 0) > 0)
+          .map(([source, label]) => `<button class="traffic-filter" data-traffic-filter="source:${escapeHtml(source)}">${escapeHtml(label)}</button>`)
+          .join('')
+      }</div>
+      <div class="traffic-layout"><div class="traffic-scroll"><div class="traffic-table"><div class="traffic-head"><span>Méthode</span><span>Hôte / endpoint</span><span>Statut</span><span>Auth</span><span>Source</span><span>Findings</span><span>Durée</span><span>Horodatage</span></div>${trafficRows}<div id="traffic-empty-filter" class="traffic-empty-filter" hidden>Aucune requête ne correspond aux filtres.</div></div></div><aside class="traffic-preview" aria-live="polite" aria-busy="false"><h3>Détails de la requête</h3><div id="traffic-preview-content"><strong>Sélectionnez une requête</strong><span>Les détails assainis seront chargés à la demande.</span></div></aside></div>
     </section>
-    <section class="dynamic-section"><div class="dynamic-section-head"><h2>Tests dynamiques récents</h2><span>${model.httpScenarios.length} scénario(s)</span></div><div class="dynamic-list">${recentDynamicRows}</div></section>
+    <section class="dynamic-section"><div class="dynamic-section-head"><h2>Tests dynamiques récents</h2><span>${model.httpScenarios.length} scénario(s)</span></div><span class="sr-only">Recent Dynamic Tests</span><div class="dynamic-list">${recentDynamicRows}</div></section>
   </section>
   <section class="page-burp-settings">
     <section class="dynamic-section"><div class="dynamic-section-head"><h2>Connecteur</h2><span class="burp-connection ${model.burpConnected ? 'connected' : 'disconnected'}">${model.burpConnected ? '● Connecté' : '○ Déconnecté'}</span></div><div class="settings-list">
@@ -4215,6 +5231,22 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     // leve, et interrompt TOUT le reste du script : le garde-fou ZAP perdait
     // ainsi ses deux boutons.
     const vscode = window.__scShellApi || (window.__scShellApi = acquireVsCodeApi());
+    // « Détails d’exécution » est rendu replié, et chaque progression ZAP
+    // redessine la page : le repli se refermait sous les yeux de l’utilisateur.
+    // Son état ouvert est gardé dans l’état du webview — qui survit au rendu —
+    // et réappliqué à chaque document. Le sondage n’est ni arrêté ni ralenti.
+    // La comparaison passif / actif, repliée par défaut, suit la même règle.
+    (() => {
+      const readState = () => (typeof vscode.getState === 'function' && vscode.getState()) || {};
+      [['details.zap-execution-details', 'zapExecutionDetailsOpen'], ['details.zap-mode-comparison', 'zapModeComparisonOpen']].forEach(([selector, key]) => {
+        document.querySelectorAll(selector).forEach((details) => {
+          if (readState()[key] === true) details.open = true;
+          details.addEventListener('toggle', () => {
+            if (typeof vscode.setState === 'function') vscode.setState({ ...readState(), [key]: details.open });
+          });
+        });
+      });
+    })();
     const themeToggle = document.getElementById('theme-toggle');
     const scanChrono = document.getElementById('scan-chrono');
     if (scanChrono) {
@@ -4251,6 +5283,26 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     // le meme clic parte deux fois.
     document.querySelectorAll('[data-command]:not(.sc-assistant [data-command])').forEach((button) => {
       button.addEventListener('click', () => vscode.postMessage({ type: 'command', command: button.dataset.command }));
+    });
+    const dynamicTargetUrl = document.getElementById('dynamic-target-url');
+    const dynamicTargetModeButtons = [...document.querySelectorAll('[data-dynamic-target-mode]')];
+    const selectedDynamicTargetMode = () => document.querySelector('[data-dynamic-target-mode].selected')?.dataset.dynamicTargetMode || 'local';
+    const selectDynamicTargetMode = (mode) => {
+      dynamicTargetModeButtons.forEach((button) => {
+        const selected = button.dataset.dynamicTargetMode === mode;
+        button.classList.toggle('selected', selected);
+        button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+      });
+    };
+    dynamicTargetModeButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const mode = button.dataset.dynamicTargetMode === 'remote' ? 'remote' : 'local';
+        selectDynamicTargetMode(mode);
+        vscode.postMessage({ type: 'dynamicTargetMode', mode, targetUrl: dynamicTargetUrl?.value || '' });
+      });
+    });
+    document.querySelector('[data-dynamic-target-action="save"]')?.addEventListener('click', () => {
+      vscode.postMessage({ type: 'dynamicTargetSave', mode: selectedDynamicTargetMode(), targetUrl: dynamicTargetUrl?.value || '' });
     });
     const zapPreflight = document.querySelector('[data-zap-preflight-id]');
     if (zapPreflight) {
@@ -4289,6 +5341,7 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       const firstDecision = zapPreflight.querySelector('[data-zap-preflight-decision="passive"]');
       firstDecision?.focus?.();
     }
+    ${zapAccountModal ? zapAccountModalScript() : ''}
     ${assistantCard ? assistantCardScript() : ''}
     ${model.dynamicWorkspace ? dynamicSectionsScript() : ''}
     document.addEventListener('click', (e) => {
@@ -4407,15 +5460,20 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         const button = event.target.closest('button');
         if (!button) return;
         
-        const findingIndex = button.dataset.findingIndex;
-        if (findingIndex !== undefined) {
+        // Cette surface a son propre attribut : tant que ses boutons portaient
+        // celui des findings, le routeur global les captait AUSSI et « Open code »
+        // partait deux fois — panneau Détails, puis fichier.
+        const findingIndex = button.dataset.scannerFindingIndex;
+        if (findingIndex !== undefined && findingIndex !== '') {
           const idx = Number(findingIndex);
-          if (button.classList.contains('action-open-details')) {
-            vscode.postMessage({ type: 'finding', index: idx });
-          } else if (button.classList.contains('action-open-file')) {
-            vscode.postMessage({ type: 'findingCode', index: idx });
-          } else if (button.classList.contains('action-apply-fix')) {
-            vscode.postMessage({ type: 'applyFindingFix', index: idx });
+          if (Number.isInteger(idx) && idx >= 0) {
+            if (button.classList.contains('action-open-details')) {
+              vscode.postMessage({ type: 'finding', index: idx });
+            } else if (button.classList.contains('action-open-file')) {
+              vscode.postMessage({ type: 'findingCode', index: idx });
+            } else if (button.classList.contains('action-apply-fix')) {
+              vscode.postMessage({ type: 'applyFindingFix', index: idx });
+            }
           }
         }
 
@@ -4453,10 +5511,10 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
       stage.addEventListener('mouseenter', () => placePipelinePopover(stage));
       stage.addEventListener('focusin', () => placePipelinePopover(stage));
     });
-    // Filtre de provenance des findings dynamiques. La carte ZAP l'active pour
-    // que sa destination corresponde exactement au compteur qu'elle affiche :
-    // un bouton « Voir les findings ZAP » qui ouvre l'ensemble ZAP + Burp est
-    // une incoherence entre ce qui est annonce et ce qui est montre.
+    // Filtre de provenance de la section prioritaire. Les boutons des cartes,
+    // eux, ouvrent la page Findings filtree sur leur scanner : cette section ne
+    // montre que les HIGH et CRITICAL, et y envoyer un compteur qui vaut pour
+    // toutes les severites annoncait autre chose que ce qui etait montre.
     const dynamicRows = [...document.querySelectorAll('.dynamic-finding-row')];
     const dynamicFilters = [...document.querySelectorAll('[data-dynamic-filter]')];
     const dynamicVisibleCount = document.getElementById('dynamic-visible-count');
@@ -4475,7 +5533,6 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     dynamicFilters.forEach((button) => button.addEventListener('click', () => applyDynamicFilter(button.dataset.dynamicFilter)));
 
     document.querySelectorAll('.anchor-action').forEach((button) => button.addEventListener('click', () => {
-      if (button.dataset.dynamicFilterTarget) applyDynamicFilter(button.dataset.dynamicFilterTarget);
       document.getElementById(button.dataset.target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }));
     const trafficRows = [...document.querySelectorAll('.traffic-row')];
@@ -4499,7 +5556,9 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         const matchesFilter = activeTrafficFilter === 'all'
           || row.dataset.method === activeTrafficFilter
           || (activeTrafficFilter === 'authenticated' && row.dataset.authenticated === 'true')
-          || (activeTrafficFilter === 'findings' && Number(row.dataset.findings) > 0);
+          || (activeTrafficFilter === 'findings' && Number(row.dataset.findings) > 0)
+          || (activeTrafficFilter.indexOf('source:') === 0
+            && row.dataset.source.toLowerCase() === activeTrafficFilter.slice(7));
         const show = matchesFilter && (!query || row.dataset.search.includes(query));
         row.hidden = !show;
         if (show) count += 1;
@@ -4614,13 +5673,17 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     const clearFindingFilters = document.getElementById('finding-clear-filters');
     const findingFilterChips = document.getElementById('finding-filter-chips');
     const visible = document.getElementById('visible-findings');
+    // Number('') vaut 0 : un index absent visait le premier finding au lieu de
+    // ne rien faire. La chaîne brute est donc testée avant la conversion.
     previewDetails?.addEventListener('click', () => {
-      const index = Number(previewDetails.dataset.findingIndex);
-      if (Number.isInteger(index)) vscode.postMessage({ type: 'finding', index });
+      const raw = previewDetails.dataset.findingIndex;
+      const index = Number(raw);
+      if (raw !== undefined && raw !== '' && Number.isInteger(index) && index >= 0) vscode.postMessage({ type: 'finding', index });
     });
     previewCode?.addEventListener('click', () => {
-      const index = Number(previewCode.dataset.findingCodeIndex);
-      if (Number.isInteger(index)) vscode.postMessage({ type: 'findingCode', index });
+      const raw = previewCode.dataset.findingCodeIndex;
+      const index = Number(raw);
+      if (raw !== undefined && raw !== '' && Number.isInteger(index) && index >= 0) vscode.postMessage({ type: 'findingCode', index });
     });
     const renderFindingFilterChips = () => {
       if (!findingFilterChips) return;
@@ -4667,6 +5730,9 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
     };
     [search, tool, severity, status, contextFilter, reachabilityFilter].forEach((control) => control?.addEventListener('input', filterFindings));
     [tool, severity, status, contextFilter, reachabilityFilter].forEach((control) => control?.addEventListener('change', filterFindings));
+    // Un filtre préréglé à l'ouverture s'applique tout de suite : la liste, le
+    // compteur et la puce doivent dire la même chose que le bouton qui a mené ici.
+    if (tool?.value) filterFindings();
     clearFindingFilters?.addEventListener('click', () => {
       [search, tool, severity, status, contextFilter, reachabilityFilter].forEach((control) => { if (control) control.value = ''; });
       filterFindings();
@@ -4708,7 +5774,12 @@ function renderDashboardHtml(model, nonce, surface = 'full', selectedTheme = 'li
         let x = dotRect.left - wrapperRect.left + dotRect.width / 2;
         let y = dotRect.top - wrapperRect.top;
 
-        tooltip.innerHTML = '<span class="tooltip-timestamp">' + date + '</span>' +
+        const escapeText = (value) => String(value || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+        tooltip.innerHTML = dot.getAttribute('data-noncomparable') === 'true'
+          ? '<span class="tooltip-timestamp">' + escapeText(date) + '</span>' +
+            '<div class="tooltip-row total-row"><span class="tooltip-label">Non comparable — exclu de la courbe</span></div>' +
+            '<div class="tooltip-row"><span class="tooltip-label">' + escapeText(dot.getAttribute('data-reason')) + '</span></div>'
+          : '<span class="tooltip-timestamp">' + date + '</span>' +
           '<div class="tooltip-row total-row">' +
             '<span class="tooltip-label">Total findings</span>' +
             '<strong>' + total + '</strong>' +
@@ -4758,6 +5829,35 @@ const SCANNER_CATEGORIES = Object.freeze({
   Snyk: "Analyse de sécurité multi-facettes (SCA/SAST/IaC)",
   ZAP: "Analyse dynamique automatisée (DAST)"
 });
+
+/** What identifies a finding when its `id` cannot: what the card already shows. */
+function findingLocationKey(finding) {
+  const location = finding?.absolutePath || finding?.file || finding?.endpoint || finding?.target || '';
+  const rule = finding?.ruleId || finding?.cwe || '';
+  if (!location && !rule) return '';
+  return `${finding?.tool || ''}|${rule}|${location}|${Number(finding?.startLine) || 0}`;
+}
+
+/**
+ * Position of a scanner-run finding inside the flat list the actions address.
+ *
+ * The two collections are built at different moments, so a card is not
+ * guaranteed to be an element of `model.findings`. `id` is the primary key; a
+ * finding that never had one — `undefined === undefined` used to match the first
+ * entry and send every card to finding zero — falls back to the location it
+ * reports. Returns -1 only when nothing identifies it, and the caller must then
+ * refuse to build an action rather than emit an index nobody can resolve.
+ */
+function resolveFindingIndex(findings, finding) {
+  const list = Array.isArray(findings) ? findings : [];
+  if (!finding) return -1;
+  if (finding.id) {
+    const byId = list.findIndex((candidate) => candidate.id === finding.id);
+    if (byId >= 0) return byId;
+  }
+  const key = findingLocationKey(finding);
+  return key ? list.findIndex((candidate) => findingLocationKey(candidate) === key) : -1;
+}
 
 function renderScannerDetailsPage(model, selectedTheme, assets = {}) {
   const scannerName = model.activeScanner || '';
@@ -4984,7 +6084,11 @@ function renderScannerDetailsPage(model, selectedTheme, assets = {}) {
 
   html += `<div class="scanner-findings-list">`;
   scannerFindings.forEach((finding, index) => {
-    const overallIndex = model.findings.findIndex(f => f.id === finding.id);
+    const overallIndex = resolveFindingIndex(model.findings, finding);
+    // A card the flat list no longer holds cannot be acted upon. It used to emit
+    // -1, which every consumer accepted and then dropped in silence.
+    const addressable = overallIndex >= 0;
+    const unavailableTitle = 'Ce résultat vient d’une exécution du scanner qui n’est plus dans le rapport courant. Relancez l’analyse pour le rouvrir.';
     const isContainer = finding.target && (finding.target.includes(':') || !finding.target.includes('.') || finding.target.includes('image'));
     const lineLabel = Number.isFinite(Number(finding.startLine)) ? `:${Number(finding.startLine) + 1}` : '';
     const locationLabel = finding.file ? `${finding.file}${lineLabel}` : finding.endpoint || finding.target || 'Unavailable';
@@ -5020,9 +6124,9 @@ function renderScannerDetailsPage(model, selectedTheme, assets = {}) {
           ${renderScannerSpecificDetails(finding, scannerName, model)}
         </div>
         <div class="finding-card-actions">
-          <button class="secondary action-open-file" data-finding-index="${overallIndex}">Open code</button>
-          <button class="secondary action-open-details" data-finding-index="${overallIndex}">View details →</button>
-          ${finding.autofix ? `<button class="primary action-apply-fix" data-finding-index="${overallIndex}">Fix &amp; Verify</button>` : ''}
+          <button class="secondary action-open-file"${addressable ? ` data-scanner-finding-index="${overallIndex}"` : ` disabled title="${escapeHtml(unavailableTitle)}"`}>Open code</button>
+          <button class="secondary action-open-details"${addressable ? ` data-scanner-finding-index="${overallIndex}"` : ` disabled title="${escapeHtml(unavailableTitle)}"`}>View details →</button>
+          ${finding.autofix ? `<button class="primary action-apply-fix"${addressable ? ` data-scanner-finding-index="${overallIndex}"` : ` disabled title="${escapeHtml(unavailableTitle)}"`}>Fix &amp; Verify</button>` : ''}
         </div>
       </div>
     </div>

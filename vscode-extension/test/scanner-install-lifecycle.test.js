@@ -128,7 +128,7 @@ test('installation : un signal deja annule n envoie aucune requete', async (t) =
 
 test('installation : le telechargeur accepte signal, delai et detection de blocage', () => {
   const source = src('scanner-tool-manager.js');
-  assert.match(source, /async function download\(url, destination, onProgress = \(\) => \{\}, \{ signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS, stallTimeoutMs = DEFAULT_STALL_MS \} = \{\}\)/);
+  assert.match(source, /async function download\(url, destination, onProgress = \(\) => \{\}, \{ signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS, stallTimeoutMs = DEFAULT_STALL_MS, progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS \} = \{\}\)/);
   // La requete a desormais un delai de socket ET un abandon : c'est l'absence
   // des deux qui rendait le blocage eternel.
   assert.match(source, /active\.setTimeout\(timeoutMs/);

@@ -641,6 +641,13 @@ function renderPolicyTab(model) {
         </div>` : ''}
       </section>`;
 
+  // Gate and legacy thresholds in the same file: the page says which one decides.
+  // Nothing is removed from the file; the legacy rules are simply not applied.
+  const legacy = !config.error && config.legacyNotice
+    ? `<section class="banner warn" data-policy-legacy><strong>Règles legacy ignorées par le Policy Gate</strong><p>${escapeHtml(config.legacyNotice)}</p>
+        <p>Elles restent dans security-center.yml : Security Center ne les supprime pas. <code>policy.include_tests</code> reste appliqué par le Policy Gate.</p></section>`
+    : '';
+
   // Which scan this verdict belongs to, and whether the policy has moved since.
   const provenance = `<article class="card compact">
       <div class="card-head"><div><h3>Évaluation</h3><small>Le verdict appartient au même scan que les findings, les corrélations et les priorités.</small></div></div>
@@ -700,7 +707,7 @@ function renderPolicyTab(model) {
       </div>
     </article>`;
 
-  return `${saved}${verdict}${provenance}${rules}${form}${details}${renderScanFooter(model)}`;
+  return `${saved}${verdict}${legacy}${provenance}${rules}${form}${details}${renderScanFooter(model)}`;
 }
 
 /** One correlated vulnerability, with every source scanner kept visible. */

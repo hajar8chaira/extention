@@ -392,7 +392,7 @@ function renderSidebarLauncherHtml(model = {}, nonce = '', theme = 'light', uiSt
   const backend = String(model.backendStatus || 'unknown').toLowerCase();
   const live = liveState(model);
   const mascotImageUri = assets.companionImageUri || assets.mascotImageUri || '';
-  // L'identite Secenter. Sans URI resolue, la marque vectorielle reste : une
+  // L'identite SCenter. Sans URI resolue, la marque vectorielle reste : une
   // barre laterale ne doit jamais afficher d'image cassee.
   const brandLogoUri = assets.brandLogoUri || '';
   const brandMark = brandLogoUri
@@ -412,7 +412,7 @@ function renderSidebarLauncherHtml(model = {}, nonce = '', theme = 'light', uiSt
   <div class="launcher">
     <header class="brand">
       ${brandMark}
-      <span class="brand-copy"><strong>Secenter</strong><small>SECURITY CENTER</small></span>
+      <span class="brand-copy"><strong>SCenter</strong><small>SECURITY CENTER</small></span>
     </header>
 
     <section class="project" aria-label="État du workspace">
@@ -422,8 +422,8 @@ function renderSidebarLauncherHtml(model = {}, nonce = '', theme = 'light', uiSt
       ${backendPill(backend)}
     </section>
 
-    <button class="cta" data-open-security-center aria-label="Ouvrir Secenter">
-      Ouvrir Secenter<span class="cta-arrow" aria-hidden="true">→</span>
+    <button class="cta" data-open-security-center aria-label="Ouvrir SCenter">
+      Ouvrir SCenter<span class="cta-arrow" aria-hidden="true">→</span>
     </button>
 
     <section aria-label="Posture de sécurité">

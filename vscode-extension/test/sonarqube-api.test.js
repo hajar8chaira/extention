@@ -45,7 +45,10 @@ test('transmet le jeton uniquement dans l’en-tête Authorization', async (t) =
   const { server, received, hostUrl } = await startServer((url, request, response) => json(response, { status: 'UP', version: '25.1' }));
   t.after(() => server.close());
   await sonarRequest(hostUrl, 'api/system/status', { token: TOKEN });
-  assert.equal(received[0].headers.authorization, `Bearer ${TOKEN}`);
+  // Basic « jeton en nom d'utilisateur, mot de passe vide » : le seul schéma
+  // compris par toutes les versions supportées, Bearer n'existant qu'à partir
+  // de SonarQube 10.0. Voir sonarqube-token-auth.test.js.
+  assert.equal(received[0].headers.authorization, `Basic ${Buffer.from(`${TOKEN}:`, 'utf8').toString('base64')}`);
   assert.equal(JSON.stringify(received[0].query).includes(TOKEN), false);
   assert.equal(received[0].path.includes(TOKEN), false);
 });

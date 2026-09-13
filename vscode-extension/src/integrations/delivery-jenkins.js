@@ -23,6 +23,7 @@ const {
   SECTION_KIND, FIELD_TYPE, CONFIG_GROUP,
   buildDeliveryModel, notReportedCapability, readyCapability, validateAgainstFields
 } = require('./delivery-contract');
+const { detectCiEngine } = require('../ci-engine');
 
 const ID = 'jenkins';
 const LABEL = 'Jenkins';
@@ -96,6 +97,21 @@ const OUTCOME_BY_STATE = Object.freeze({
   [DELIVERY_STATE.FAILED]: RUN_OUTCOME.FAILED,
   [DELIVERY_STATE.ABORTED]: RUN_OUTCOME.ABORTED,
   [DELIVERY_STATE.NOT_STARTED]: RUN_OUTCOME.NOT_STARTED
+});
+
+/**
+ * Security Center stage states mapped to run outcomes. A stage that was not
+ * configured or skipped did not run; it is not a success and not a failure.
+ */
+const OUTCOME_BY_STAGE_STATE = Object.freeze({
+  passed: RUN_OUTCOME.SUCCESS,
+  warning: RUN_OUTCOME.UNSTABLE,
+  blocked: RUN_OUTCOME.FAILED,
+  failed: RUN_OUTCOME.FAILED,
+  running: RUN_OUTCOME.RUNNING,
+  ready: RUN_OUTCOME.NOT_STARTED,
+  not_configured: RUN_OUTCOME.NOT_STARTED,
+  skipped: RUN_OUTCOME.NOT_STARTED
 });
 
 /** Connection outcomes mapped to provider status. */
@@ -197,14 +213,28 @@ function toDeliveryModel(status = {}, configuration = {}) {
   const report = status.ci || {};
   const artifacts = Array.isArray(build?.artifacts) ? build.artifacts : [];
   const hasArtifacts = artifacts.length > 0;
+  // The stages shown are Security Center's own, read from the report archived
+  // by this build — never Jenkins stages, and never from a report attributed to
+  // another commit.
+  const reportedStages = report.state === REPORT_STATE.REPORTED && !status.identity?.inconsistent
+    && Array.isArray(report.report?.stages) ? report.report.stages : [];
+  // Deployment and health check come only from the record this build archived.
+  const deliveryRecord = status.deliveryRecord?.state === REPORT_STATE.REPORTED ? status.deliveryRecord.record : null;
 
   const capabilities = {
     [CAPABILITY.PIPELINE_STATUS]: readyCapability(),
     [CAPABILITY.LAST_RUN]: build ? readyCapability() : notReportedCapability('Le job n’a pas encore produit d’exécution.'),
-    // Not a claim of absence: the API as read here does not expose stages.
-    [CAPABILITY.STAGES]: notReportedCapability('Le fournisseur expose le build, pas ses étapes.'),
+    // Not a claim of absence: the Jenkins API as read here does not expose its
+    // stages. Only the archived Security Center report can supply them.
+    [CAPABILITY.STAGES]: reportedStages.length
+      ? readyCapability()
+      : notReportedCapability(report.state === REPORT_STATE.REPORTED
+        ? 'Le rapport Security Center archivé ne contient pas d’étapes.'
+        : 'Le fournisseur expose le build, pas ses étapes.'),
     [CAPABILITY.ARTIFACTS]: hasArtifacts ? readyCapability() : notReportedCapability('Aucun artefact rapporté par cette exécution.'),
-    [CAPABILITY.DEPLOYMENT_STATUS]: notReportedCapability('Le fournisseur ne rapporte pas d’état de déploiement.')
+    [CAPABILITY.DEPLOYMENT_STATUS]: deliveryRecord
+      ? readyCapability()
+      : notReportedCapability(status.deliveryRecord?.reason || 'Le fournisseur ne rapporte pas d’état de déploiement.')
   };
 
   return buildDeliveryModel({
@@ -226,13 +256,26 @@ function toDeliveryModel(status = {}, configuration = {}) {
       url: build.url || '',
       commitMatch: status.commit?.match || null
     } : null,
-    stages: [],
+    stages: reportedStages.map((stage) => ({
+      name: `Security Center · ${stage.label || stage.id}`,
+      id: stage.id,
+      outcome: OUTCOME_BY_STAGE_STATE[stage.state] || RUN_OUTCOME.NOT_REPORTED,
+      detail: stage.detail || '',
+      source: 'security-center-report'
+    })),
     artifacts: artifacts.map((artifact) => ({
       name: artifact.fileName || '',
       path: artifact.relativePath || '',
       kind: 'build-artifact'
     })),
-    deployment: null,
+    deployment: deliveryRecord
+      ? {
+        status: deliveryRecord.deployment.status,
+        reason: deliveryRecord.deployment.reason,
+        healthCheck: deliveryRecord.healthCheck,
+        verdict: deliveryRecord.verdict
+      }
+      : null,
     securityReport: {
       // `REPORTED` is the only state that carries a verdict. The others say why
       // there is none, which is what the page must show instead of a failure.
@@ -240,6 +283,9 @@ function toDeliveryModel(status = {}, configuration = {}) {
       state: String(report.state || REPORT_STATE.NOT_REPORTED),
       reason: report.reason || '',
       policy: status.policy || null,
+      verdict: !status.identity?.inconsistent ? report.report?.verdict || null : null,
+      // Reported, never acted on: the extension does not install the engine.
+      ciEngine: detectCiEngine({ reportState: report.state, report: report.report, inconsistent: Boolean(status.identity?.inconsistent) }),
       supplyChain: status.artifacts || null,
       artifactPath: report.artifactPath || null,
       inconsistent: Boolean(status.identity?.inconsistent)
@@ -278,4 +324,4 @@ const jenkinsDeliveryAdapter = Object.freeze({
   consoleUrl
 });
 
-module.exports = { jenkinsDeliveryAdapter, CONFIGURATION_FIELDS, OUTCOME_BY_STATE, STATUS_BY_CONNECTION, toDeliveryModel };
+module.exports = { jenkinsDeliveryAdapter, CONFIGURATION_FIELDS, OUTCOME_BY_STATE, OUTCOME_BY_STAGE_STATE, STATUS_BY_CONNECTION, toDeliveryModel };

@@ -7,7 +7,7 @@ const { SCANNER_PRESENTATION, scannerLogoUri, isTrustedWebviewAssetUri } = requi
 const { buildDashboardModel, renderDashboardHtml, summarizeScannerError } = require('../src/dashboard');
 
 const repoRoot = path.join(__dirname, '..');
-const scannerTools = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP'];
+const scannerTools = ['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'Nuclei', 'ZAP'];
 
 function logoAssets(prefix = 'vscode-webview-resource:/media/scanners') {
   return {
@@ -30,6 +30,21 @@ test('every configured scanner has a local logo or safe fallback', () => {
     if (presentation.logo) {
       assert.ok(fs.existsSync(path.join(repoRoot, 'media', 'scanners', presentation.logo)), `${tool} logo is missing`);
     }
+  }
+});
+
+test('Dynamic Security connector logos are packaged and local-only', () => {
+  for (const tool of ['mitmproxy', 'Burp']) {
+    const presentation = SCANNER_PRESENTATION[tool];
+    assert.ok(presentation, `${tool} must have presentation metadata`);
+    const assets = {
+      cspSource: 'vscode-webview:',
+      scannerLogoUris: { [tool]: `vscode-webview-resource:/media/scanners/${presentation.logo}` }
+    };
+    assert.ok(presentation.logo, `${tool} must use an official local logo asset`);
+    assert.ok(fs.existsSync(path.join(repoRoot, 'media', 'scanners', presentation.logo)), `${tool} logo is missing`);
+    assert.match(scannerLogoUri(tool, assets), /^vscode-webview-resource:/);
+    assert.equal(scannerLogoUri(tool, { scannerLogoUris: { [tool]: `https://example.test/${presentation.logo}` } }), '');
   }
 });
 
@@ -143,7 +158,11 @@ test('scanner IDs still map to the same scanner implementations', () => {
   };
   for (const [tool, runner] of Object.entries(expected)) {
     const escapedTool = tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    assert.match(extensionSource, new RegExp(`tool: '${escapedTool}'[\\s\\S]*execute: \\(\\) => ${runner}\\(`));
+    // `execute` peut ouvrir un corps de fonction, et l’attendre — ZAP y vérifie
+    // l’autorisation de la cible puis mesure ses moteurs avant de lancer le sien
+    // — mais il appelle toujours le même exécutant, et c’est cela que ce test
+    // protège.
+    assert.match(extensionSource, new RegExp(`tool: '${escapedTool}'[\\s\\S]*execute: (?:async )?\\(\\) => (?:\\{[\\s\\S]*?)?${runner}\\(`));
   }
 });
 

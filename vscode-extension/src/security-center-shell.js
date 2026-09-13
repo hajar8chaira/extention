@@ -142,8 +142,8 @@ function renderInternalSidebar(surface, { asLinks = false, brandLogoUri = '' } =
   const brandMark = brandLogoUri
     ? `<img class="sc-nav-logo" src="${escapeHtml(brandLogoUri)}" alt="" width="28" height="28" decoding="async">`
     : compactIcon('shield');
-  return `<aside class="sc-internal-nav" aria-label="Navigation Secenter">
-    <div class="sc-nav-brand"><span class="sc-nav-mark">${brandMark}</span><div><strong>Secenter</strong><small>Security Center</small></div></div>
+  return `<aside class="sc-internal-nav" aria-label="Navigation SCenter">
+    <div class="sc-nav-brand"><span class="sc-nav-mark">${brandMark}</span><div><strong>SCenter</strong><small>Security Center</small></div></div>
     <nav class="sc-nav-groups">
       ${NAV_GROUPS.map(([group, items]) => `<section class="sc-nav-group"><h2>${escapeHtml(group)}</h2>${items.map(([label, command, icon]) => {
         const active = command && command === activeCommand ? ' active' : '';

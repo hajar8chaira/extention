@@ -230,3 +230,94 @@ test('la carte ne divulgue jamais le jeton pendant l’installation', () => {
   assert.equal(html.includes(TOKEN), false);
   assert.equal(html.includes('squ_'), false);
 });
+
+// ------------------------------------------- garde Zip Slip de l'installateur
+
+const fsp = require('node:fs/promises');
+const { comparablePath } = require('../src/scanner-tool-manager');
+
+/** L'instance sert seulement à atteindre la méthode : rien n'est installé. */
+const guard = () => new ScannerToolManager(path.join(os.tmpdir(), 'sc-sonar-guard-storage'));
+
+test('SonarScanner : la structure réelle de l’archive officielle est acceptée', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-sonar-layout-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  // La forme de sonar-scanner-cli-<version>-windows-x64.zip : un dossier racine,
+  // puis bin/, lib/, conf/ et jre/.
+  const distribution = path.join(root, 'sonar-scanner-8.1.0.6389-windows-x64');
+  await fsp.mkdir(path.join(distribution, 'bin'), { recursive: true });
+  await fsp.mkdir(path.join(distribution, 'lib'), { recursive: true });
+  await fsp.mkdir(path.join(distribution, 'conf'), { recursive: true });
+  await fsp.mkdir(path.join(distribution, 'jre', 'bin'), { recursive: true });
+  await fsp.writeFile(path.join(distribution, 'bin', 'sonar-scanner.bat'), '@echo off');
+  await fsp.writeFile(path.join(distribution, 'lib', 'sonar-scanner-cli.jar'), 'jar');
+  await fsp.writeFile(path.join(distribution, 'conf', 'sonar-scanner.properties'), '#');
+  await guard().assertNoPathEscape(root);
+});
+
+test('SonarScanner : la casse de la lettre de lecteur ne fait plus échouer l’extraction', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-sonar-case-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  await fsp.mkdir(path.join(root, 'sonar-scanner-8.1.0.6389-windows-x64', 'bin'), { recursive: true });
+  await fsp.writeFile(path.join(root, 'sonar-scanner-8.1.0.6389-windows-x64', 'bin', 'sonar-scanner.bat'), '@echo off');
+
+  // VS Code fournit son stockage via `Uri.fsPath`, dont la lettre de lecteur est
+  // minuscule. La racine venait de `path.resolve()` et les entrées de
+  // `fs.realpath()` : aucune entrée ne « commençait » par la racine, et la
+  // première — le dossier racine de l'archive — était refusée.
+  await guard().assertNoPathEscape(root);
+  if (process.platform === 'win32') {
+    const lowered = root.charAt(0).toLowerCase() + root.slice(1);
+    const uppered = root.charAt(0).toUpperCase() + root.slice(1);
+    assert.notEqual(lowered, uppered, 'le cas de test exige deux casses distinctes');
+    await guard().assertNoPathEscape(lowered);
+    await guard().assertNoPathEscape(uppered);
+  }
+});
+
+test('SonarScanner : une archive qui sort du dossier reste refusée', async (t) => {
+  const parent = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-sonar-escape-'));
+  t.after(() => fsp.rm(parent, { recursive: true, force: true }));
+  const root = path.join(parent, 'extract');
+  const outside = path.join(parent, 'dehors');
+  await fsp.mkdir(path.join(root, 'sonar-scanner-8.1.0.6389-windows-x64', 'bin'), { recursive: true });
+  await fsp.mkdir(outside, { recursive: true });
+  await fsp.writeFile(path.join(outside, 'vole.jar'), 'jar');
+
+  let linked = false;
+  try {
+    await fsp.symlink(outside, path.join(root, 'sonar-scanner-8.1.0.6389-windows-x64', 'evasion'), 'junction');
+    linked = true;
+  } catch { /* la création de jonction peut être refusée sans privilège */ }
+  if (linked) {
+    await assert.rejects(() => guard().assertNoPathEscape(root), /en dehors du dossier d’installation/);
+    // La casse de la racine n'offre aucune échappatoire non plus.
+    if (process.platform === 'win32') {
+      const lowered = root.charAt(0).toLowerCase() + root.slice(1);
+      await assert.rejects(() => guard().assertNoPathEscape(lowered), /en dehors du dossier d’installation/);
+    }
+    await fsp.rm(path.join(root, 'sonar-scanner-8.1.0.6389-windows-x64', 'evasion'), { recursive: true, force: true });
+  }
+  // Sans le lien, la même arborescence est acceptée : c'est l'évasion qui est
+  // refusée, pas la structure de l'archive.
+  await guard().assertNoPathEscape(root);
+});
+
+test('SonarScanner : la garde compare deux chemins canonisés de la même façon', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'scanner-tool-manager.js'), 'utf8');
+  const method = source.match(/async assertNoPathEscape\([\s\S]*?\n  \}/)[0];
+  // La racine passe par `realpath`, comme les entrées : une jonction dans le
+  // chemin parent la déplacerait autrement hors de sa propre sous-arborescence.
+  assert.match(method, /const baseReal = await fs\.realpath\(root\)\.catch\(\(\) => path\.resolve\(root\)\);/);
+  assert.match(method, /comparablePath\(baseReal\)/);
+  assert.match(method, /comparablePath\(await fs\.realpath\(candidate\)/);
+  // `realpath` sur chaque entrée reste la garde : c'est elle qui démasque un
+  // lien ou une jonction sortante.
+  assert.ok(method.includes('fs.realpath(candidate)'), 'les liens sont toujours résolus');
+  // La règle de rejet est inchangée.
+  assert.match(method, /if \(resolved !== base && !resolved\.startsWith\(prefix\)\)/);
+
+  // Insensible à la casse sur Windows seulement : sur un système sensible à la
+  // casse, abaisser la casse ouvrirait une évasion.
+  assert.equal(comparablePath('C:/A/B') === comparablePath('c:/a/b'), process.platform === 'win32');
+});

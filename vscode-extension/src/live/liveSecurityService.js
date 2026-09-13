@@ -1,5 +1,5 @@
 const { isLiveSecurityState } = require('./models');
-const { LiveScheduler } = require('./liveScheduler');
+const { LiveScheduler, uriKey } = require('./liveScheduler');
 
 class LiveSecurityService {
   constructor({ workspace, window, analyzeDocument = async () => [], diagnostics, configurationSection = 'securityCenter' }) {
@@ -11,6 +11,7 @@ class LiveSecurityService {
     this.state = 'disabled';
     this.disposed = false;
     this.documentSubscriptions = [];
+    this.analyzedVersions = new Map();
     this.stateListeners = new Set();
     this.performanceReduced = false;
     this.performanceNoticeShown = false;
@@ -82,6 +83,7 @@ class LiveSecurityService {
       onState: (state) => this.setState(state),
       onResult: (findings, token) => {
         const startedAt = performance.now();
+        this.analyzedVersions.set(token.uri, token.version);
         this.diagnostics?.publish(findings, token);
         this.debugTiming('diagnostics', { updateMs: Math.round((performance.now() - startedAt) * 10) / 10 });
       },
@@ -101,6 +103,25 @@ class LiveSecurityService {
     if (configuration.get('live.scanOnSave', true)) {
       this.documentSubscriptions.push(this.workspace.onDidSaveTextDocument((document) => this.scheduler.schedule(document, true)));
     }
+    // Opening a file must be enough to get diagnostics: without this the first
+    // analysis only happened on the first keystroke or save. The active editor
+    // change is the single event that covers both opening a file and switching
+    // back to an already open one, and the scheduler only accepts the active
+    // document anyway, so no other lifecycle event is needed here.
+    if (typeof this.window?.onDidChangeActiveTextEditor === 'function') {
+      this.documentSubscriptions.push(this.window.onDidChangeActiveTextEditor((editor) => this.scanActiveDocument(editor?.document)));
+    }
+    // Covers the editor already open when the extension activates or when Live
+    // Security is switched on, which fires no editor change of its own.
+    this.scanActiveDocument();
+  }
+  scanActiveDocument(document = this.window?.activeTextEditor?.document) {
+    if (this.disposed || !this.scheduler || !document) return false;
+    // A version already analysed keeps tab switching free of redundant work,
+    // and an empty buffer has nothing to report.
+    if (this.analyzedVersions.get(uriKey(document.uri)) === document.version) return false;
+    if (!String(document.getText?.() || '').trim()) return false;
+    return this.scheduler.schedule(document);
   }
   debugTiming(label, timing) {
     if (!this.configuration.get('live.debug', false)) return;
@@ -111,6 +132,7 @@ class LiveSecurityService {
     this.scheduler?.dispose();
     this.scheduler = undefined;
     this.performanceReduced = false;
+    this.analyzedVersions.clear();
     for (const subscription of this.documentSubscriptions.splice(0)) subscription.dispose();
   }
   dispose() {

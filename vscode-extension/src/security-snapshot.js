@@ -97,12 +97,16 @@ function completeExecution(snapshot, execution, executionFindings, scannerStatus
   const resultSets = { ...(snapshot.resultSets || {}) };
   const refresh = { ...(snapshot.refresh || {}) };
   for (const status of scannerStatuses) {
+    const identity = snapshot.refresh?.[status.tool]?.identity;
     if (status.status === 'completed') resultSets[status.tool] = resultSet(status.tool, executionFindings.filter((finding) => finding.tool === status.tool), status, execution, finishedAt);
     const terminalState = isTerminalScannerStatus(status) ? scannerStatusValue(status) : 'failed';
     refresh[status.tool] = {
       state: terminalState,
       activeExecutionId: execution.executionId,
-      ...(status.error ? { error: status.error } : {})
+      ...(status.error ? { error: status.error } : {}),
+      // Le mode et l'authentification de ce run survivent à sa clôture : un run
+      // en échec ne reprend pas l'identité du dernier run réussi.
+      ...(identity ? { identity } : {})
     };
   }
   return {
@@ -133,7 +137,10 @@ function projectSnapshot(snapshot) {
     }
     if (refreshing) {
       scanners.push({
-        ...(set?.scannerStatus || { tool }), tool,
+        // L'identité du run courant — mode, authentification, moteur — l'emporte
+        // sur celle du dernier run terminé : un scan actif ne s'affiche pas avec
+        // le mode et l'authentification du baseline qui l'a précédé.
+        ...(set?.scannerStatus || { tool }), ...(refresh.identity || {}), tool,
         status: refresh.state,
         refreshState: refresh.state,
         activeExecutionId: refresh.activeExecutionId,
@@ -167,6 +174,7 @@ function projectSnapshot(snapshot) {
       const lastRefreshFailed = lastRefresh && lastRefresh.state !== 'completed';
       scanners.push({
         ...set.scannerStatus,
+        ...(lastRefreshFailed ? lastRefresh.identity || {} : {}),
         tool,
         status: lastRefreshFailed ? lastRefresh.state : 'completed',
         sourceExecutionId: lastRefreshFailed ? lastRefresh.activeExecutionId : set.sourceExecutionId,
@@ -201,6 +209,7 @@ function projectSnapshot(snapshot) {
           : {})
       });
     } else if (refresh) scanners.push({
+      ...(refresh.identity || {}),
       tool,
       status: refresh.state,
       activeExecutionId: refresh.activeExecutionId,

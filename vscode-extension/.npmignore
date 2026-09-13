@@ -1,0 +1,11 @@
+# npm package = the headless Security Center CLI installed on CI agents.
+# The VS Code extension (VSIX) is built by vsce from .vscodeignore, not from here.
+#
+# Allowlist: ignore everything at the top level, then re-include only what the
+# CLI needs at runtime. Every module reachable from src/cli.js lives under src/,
+# and it has no npm dependency. npm always adds package.json, README and LICENSE.
+/*
+!/src/
+!/templates/
+# Build identity (commit, timestamp) stamped by scripts/build-scenter-artifacts.js.
+!/build-info.json

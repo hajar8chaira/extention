@@ -1,13 +1,14 @@
 # Security Center
 
-Extension DevSecOps/AppSec pour Visual Studio Code avec scanners Docker, backend local FastAPI, dashboard intégré et application vulnérable contrôlée.
+Extension DevSecOps/AppSec pour Visual Studio Code avec scanners Docker, backend local embarqué, dashboard intégré et application vulnérable contrôlée.
 
 ## Structure
 
 ```text
 pfa-start/
-├── vscode-extension/          Extension VS Code et dashboard Webview
-├── backend/                   API FastAPI et stockage SQLite
+├── vscode-extension/          Extension VS Code, dashboard Webview et backend local embarqué
+│   └── backend/               Service local Node livré dans le VSIX (persistance, historique, audit, Burp)
+├── backend/                   Ancienne API FastAPI — développement et déploiement Docker uniquement
 ├── test-application/
 │   └── juice-shop/            Code source OWASP Juice Shop
 ├── docker-compose.backend.yml
@@ -19,17 +20,37 @@ pfa-start/
 
 ## Backend
 
+Le backend persiste l'historique des scans, le journal d'audit, les tendances/MTTR et les scénarios HTTP capturés depuis Burp.
+
+**Il est géré automatiquement par l'extension.** Aucune installation : ni Docker, ni Python, ni exécutable à télécharger. Le service est livré dans le VSIX (`vscode-extension/backend/`), tourne sur le runtime Node que VS Code fournit déjà, n'écoute que sur `127.0.0.1`, et conserve ses données dans le stockage global de VS Code — une mise à jour de l'extension ne supprime donc pas l'historique.
+
+Trois modes, dans les réglages `securityCenter.backend.mode` :
+
+| Mode | Ce que fait l'extension | Pour qui |
+| --- | --- | --- |
+| `auto` (défaut) | Démarre, surveille et redémarre le service local | Tout le monde |
+| `remote` | Ne démarre rien, utilise `securityCenter.backend.url` | Équipes, entreprise |
+| `docker` | Ne démarre rien, rapporte l'état de la stack compose | Développement |
+
+API (même contrat quel que soit le mode) :
+
+- santé : `<backend>/health`
+- dashboard JSON : `<backend>/api/v1/dashboard`
+
+L'adresse réelle est publiée par le service et lisible dans **Integrations → Security Center Backend**. En mode `auto`, le port par défaut est 8765 ; s'il est occupé par un autre service, un port libre est choisi et publié.
+
+## Backend FastAPI — développement et déploiement Docker
+
+`backend/` et `docker-compose.backend.yml` conservent l'implémentation FastAPI/SQLite. Elle n'est plus nécessaire à l'usage du produit : elle sert au développement, aux tests d'intégration, à la CI, au débogage, et à relire un historique SQLite écrit avant cette version.
+
 ```powershell
 docker compose -f docker-compose.backend.yml up -d --build
 ```
 
-API :
-
 - santé : `http://127.0.0.1:8765/health`
 - documentation : `http://127.0.0.1:8765/docs`
-- dashboard JSON : `http://127.0.0.1:8765/api/v1/dashboard`
 
-Les données SQLite sont conservées dans le volume Docker `security-center-data`.
+Les données SQLite restent dans le volume Docker `security-center-data`. Pour que l'extension l'utilise, choisir le mode `docker`.
 
 ## Extension
 
@@ -39,7 +60,7 @@ Les données SQLite sont conservées dans le volume Docker `security-center-data
 4. Ouvrir l’icône Security Center.
 5. Consulter le **Dashboard** ou lancer **Security Center: Scan Workspace**.
 
-Le scan continue si le backend est arrêté. Dans ce cas, la Webview affiche `backend: offline` et les résultats restent disponibles dans la TreeView et Problems.
+Le scan, Live Security et Fix & Verify fonctionnent sans backend. Dans ce cas, la Webview affiche `backend: offline`, les surfaces d'historique expliquent leur état, et les résultats restent disponibles dans la TreeView et Problems.
 
 ## Application vulnérable
 

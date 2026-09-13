@@ -1,0 +1,5 @@
+<svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <title>CircleCI</title>
+  <path fill="#343434" d="M12 0C6 0 1 4.4.1 10.2h6.1A6 6 0 1 1 6.2 14H.1C1.1 19.7 6 24 12 24a12 12 0 1 0 0-24z"/>
+  <circle cx="12" cy="12" r="3.8" fill="#343434"/>
+</svg>

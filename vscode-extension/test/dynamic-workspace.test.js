@@ -282,7 +282,7 @@ test('sans espace de travail, la page ne change pas', () => {
   assert.ok(!html.includes('.dyn-metric'), 'aucun CSS inutile');
   // Les sections ZAP et Burp existantes restent en place.
   assert.match(html, /<h2>ZAP<\/h2>/);
-  assert.match(html, /<h2>Burp<\/h2>/);
+  assert.match(html, /<h2>Burp Suite<\/h2>/);
 });
 
 test('rien n’est affiché comme zéro testé quand rien n’a été évalué', () => {
@@ -442,7 +442,7 @@ test('runZap accepte un profil résolu sans passer par un second moteur de login
   assert.match(source, /mode: 0o600/);
   assert.match(source, /fs\.rm\(reportDirectory, \{ recursive: true, force: true \}\)/);
   // La définition et l’unique appel : deux occurrences, pas trois.
-  assert.equal((source.match(/zapAuthEnv\(authResult, targetUrl\)/g) || []).length, 2);
+  assert.equal((source.match(/zapAuthEnv\(authResult, targetUrl/g) || []).length, 2);
 });
 
 test('les en-têtes du profil ne sont produits que sur demande explicite', () => {

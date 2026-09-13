@@ -51,6 +51,19 @@ function sonarScannerPlatform(platform = process.platform, arch = process.arch) 
   return '';
 }
 
+/**
+ * Comparable form of a path.
+ *
+ * On Windows the filesystem does not distinguish case: `C:\A` and `c:\a` name
+ * the same directory, and comparing them byte for byte is wrong. On a
+ * case-sensitive system `A` and `a` are two different directories, and lowering
+ * the case there would open an escape.
+ */
+function comparablePath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 function compareVersions(left, right) {
   const a = String(left).split('.').map(Number);
   const b = String(right).split('.').map(Number);
@@ -68,6 +81,16 @@ const TOOLS = Object.freeze({
   osv: { label: 'OSV-Scanner', kind: 'github', command: 'osv-scanner', repo: 'google/osv-scanner', purpose: 'Vulnérabilités des dépendances', asset: /osv-scanner_windows_amd64\.exe$/i, checksum: /(checksums|sha256).*\.txt$/i },
   sonarscanner: { label: 'SonarScanner', kind: 'sonarsource', command: 'sonar-scanner', purpose: 'Analyse SonarQube du code', base: SONARSCANNER_BASE, version: SONARSCANNER_PINNED_VERSION },
   snyk: { label: 'Snyk CLI', kind: 'snyk', command: 'snyk', purpose: 'Dépendances, code et IaC via Snyk', base: SNYK_CLI_BASE },
+  // Nuclei is a DAST engine, installed through the exact same official release
+  // + SHA-256 contract as the scanners. Its templates are a second artefact,
+  // published in a separate repository, and are installed by `src/nuclei.js`:
+  // the binary alone detects nothing.
+  nuclei: {
+    label: 'Nuclei', kind: 'github', command: 'nuclei', repo: 'projectdiscovery/nuclei',
+    purpose: 'Analyse dynamique par templates (DAST)',
+    asset: /^nuclei_[\d.]+_windows_amd64\.zip$/i, checksum: /_checksums\.txt$/i,
+    versionArgs: ['-version'], dynamic: true
+  },
   // Cosign is a supply-chain tool, not a scanner: it signs and verifies
   // artefacts and never produces findings. It reuses the same official
   // release + SHA-256 installation contract as the scanners.
@@ -92,13 +115,30 @@ const INSTALL_PHASE = Object.freeze({
 const INSTALL_ERROR = Object.freeze({
   TIMEOUT: 'TIMEOUT',
   STALLED: 'STALLED',
-  CANCELLED: 'CANCELLED'
+  CANCELLED: 'CANCELLED',
+  // The connection died mid-transfer: the socket was reset or closed before the
+  // announced size arrived. Node reports this as a bare « aborted ».
+  INTERRUPTED: 'INTERRUPTED',
+  // The host could not be reached at all: DNS, firewall or proxy.
+  UNREACHABLE: 'UNREACHABLE',
+  // The TLS chain was refused, typically behind HTTPS inspection.
+  TLS: 'TLS',
+  // The downloaded artefact is not a readable archive.
+  ARCHIVE: 'ARCHIVE'
 });
 
 /** No useful byte for this long means the transfer is dead, not slow. */
 const DEFAULT_STALL_MS = 120000;
 /** Ceiling for one HTTP response to complete. Large binaries need room. */
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 900000;
+/**
+ * Progress is a signal for a human, not a byte log. A 60 MB binary arrives in
+ * roughly nine hundred chunks; forwarding every one of them let the caller
+ * schedule that many UI refreshes, each re-probing every managed tool, until the
+ * event loop was so far behind that the download socket itself was reset. One
+ * event per interval carries the exact same information.
+ */
+const DEFAULT_PROGRESS_INTERVAL_MS = 250;
 
 class InstallCancelledError extends Error {
   constructor(message = 'Installation annulée.') {
@@ -117,8 +157,47 @@ class InstallTimeoutError extends Error {
   }
 }
 
+class InstallNetworkError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'InstallNetworkError';
+    this.code = code;
+  }
+}
+
 function throwIfAborted(signal) {
   if (signal?.aborted) throw new InstallCancelledError();
+}
+
+/**
+ * Turns a transport failure into something a user can act on.
+ *
+ * Node surfaces a mid-transfer reset as a bare « aborted », which used to reach
+ * the card verbatim and explained nothing. Cancellations and timeouts already
+ * carry their own explicit message and are returned untouched.
+ */
+function describeTransportError(error, url = '') {
+  if (error?.cancelled || error?.code === INSTALL_ERROR.CANCELLED) return error;
+  if (error instanceof InstallTimeoutError || error instanceof InstallNetworkError) return error;
+  const host = (() => { try { return new URL(url).host; } catch { return ''; } })();
+  const origin = host ? ` depuis ${host}` : '';
+  const code = String(error?.code || '');
+  const message = String(error?.message || '');
+  if (/^(ENOTFOUND|EAI_AGAIN)$/.test(code)) {
+    return new InstallNetworkError(`Serveur de téléchargement introuvable${origin} : la résolution DNS a échoué. Vérifiez la connexion réseau ou le proxy.`, INSTALL_ERROR.UNREACHABLE);
+  }
+  if (/^(ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN)$/.test(code)) {
+    return new InstallNetworkError(`Serveur de téléchargement inaccessible${origin}. Un pare-feu ou un proxy bloque probablement la connexion.`, INSTALL_ERROR.UNREACHABLE);
+  }
+  if (/CERT|SELF_SIGNED|UNABLE_TO_(GET|VERIFY)/.test(code)) {
+    return new InstallNetworkError(`Certificat TLS refusé${origin} (${code}). Un proxy d’inspection HTTPS intercepte la connexion.`, INSTALL_ERROR.TLS);
+  }
+  // Node reports a socket reset in mid-transfer as a bare « aborted ». Checked
+  // last so a more precise code always wins over the generic message.
+  if (/^(ECONNRESET|ECONNABORTED|EPIPE|ERR_STREAM_PREMATURE_CLOSE)$/.test(code) || /^aborted$/i.test(message.trim())) {
+    return new InstallNetworkError(`Connexion interrompue pendant le téléchargement${origin}. Le fichier partiel a été supprimé ; relancez l’installation.`, INSTALL_ERROR.INTERRUPTED);
+  }
+  return error;
 }
 
 function request(url, headers = {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS } = {}) {
@@ -155,7 +234,7 @@ function request(url, headers = {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEO
         resolve(response);
       });
       active.setTimeout(timeoutMs, () => fail(new InstallTimeoutError(`Téléchargement interrompu après ${Math.round(timeoutMs / 1000)} s.`)));
-      active.on('error', fail);
+      active.on('error', (error) => fail(describeTransportError(error, current)));
     };
     run(url);
   });
@@ -172,12 +251,28 @@ function request(url, headers = {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEO
  * must then show an indeterminate state rather than compute a percentage from a
  * denominator it does not have.
  */
-async function download(url, destination, onProgress = () => {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS, stallTimeoutMs = DEFAULT_STALL_MS } = {}) {
+async function download(url, destination, onProgress = () => {}, { signal, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS, stallTimeoutMs = DEFAULT_STALL_MS, progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS } = {}) {
   throwIfAborted(signal);
   const response = await request(url, {}, { signal, timeoutMs });
   const total = Number(response.headers['content-length'] || 0);
   let received = 0;
   let lastProgressAt = Date.now();
+  // Stall detection reads every chunk; the caller does not. `lastEmitAt` only
+  // rate-limits what leaves this function, so a slow transfer is still detected
+  // at full resolution.
+  let lastEmitAt = 0;
+  const emit = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastEmitAt < progressIntervalMs) return;
+    lastEmitAt = now;
+    onProgress({ phase: INSTALL_PHASE.DOWNLOADING, received, total });
+  };
+  // The body can fail between the headers and the first read — `fs.open` is
+  // awaited in between. Without a listener on that window the reset became an
+  // unhandled stream error instead of a failed installation.
+  let streamError = null;
+  const captureStreamError = (error) => { streamError = streamError || error; };
+  response.on('error', captureStreamError);
   const handle = await fs.open(destination, 'w');
   try {
     const stallTimer = setInterval(() => {
@@ -186,22 +281,33 @@ async function download(url, destination, onProgress = () => {}, { signal, timeo
       }
     }, Math.max(1000, Math.min(stallTimeoutMs, 5000)));
     try {
+      emit(true);
       for await (const chunk of response) {
         throwIfAborted(signal);
         await handle.write(chunk);
         received += chunk.length;
         lastProgressAt = Date.now();
-        onProgress({ phase: INSTALL_PHASE.DOWNLOADING, received, total });
+        emit();
       }
+      // The last chunk must always be reported, otherwise the bar can stop
+      // short of the size the server announced.
+      emit(true);
     } finally { clearInterval(stallTimer); }
+    if (streamError) throw streamError;
   } catch (error) {
     await handle.close().catch(() => {});
     // Only the incomplete artefact of this run. Never an installed version,
     // never another tool's cache, never any configuration.
     await fs.rm(destination, { force: true }).catch(() => {});
-    throw error;
-  }
+    throw describeTransportError(error, url);
+  } finally { response.off?.('error', captureStreamError); }
   await handle.close();
+  // A truncated body that ends cleanly is still a failed download: refuse it
+  // here rather than let the SHA-256 check blame the publisher.
+  if (total > 0 && received !== total) {
+    await fs.rm(destination, { force: true }).catch(() => {});
+    throw new InstallNetworkError(`Téléchargement incomplet : ${received} octets reçus sur ${total} annoncés. Connexion interrompue ; relancez l’installation.`, INSTALL_ERROR.INTERRUPTED);
+  }
 }
 
 async function downloadText(url) {
@@ -234,6 +340,9 @@ async function commandVersion(executable, timeout = 30000, versionArgs = ['--ver
     const output = String(stdout || stderr);
     // SonarScanner prints a banner before the version line.
     return output.match(/SonarScanner\s+(?:CLI\s+)?v?[0-9][\w.-]*/i)?.[0]
+      // Nuclei answers on stderr, and prints its ASCII banner — which contains
+      // the version too — before the line that actually names the engine.
+      || output.match(/Nuclei Engine Version:\s*(v?[0-9][\w.-]*)/i)?.[1]
       // Cosign prints ASCII art first: the first line carrying a version wins
       // over the first non-empty line, which would otherwise be the banner.
       || output.trim().split(/\r?\n/).find((line) => /\d+\.\d+/.test(line) && line.trim())?.trim()
@@ -269,7 +378,13 @@ class ScannerToolManager {
     // The first Semgrep startup on Windows can spend a few extra seconds
     // initializing its Python environment. Do not report a false failure
     // while the managed executable is healthy but cold.
-    const versionTimeout = id === 'semgrep' ? 60000 : 30000;
+    // The Snyk CLI needs the same allowance for a different reason: it is a
+    // single 181 MB self-extracting binary, and its very first launch after
+    // download — the one `install()` performs — measured 21 s on a warm machine,
+    // most of it Windows scanning a freshly written executable of that size.
+    // Under the 30 s default a perfectly good installation was one slow disk
+    // away from being declared « n’a rien renvoyé ».
+    const versionTimeout = id === 'semgrep' || id === 'snyk' ? 60000 : 30000;
     // Cosign v2+ exposes `cosign version`, not `--version`.
     const version = executable ? await commandVersion(executable, versionTimeout, tool.versionArgs || ['--version']) : '';
     return { id, ...tool, installed: Boolean(executable && version), executable, version, managed: executable === managed };
@@ -392,20 +507,37 @@ class ScannerToolManager {
       .catch(() => { throw new Error('Extraction impossible : la commande « unzip » est requise sur cette plateforme.'); });
   }
 
-  /** Zip Slip guard: nothing may resolve outside the extraction directory. */
+  /**
+   * Zip Slip guard: nothing may resolve outside the extraction directory.
+   *
+   * Both sides of the comparison are canonicalised the same way. They were not:
+   * the root came from `path.resolve()`, which keeps the drive letter exactly as
+   * supplied, while every entry went through `fs.realpath()`, which returns the
+   * filesystem's canonical form. VS Code hands its storage path to the extension
+   * through `Uri.fsPath`, whose drive letter is lower-case, so the root read
+   * `c:\…` and the entries `C:\…`. No entry then "started with" the root, and the
+   * very first one — the archive's own root folder — was refused. The rule is
+   * unchanged: anything resolving outside the root is still rejected.
+   */
   async assertNoPathEscape(root) {
-    const base = path.resolve(root);
+    // `realpath` on the root too: a junction or symlink anywhere in the parent
+    // chain would otherwise move it out of its own subtree.
+    const baseReal = await fs.realpath(root).catch(() => path.resolve(root));
+    const base = comparablePath(baseReal);
+    const prefix = `${base}${path.sep}`;
     const walk = async (directory) => {
       for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
         const candidate = path.join(directory, entry.name);
-        const resolved = await fs.realpath(candidate).catch(() => path.resolve(candidate));
-        if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
+        // `realpath` follows symlinks and junctions: an entry pointing outside
+        // the root is seen here whatever its name inside the archive.
+        const resolved = comparablePath(await fs.realpath(candidate).catch(() => path.resolve(candidate)));
+        if (resolved !== base && !resolved.startsWith(prefix)) {
           throw new Error('Archive refusée : elle tente d’écrire en dehors du dossier d’installation.');
         }
         if (entry.isDirectory()) await walk(candidate);
       }
     };
-    await walk(base);
+    await walk(baseReal);
   }
 
   async install(id, onProgress = () => {}, { signal } = {}) {
@@ -432,9 +564,18 @@ class ScannerToolManager {
       if (actual !== expected) throw new Error('Échec de vérification SHA-256. Le fichier téléchargé a été supprimé.');
       onProgress({ phase: 'verify', message: 'Empreinte SHA-256 vérifiée' });
       if (archive.toLowerCase().endsWith('.zip')) {
-        await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${archive.replaceAll("'", "''")}' -DestinationPath '${this.toolDirectory(id).replaceAll("'", "''")}' -Force`], { windowsHide: true, timeout: 120000 });
+        // A PowerShell extraction error says nothing useful to a user; the only
+        // actionable reading of it is « the archive that arrived is unusable ».
+        await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${archive.replaceAll("'", "''")}' -DestinationPath '${this.toolDirectory(id).replaceAll("'", "''")}' -Force`], { windowsHide: true, timeout: 120000 })
+          .catch(() => { throw new InstallNetworkError(`Archive invalide : ${release.asset.name} n’a pas pu être décompressée. Relancez l’installation.`, INSTALL_ERROR.ARCHIVE); });
       } else await fs.copyFile(archive, this.managedExecutable(id));
       const found = await this.findExtractedExecutable(this.toolDirectory(id), `${tool.command}.exe`);
+      // Expand-Archive reports an unreadable archive as a non-terminating error
+      // and still exits 0, so an empty extraction is the only signal left. Said
+      // here it names the cause, instead of a later « ne répond pas à --version ».
+      if (!found && archive.toLowerCase().endsWith('.zip')) {
+        throw new InstallNetworkError(`Archive invalide : ${release.asset.name} ne contient pas ${tool.command}.exe. Le téléchargement est probablement corrompu ; relancez l’installation.`, INSTALL_ERROR.ARCHIVE);
+      }
       if (found && found !== this.managedExecutable(id)) await fs.copyFile(found, this.managedExecutable(id));
       await fs.writeFile(path.join(this.toolDirectory(id), 'provenance.json'), JSON.stringify({ source: `https://github.com/${tool.repo}`, version: release.version, asset: release.asset.name, sha256: actual, installedAt: new Date().toISOString() }, null, 2));
       await this.activateManagedPath();
@@ -452,15 +593,36 @@ class ScannerToolManager {
     }
     return '';
   }
+  /**
+   * Runs one installation child process under the run's abort signal.
+   *
+   * A process killed by that signal is a cancellation, not a failure: without
+   * this mapping the card would announce an error for something the user asked
+   * for. Only the step's own process is affected — nothing else is touched.
+   */
+  async cancellableStep(run, signal) {
+    throwIfAborted(signal);
+    try { return await run(); }
+    catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') throw new InstallCancelledError();
+      throw error;
+    }
+  }
   async installSemgrep(onProgress, { signal } = {}) {
+    throwIfAborted(signal);
     const python = await this.findOnPath('python') || await this.findOnPath('python3');
     if (!python) throw new Error('Python est requis pour Semgrep. Installez Python puis réessayez.');
     const venv = path.join(this.toolDirectory('semgrep'), 'venv');
     onProgress({ phase: 'prepare', message: 'Création de l’environnement Python isolé' });
-    await execFileAsync(python, ['-m', 'venv', venv], { windowsHide: true, timeout: 120000 });
+    // Semgrep is the one installer that spends its whole time inside child
+    // processes rather than a download. Until the signal reached them, pressing
+    // « Annuler » was ignored for the ~90 s pip takes, and the run still ended
+    // by declaring the tool ready.
+    await this.cancellableStep(() => execFileAsync(python, ['-m', 'venv', venv], { windowsHide: true, timeout: 120000, signal }), signal);
     const py = path.join(venv, process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
     onProgress({ phase: 'install', message: 'Installation de Semgrep depuis PyPI' });
-    await execFileAsync(py, ['-m', 'pip', 'install', '--disable-pip-version-check', 'semgrep'], { windowsHide: true, timeout: 600000, maxBuffer: 10 * 1024 * 1024 });
+    await this.cancellableStep(() => execFileAsync(py, ['-m', 'pip', 'install', '--disable-pip-version-check', 'semgrep'], { windowsHide: true, timeout: 600000, maxBuffer: 10 * 1024 * 1024, signal }), signal);
+    throwIfAborted(signal);
     await this.activateManagedPath();
     const result = await this.status('semgrep');
     if (!result.installed) throw new Error('Semgrep installé, mais son exécutable ne répond pas.');
@@ -469,9 +631,10 @@ class ScannerToolManager {
 }
 
 module.exports = {
-  ScannerToolManager, TOOLS, sha256, commandVersion, versionInvocation,
+  ScannerToolManager, TOOLS, sha256, commandVersion, versionInvocation, comparablePath,
   INSTALL_PHASE, INSTALL_ERROR, DEFAULT_STALL_MS, DEFAULT_DOWNLOAD_TIMEOUT_MS,
-  InstallCancelledError, InstallTimeoutError, download, request,
+  DEFAULT_PROGRESS_INTERVAL_MS, describeTransportError,
+  InstallCancelledError, InstallTimeoutError, InstallNetworkError, download, downloadText, request,
   sonarScannerPlatform, compareVersions, SONARSCANNER_BASE, SONARSCANNER_PINNED_VERSION,
   snykCliAsset, parseSnykChecksums, SNYK_CLI_BASE
 };

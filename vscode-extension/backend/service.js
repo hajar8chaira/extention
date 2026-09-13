@@ -91,7 +91,11 @@ function renderScanHtml(stored) {
  * know it is still needed, and shut itself down when it is not.
  */
 function createRequestHandler({ store, apiKey = '', version = PROTOCOL_VERSION, port = DEFAULT_PORT, startedAt = new Date().toISOString(), onActivity = () => {} } = {}) {
-  const burp = { lastSeen: null };
+  // Ce que le connecteur Burp a réellement fait, y compris quand il a échoué :
+  // sans ces traces, la carte ne pouvait dire que « déconnecté ».
+  const burp = { lastSeen: null, lastIngestedAt: null, lastIngestionError: null, lastAuthRejectedAt: null };
+  const isoOrNull = (value) => (value ? new Date(value).toISOString() : null);
+  const mitmproxy = { lastSeen: null };
 
   async function route(request, url) {
     const method = request.method || 'GET';
@@ -191,8 +195,21 @@ function createRequestHandler({ store, apiKey = '', version = PROTOCOL_VERSION, 
     }
 
     if (method === 'POST' && pathname === '/api/v1/integrations/burp/requests') {
-      const scenario = validateHttpScenario(await readBody(request));
-      return { status: 201, body: store.saveHttpScenario({ ...scenario, source: 'burp' }) };
+      try {
+        const scenario = validateHttpScenario(await readBody(request));
+        const saved = store.saveHttpScenario({ ...scenario, source: 'burp' });
+        burp.lastIngestedAt = Date.now();
+        return { status: 201, body: saved };
+      } catch (error) {
+        // Une capture refusée reste visible sur la carte, pas seulement dans le journal de Burp.
+        const statusCode = Number(error && error.statusCode) || 500;
+        burp.lastIngestionError = {
+          at: new Date().toISOString(),
+          status: statusCode,
+          detail: statusCode >= 500 ? 'Internal backend error' : String(error.message || 'Request rejected')
+        };
+        throw error;
+      }
     }
 
     if (method === 'GET' && pathname === '/api/v1/integrations/burp/status') {
@@ -205,7 +222,10 @@ function createRequestHandler({ store, apiKey = '', version = PROTOCOL_VERSION, 
           connector: 'security-center-burp',
           connected,
           last_seen: burp.lastSeen ? new Date(burp.lastSeen).toISOString() : null,
-          received_requests: scenarios.filter((scenario) => scenario.source === 'burp').length
+          received_requests: scenarios.filter((scenario) => scenario.source === 'burp').length,
+          last_ingested_at: isoOrNull(burp.lastIngestedAt),
+          last_ingestion_error: burp.lastIngestionError,
+          last_auth_rejected_at: isoOrNull(burp.lastAuthRejectedAt)
         }
       };
     }
@@ -213,6 +233,31 @@ function createRequestHandler({ store, apiKey = '', version = PROTOCOL_VERSION, 
     if (method === 'POST' && pathname === '/api/v1/integrations/burp/heartbeat') {
       burp.lastSeen = Date.now();
       return { status: 200, body: { status: 'connected', last_seen: new Date(burp.lastSeen).toISOString() } };
+    }
+
+    // Le proxy managé emprunte le même contrat que Burp : même validation, même
+    // dédoublonnage, même stockage. Seule la source diffère, et c'est elle qui
+    // permet ensuite de dire d'où vient chaque requête.
+    if (method === 'POST' && pathname === '/api/v1/integrations/mitmproxy/requests') {
+      const scenario = validateHttpScenario(await readBody(request));
+      mitmproxy.lastSeen = Date.now();
+      return { status: 201, body: store.saveHttpScenario({ ...scenario, source: 'mitmproxy' }) };
+    }
+
+    if (method === 'GET' && pathname === '/api/v1/integrations/mitmproxy/status') {
+      const scenarios = store.listHttpScenarios(500);
+      return {
+        status: 200,
+        body: {
+          status: 'ready',
+          connector: 'security-center-mitmproxy',
+          // « Capture active » se mesure au trafic reçu, jamais à la présence du
+          // processus : un proxy démarré que personne ne traverse ne capture rien.
+          capturing: Boolean(mitmproxy.lastSeen) && (Date.now() - mitmproxy.lastSeen) < 15000,
+          last_seen: mitmproxy.lastSeen ? new Date(mitmproxy.lastSeen).toISOString() : null,
+          received_requests: scenarios.filter((scenario) => scenario.source === 'mitmproxy').length
+        }
+      };
     }
 
     throw Object.assign(new Error('Not found'), { statusCode: 404 });
@@ -233,7 +278,11 @@ function createRequestHandler({ store, apiKey = '', version = PROTOCOL_VERSION, 
       const supplied = Buffer.from(String(request.headers['x-security-center-key'] || ''), 'utf8');
       const expected = Buffer.from(apiKey, 'utf8');
       const valid = supplied.length === expected.length && require('node:crypto').timingSafeEqual(supplied, expected);
-      if (!valid) return sendJson(response, 401, { detail: 'Invalid or missing Security Center API key' });
+      if (!valid) {
+        // Un connecteur Burp qui présente une mauvaise clé est dit sur la carte.
+        if (url.pathname.startsWith('/api/v1/integrations/burp/')) burp.lastAuthRejectedAt = Date.now();
+        return sendJson(response, 401, { detail: 'Invalid or missing Security Center API key' });
+      }
     }
 
     try {

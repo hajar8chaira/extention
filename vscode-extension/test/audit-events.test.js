@@ -148,8 +148,10 @@ test('Jenkinsfile : invoque le CLI local du depot, jamais un paquet npm publie',
   // registre public ce qui occupe ce nom.
   assert.doesNotMatch(jenkinsfile, /npx\s+--yes\s+security-center/);
   assert.doesNotMatch(jenkinsfile, /npx[^\n]*security-center scan/);
-  // Le meme chemin que le workflow GitHub deja fonctionnel.
-  assert.match(jenkinsfile, /node vscode-extension\/src\/cli\.js scan/);
+  // Jenkins appelle le CI Engine installé par sa commande, jamais un chemin du
+  // dépôt Security Center : le dépôt applicatif ne contient pas ses sources.
+  assert.match(jenkinsfile, /security-center scan /);
+  assert.doesNotMatch(jenkinsfile, /node [^\n]*vscode-extension\/src\/cli\.js/);
   const workflow = fsCk6.readFileSync(pathCk6.join(__dirname, '..', '..', '.github', 'workflows', 'security-center.yml'), 'utf8');
   assert.match(workflow, /node vscode-extension\/src\/cli\.js scan/, 'le workflow GitHub reste la reference');
 });
@@ -170,7 +172,7 @@ test('Jenkinsfile : drapeaux, codes de sortie et archivage preserves', () => {
   assert.match(jenkinsfile, /archiveArtifacts artifacts: 'security-center-report\.json', allowEmptyArchive: true, fingerprint: true/);
   assert.match(jenkinsfile, /always \{/);
   // Etapes inchangees.
-  for (const stage of ['Checkout', 'Build & Test', 'Security Center', 'Policy Gate', 'Supply chain evidence', 'Deploy']) {
+  for (const stage of ['Checkout', 'Bootstrap Security Center CI Engine', 'Security Center Analysis', 'Policy Gate', 'Supply chain evidence', 'Deploy', 'Health Check']) {
     assert.ok(jenkinsfile.includes(`stage('${stage}')`), `l etape ${stage} doit rester`);
   }
 });

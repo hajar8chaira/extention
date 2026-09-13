@@ -159,7 +159,7 @@ test('Live Security garde ses ressources locales et sa CSP d images', () => {
   // Le compagnon est servi depuis media/live : sans localResourceRoots ni
   // img-src, l image serait bloquee par la CSP du webview.
   assert.match(live, /localResourceRoots:\s*\[assetRoot, brandingRoot\]/, 'localResourceRoots perdu');
-  // La marque Secenter est servie depuis media/branding : sa racine doit etre
+  // La marque SCenter est servie depuis media/branding : sa racine doit etre
   // declaree au meme titre que celle du compagnon, sinon l URI est rejetee.
   assert.match(live, /brandingRoot = this\.api\.Uri\.joinPath\(this\.extensionUri, 'media', 'branding'\)/,
     'la racine de marque doit etre declaree');

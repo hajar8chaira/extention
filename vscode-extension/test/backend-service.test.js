@@ -181,14 +181,27 @@ test('une autorisation sans motif est refusée', async (t) => {
 
 // -------------------------------------------------------- scénarios HTTP
 
-test('une cible non locale est refusée, une capture Burp est stockée une seule fois', async (t) => {
+test('une capture distante est stockable, une URL invalide reste refusée, chaque échange observé est un événement', async (t) => {
   const service = await startService();
   t.after(() => service.stop());
 
+  // Enregistrer une requete capturee n'emet rien : une origine distante
+  // autorisee est une preuve a investiguer, pas une action.
   const remote = await service.call('POST', '/api/v1/http-scenarios', {
-    name: 'externe', source: 'manual', request: { method: 'GET', url: 'https://example.com/' }
+    name: 'externe', source: 'manual', request: { method: 'GET', url: 'http://192.168.222.132:3000/rest/products' }
   });
-  assert.equal(remote.status, 422);
+  assert.equal(remote.status, 201);
+  assert.equal(remote.body.scope, 'remote');
+
+  // La validation structurelle, elle, ne bouge pas.
+  const badScheme = await service.call('POST', '/api/v1/http-scenarios', {
+    name: 'externe', source: 'manual', request: { method: 'GET', url: 'ftp://example.com/' }
+  });
+  assert.equal(badScheme.status, 422);
+  const badUrl = await service.call('POST', '/api/v1/http-scenarios', {
+    name: 'externe', source: 'manual', request: { method: 'GET', url: 'pas-une-url' }
+  });
+  assert.equal(badUrl.status, 422);
 
   const scenario = {
     name: 'login', source: 'manual',
@@ -198,15 +211,22 @@ test('une cible non locale est refusée, une capture Burp est stockée une seule
   const first = await service.call('POST', '/api/v1/integrations/burp/requests', scenario);
   const second = await service.call('POST', '/api/v1/integrations/burp/requests', scenario);
   assert.equal(first.body.source, 'burp');
-  // Le même échange capturé deux fois reste un seul scénario.
-  assert.equal(second.body.scenario_id, first.body.scenario_id);
+  // Le même échange observé deux fois, ce sont deux requêtes capturées. Les
+  // réduire à une répondait « une » à un proxy qui en avait vu deux.
+  assert.notEqual(second.body.scenario_id, first.body.scenario_id, 'deux observations, deux événements');
 
   const listed = await service.call('GET', '/api/v1/http-scenarios');
-  assert.equal(listed.body.length, 1);
+  assert.equal(listed.body.filter((entry) => entry.source === 'burp').length, 2);
+  assert.equal(listed.body.length, 3);
+  // Deux requêtes, un seul endpoint : le regroupement appartient à l'analyse.
+  const endpoints = new Set(listed.body
+    .filter((entry) => entry.source === 'burp')
+    .map((entry) => new URL(entry.request.url).pathname));
+  assert.equal(endpoints.size, 1);
 
   const status = await service.call('GET', '/api/v1/integrations/burp/status');
   assert.equal(status.body.connected, false);
-  assert.equal(status.body.received_requests, 1);
+  assert.equal(status.body.received_requests, 2);
 
   await service.call('POST', '/api/v1/integrations/burp/heartbeat');
   const afterHeartbeat = await service.call('GET', '/api/v1/integrations/burp/status');
@@ -277,14 +297,22 @@ test('le vocabulaire de triage est fermé', () => {
   assert.equal(validateStatusUpdate({ status: 'triaged' }).actor, 'local-user');
 });
 
-test('seules les cibles locales sont acceptées pour un scénario', () => {
-  assert.throws(() => validateHttpScenario({
+test('un scénario capturé est accepté local comme distant, et sa portée est enregistrée', () => {
+  // Enregistrer n'emet rien : la portee est notee, pas refusee.
+  const remote = validateHttpScenario({
     name: 'x', source: 'har', request: { method: 'GET', url: 'http://192.168.1.10/' }
-  }), /local/i);
+  });
+  assert.equal(remote.request.url, 'http://192.168.1.10/');
+  assert.equal(remote.scope, 'remote');
   const local = validateHttpScenario({
     name: 'x', source: 'har', request: { method: 'GET', url: 'http://localhost:3000/' }
   });
   assert.equal(local.request.url, 'http://localhost:3000/');
+  assert.equal(local.scope, 'local');
+  // Ce qui n'est pas une requete HTTP reste refuse.
+  assert.throws(() => validateHttpScenario({
+    name: 'x', source: 'har', request: { method: 'GET', url: 'ftp://serveur/x' }
+  }), /HTTP and HTTPS/);
 });
 
 test('la rédaction des métadonnées descend dans les listes et les objets', () => {
@@ -322,6 +350,10 @@ test('le gestionnaire démarre réellement le service, puis l’arrête', async 
       : { state: 'offline', online: false, url, label: 'Hors ligne', hint: '', message: 'hors perimetre du test' }),
     freePort: async () => port,
     portFree: async (candidate) => candidate === port,
+    // Jamais le vrai ~/.security-center/backend.json : ce backend de test, sans
+    // clé, y remplaçait l'adresse et la clé du backend réellement utilisé, et
+    // Burp se retrouvait avec une clé vide vers un port déjà fermé.
+    publishDiscovery: () => {},
     startTimeoutMs: 15000
   });
   t.after(async () => { await manager.stopLocalBackend(); });

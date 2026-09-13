@@ -149,11 +149,15 @@ test('« unknown » est transitoire : aucun état résolu ne le produit', () => 
 test('un échec de données ne laisse pas le badge sur « unknown » : il redemande l’état', () => {
   assert.match(extensionSource, /refreshBackendBadge\(\{ start: true \}\)/,
     'l’activation doit résoudre le badge, en démarrant le service en mode Auto');
-  // Les deux `.catch()` des appels de données interrogent le gestionnaire.
+  // Les échecs d'appel de données interrogent le gestionnaire : celui de la
+  // lecture initiale par son `.catch()`, et ceux du rafraîchissement périodique
+  // par le `onError` du coordinateur — une seule horloge, un seul point d'échec.
   const catches = extensionSource.match(/\}\)\.catch\(\(\) => \{[\s\S]{0,320}?\}\);/g) || [];
   const refreshing = catches.filter((block) => block.includes('refreshBackendBadge'));
-  assert.ok(refreshing.length >= 2,
-    'les échecs d’appel de données doivent rafraîchir le badge, pas le laisser tel quel');
+  assert.ok(refreshing.length >= 1,
+    'l’échec de la lecture initiale doit rafraîchir le badge');
+  assert.match(extensionSource, /onError: \(\) => \{[\s\S]{0,320}?refreshBackendBadge\(\)/,
+    'l’échec d’une source du coordinateur doit rafraîchir le badge, pas laisser « online »');
 });
 
 test('le badge rend un ton juste : distant en ligne, démarrage neutre', () => {
@@ -183,7 +187,7 @@ test('aucun scanner ni Live Security n’importe le backend', () => {
     if (!fs.existsSync(file)) continue;
     const source = fs.readFileSync(file, 'utf8');
     assert.doesNotMatch(source, /require\('\.\.?\/?backend(-config|-manager)?'\)/,
-      `${relative} ne doit pas dépendre du backend Secenter`);
+      `${relative} ne doit pas dépendre du backend SCenter`);
   }
 });
 
@@ -196,7 +200,7 @@ test('lancer une analyse n’attend pas le backend', () => {
     'un backend indisponible ne doit pas empêcher une analyse de démarrer');
 });
 
-test('le backend Secenter n’est pas l’application analysée', () => {
+test('le backend SCenter n’est pas l’application analysée', () => {
   // Deux services distincts sur la machine : le port applicatif de la cible
   // dynamique n'est jamais celui du backend de persistance.
   const { DEFAULT_BACKEND_URL } = require('../src/backend-config');

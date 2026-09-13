@@ -190,7 +190,43 @@ function validatePolicy(raw) {
   if (!Number.isInteger(maxParallelScanners) || maxParallelScanners < 1 || maxParallelScanners > 4) {
     throw new Error('execution.max_parallel_scanners doit être un entier entre 1 et 4.');
   }
-  return { version: Number(raw.version || 1), scanners, failOn, maxActive, includeTests, licensesDenied, gitleaksHistory, gitleaksHistoryIncremental, gitleaksConfig, semgrepCustomRules, zapActive, zapOpenapi, zapContext, zapUser, zapEngine, zapLocalPath, zapPolicyMinSeverity, zapAuth, sonarMode, sonarIncludeCodeSmells, snykMode, snykCapabilities, gate, supplyChain, exclusions, maxParallelScanners };
+  // Which legacy thresholds the file writes explicitly. A default is not a rule
+  // the user chose, so only written keys are reported as ignored by the gate.
+  const legacyRules = { failOn: raw.policy?.fail_on !== undefined, maxActive: raw.policy?.max_active !== undefined };
+  return { version: Number(raw.version || 1), scanners, failOn, maxActive, includeTests, licensesDenied, gitleaksHistory, gitleaksHistoryIncremental, gitleaksConfig, semgrepCustomRules, zapActive, zapOpenapi, zapContext, zapUser, zapEngine, zapLocalPath, zapPolicyMinSeverity, zapAuth, sonarMode, sonarIncludeCodeSmells, snykMode, snykCapabilities, gate, supplyChain, legacyRules, exclusions, maxParallelScanners };
+}
+
+/**
+ * One verdict decider.
+ *
+ * A project that configures `gate:` or `supply_chain:` is judged by the Policy
+ * Gate alone. The legacy `policy.fail_on` / `policy.max_active` thresholds (and
+ * the CLI's `--fail-on`) only decide for projects that configure neither, which
+ * is what keeps old projects working unchanged. `policy.include_tests` is not
+ * legacy: the gate reads it.
+ */
+function gateDecides(policy) {
+  return Boolean(policy?.gate?.configured || policy?.supplyChain?.configured);
+}
+
+/** The legacy rules a configured gate supersedes, as the user wrote them. */
+function legacyRulesIgnored(policy, { cliFailOn = '' } = {}) {
+  if (!gateDecides(policy)) return [];
+  const keys = [];
+  if (policy.legacyRules?.failOn) keys.push('policy.fail_on');
+  if (policy.legacyRules?.maxActive) keys.push('policy.max_active');
+  if (cliFailOn) keys.push('--fail-on');
+  return keys;
+}
+
+/** The migration notice, or '' when nothing legacy is being ignored. */
+function legacyPolicyNotice(policy, options = {}) {
+  const keys = legacyRulesIgnored(policy, options);
+  if (!keys.length) return '';
+  const named = keys.length === 1 ? keys[0] : `${keys.slice(0, -1).join(', ')} et ${keys[keys.length - 1]}`;
+  return keys.length === 1
+    ? `Policy Gate actif : ${named} est une règle legacy et ne participe plus au verdict.`
+    : `Policy Gate actif : ${named} sont des règles legacy et ne participent plus au verdict.`;
 }
 
 async function loadProjectPolicy(workspacePath) {
@@ -212,6 +248,16 @@ function evaluatePolicy(findings, policy) {
     && (policy.includeTests || finding.sourceContext !== 'test'));
   const active = allActive.filter((finding) => finding.tool !== 'ZAP'
     || (SEVERITY_RANK[String(finding.rawSeverity || finding.severity).toUpperCase()] ?? 0) >= SEVERITY_RANK[policy.zapPolicyMinSeverity || 'INFO']);
+  if (gateDecides(policy)) {
+    // The Policy Gate decides. The legacy thresholds are neither applied nor
+    // reported as passed-by-them: `decidedBy` says who decides, and the keys
+    // that no longer take part are named instead of silently dropped.
+    return {
+      passed: true, decidedBy: 'gate', legacyIgnored: legacyRulesIgnored(policy),
+      activeCount: active.length, totalActiveCount: allActive.length, ignoredByToolThreshold: allActive.length - active.length,
+      blockingCount: 0, reasons: [], policy
+    };
+  }
   const threshold = SEVERITY_RANK[policy.failOn];
   const blockingFindings = active.filter((finding) => (SEVERITY_RANK[String(finding.rawSeverity || finding.severity).toUpperCase()] ?? 0) >= threshold);
   const reasons = [];
@@ -327,5 +373,6 @@ function starterPolicyYaml() {
 
 module.exports = {
   TOOL_KEYS, SEVERITY_RANK, parsePolicyYaml, validatePolicy, loadProjectPolicy, evaluatePolicy,
+  gateDecides, legacyRulesIgnored, legacyPolicyNotice,
   STARTER_GATE, applyGateToPolicyYaml, starterPolicyYaml, renderGateSection, sectionRange
 };

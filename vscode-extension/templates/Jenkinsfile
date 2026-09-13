@@ -1,15 +1,491 @@
-// Security Center — exemple de pipeline Jenkins.
+// Security Center — pipeline Jenkins du CI Engine.
 //
-// Le point de ce fichier : la MÊME politique projet qui décide dans l'éditeur
-// décide aussi en CI. Security Center n'est pas rejoué avec des règles
-// différentes — `security-center.yml` du dépôt est la seule source.
+// Ce pipeline appartient à Jenkins, pas au dépôt applicatif : le dépôt ne
+// contient que son code et security-center.yml. security-center.yml est la
+// seule source des choix de sécurité — scanners, seuils, secrets, SBOM,
+// provenance, signature. Ce fichier n'en duplique aucun : il installe le CI
+// Engine attendu, l'exécute, puis applique son verdict.
 //
 // Codes de sortie du CLI, à ne pas réinterpréter :
-//   0  accepté — Policy Gate PASS ou WARN, ou aucune politique définie
-//   1  refusé  — Policy Gate BLOCK
-//   2  échec d'exécution ou politique illisible
+//   0  accepté — analyse complète, Policy Gate PASS ou WARN : déploiement autorisé
+//   1  refusé  — analyse complète, Policy Gate BLOCK : déploiement ignoré
+//   2  échec d'exécution — scanner en échec, CI Engine indisponible ou politique invalide : déploiement ignoré
 //
-// Aucun identifiant n'est écrit ici. Les jetons viennent des credentials Jenkins.
+// Configuration Jenkins, une seule fois par l'administrateur (jamais dans le dépôt) :
+//   SCENTER_ENGINE_MANIFEST_URL     URL stable de security-center-latest.json, publié par le build
+//                                   Security Center : il nomme le paquet CI Engine, son SHA-256 et
+//                                   son commit. Jenkins se met à jour seul à chaque nouveau build.
+//   SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL  (optionnel) credential texte : jeton d'un hébergement privé
+//   Repli rétrocompatible, sans manifeste :
+//   SCENTER_ENGINE_TGZ_URL          URL du paquet CI Engine (.tgz produit par npm pack)
+//                                   ou SCENTER_ENGINE_TGZ_URL_CREDENTIAL (credential texte contenant l'URL)
+//   SCENTER_ENGINE_SHA256           SHA-256 attendu de ce paquet : le build du CI Engine à utiliser
+//   SCENTER_PROJECT_REPO_URL        dépôt applicatif analysé (sinon `checkout scm`)
+//   SCENTER_PROJECT_BRANCH          branche analysée (défaut : master)
+//   SCENTER_PROJECT_CREDENTIALS_ID  credential Git du dépôt, s'il est privé
+//   SCENTER_DEPLOY_COMMAND          commande de déploiement, exécutée seulement sur PASS
+//   SCENTER_HEALTHCHECK_URL         URL vérifiée après un déploiement réussi
+// Credentials optionnels, liés seulement quand security-center.yml en a besoin :
+//   security-center-sonar-token (scanners.sonarqube: true), security-center-snyk-token (scanners.snyk: true),
+//   SECURITY_CENTER_COSIGN_KEY_CREDENTIAL / _PASSWORD_CREDENTIAL / _PUBLIC_KEY_CREDENTIAL (signature).
+//
+// Aucun identifiant n'est écrit ici.
+
+// Copie exacte de ci-engine/scenter-engine-bootstrap.sh (identité vérifiée par les tests).
+def SCENTER_ENGINE_BOOTSTRAP = '''#!/usr/bin/env bash
+#
+# Security Center CI Engine - automatic Jenkins bootstrap.
+#
+# Runs at the start of every Security Center pipeline, inside the Jenkins
+# agent. It makes sure the expected CI Engine build is installed, and does
+# nothing when it already is:
+#
+#   installed with the expected SHA-256  -> use it, no reinstall
+#   installed with another build         -> download, verify, upgrade
+#   absent                               -> download, verify, install
+#   any failure                          -> exit 2 (ERROR): the scan must not run
+#
+# Jenkins-level configuration (never in the application repository), either:
+#   SCENTER_ENGINE_MANIFEST_URL  one stable URL of security-center-latest.json,
+#                                published by the Security Center build: it names
+#                                the TGZ URL, its SHA-256 and the source commit
+# or, as a backward-compatible fallback:
+#   SCENTER_ENGINE_TGZ_URL       where the engine package (npm pack .tgz) is served
+#   SCENTER_ENGINE_SHA256        SHA-256 of that exact package: the expected build
+# Optional:
+#   SCENTER_ENGINE_DOWNLOAD_TOKEN  bearer token for a private artifact host, sent
+#                                  only to the manifest host, never logged
+#   SCENTER_TOOLS_DIR (default /var/jenkins_home/tools), SCENTER_NODE_HOME,
+#   SCENTER_ENGINE_PREFIX, SCENTER_ENGINE_PACKAGES,
+#   SCENTER_BOOTSTRAP_FAILURE_REPORT (CI report written when the engine is unavailable)
+#
+# This file is embedded verbatim in templates/Jenkinsfile. Keep it free of
+# backslashes and triple quotes so the Groovy string stays byte-identical.
+
+set -Eeuo pipefail
+
+readonly PACKAGE_NAME='security-center-vscode'
+readonly HELP_MARKER='Security Center headless'
+
+TOOLS_DIR="${SCENTER_TOOLS_DIR:-/var/jenkins_home/tools}"
+NODE_HOME="${SCENTER_NODE_HOME:-$TOOLS_DIR/node22}"
+PREFIX="${SCENTER_ENGINE_PREFIX:-$TOOLS_DIR/security-center}"
+PACKAGES="${SCENTER_ENGINE_PACKAGES:-$TOOLS_DIR/security-center-packages}"
+MANIFEST_URL="${SCENTER_ENGINE_MANIFEST_URL:-}"
+DOWNLOAD_TOKEN="${SCENTER_ENGINE_DOWNLOAD_TOKEN:-}"
+ENGINE_URL="${SCENTER_ENGINE_TGZ_URL:-}"
+EXPECTED_SHA=''
+FAILURE_REPORT="${SCENTER_BOOTSTRAP_FAILURE_REPORT:-}"
+LOCK_TIMEOUT="${SCENTER_BOOTSTRAP_LOCK_TIMEOUT:-600}"
+MARKER="$PREFIX/scenter-ci-engine.json"
+LOCK_DIR="$PACKAGES/.bootstrap.lock"
+
+LOCK_HELD=0
+NODE_BIN=''
+NPM_BIN=''
+NODE_VERSION=''
+NPM_VERSION=''
+ENGINE_VERSION=''
+ENGINE_COMMAND=''
+PACKAGE_VERSION=''
+CACHED_PACKAGE=''
+ENGINE_SOURCE='direct'
+BUILD_COMMIT=''
+BUILD_TIMESTAMP=''
+MANIFEST_VERSION=''
+
+log() { echo "[scenter-engine] $*"; }
+
+# Printable, quote-free, bounded: safe inside the JSON written below.
+clean_text() {
+  printf '%s' "$1" | tr -cd '[:print:]' | tr -d '"' | cut -c1-300
+}
+
+# A URL without credentials, query string or fragment: safe to log and record.
+safe_url() {
+  local url="${1%%[?#]*}" scheme rest authority path
+  case "$url" in
+    *://*) scheme="${url%%://*}"; rest="${url#*://}" ;;
+    *) printf '%s' "$url"; return 0 ;;
+  esac
+  authority="${rest%%/*}"
+  path="${rest#"$authority"}"
+  printf '%s://%s%s' "$scheme" "${authority##*@}" "$path"
+}
+
+# The host[:port] of a URL, without credentials.
+url_authority() {
+  local url="${1%%[?#]*}" rest
+  case "$url" in
+    *://*) rest="${url#*://}"; rest="${rest%%/*}"; printf '%s' "${rest##*@}" ;;
+    *) printf '' ;;
+  esac
+}
+
+json_or_null() {
+  if [ -n "$1" ]; then printf '"%s"' "$(clean_text "$1")"; else printf 'null'; fi
+}
+
+# The CI report Security Delivery reads when the engine never ran: verdict
+# ERROR, engine not available, and nothing else claimed.
+write_failure_report() {
+  local reason="$1" commit='' branch=''
+  [ -n "$FAILURE_REPORT" ] || return 0
+  if command -v git >/dev/null 2>&1 && [ -n "${WORKSPACE:-}" ]; then
+    commit="$(git -C "$WORKSPACE" rev-parse HEAD 2>/dev/null || true)"
+    branch="$(git -C "$WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [ "$branch" = 'HEAD' ]; then branch=''; fi
+  fi
+  cat > "$FAILURE_REPORT" <<REPORT
+{
+  "schemaVersion": 1,
+  "generatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "verdict": { "status": "ERROR", "exitCode": 2 },
+  "engine": null,
+  "execution": { "scanId": "", "status": "engine_unavailable", "failedScanners": [], "error": $(json_or_null "$reason") },
+  "stages": null,
+  "repository": { "commit": $(json_or_null "$commit"), "branch": $(json_or_null "$branch") },
+  "policy": { "status": "NOT_EVALUATED", "configured": false, "blockingCount": 0, "warningCount": 0, "summary": "", "reasons": [], "legacyNotice": "" },
+  "scanners": []
+}
+REPORT
+}
+
+release_lock() {
+  if [ "$LOCK_HELD" = 1 ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+  fi
+}
+
+fail() {
+  local reason
+  reason="$(clean_text "$*")"
+  trap - ERR
+  echo "[scenter-engine] ERROR: $reason" >&2
+  echo 'SCENTER_ENGINE_STATUS=ERROR'
+  write_failure_report "$reason" || true
+  release_lock
+  exit 2
+}
+
+trap 'fail "unexpected bootstrap error (line $LINENO)"' ERR
+trap release_lock EXIT
+
+sha_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+resolve_toolchain() {
+  local candidate
+  NODE_BIN="${SCENTER_NODE:-}"
+  if [ -z "$NODE_BIN" ]; then
+    for candidate in "$NODE_HOME/bin/node" "$NODE_HOME/node"; do
+      if [ -x "$candidate" ]; then NODE_BIN="$candidate"; break; fi
+    done
+  fi
+  [ -n "$NODE_BIN" ] || fail "Node.js not found in $NODE_HOME (one-time Jenkins prerequisite: install Node.js 22 there)"
+  NODE_VERSION="$("$NODE_BIN" --version 2>/dev/null)" || fail "Node.js at $NODE_BIN does not run"
+  NPM_BIN="${SCENTER_NPM:-}"
+  if [ -z "$NPM_BIN" ]; then
+    for candidate in "$NODE_HOME/bin/npm" "$NODE_HOME/npm"; do
+      if [ -x "$candidate" ]; then NPM_BIN="$candidate"; break; fi
+    done
+  fi
+  [ -n "$NPM_BIN" ] || fail "npm not found next to Node.js in $NODE_HOME"
+  PATH="$(dirname "$NODE_BIN"):$PATH"
+  export PATH
+  NPM_VERSION="$("$NPM_BIN" --version 2>/dev/null)" || fail "npm at $NPM_BIN does not run"
+}
+
+# Prints one string field of a JSON file, nothing when absent or unreadable.
+json_field() {
+  "$NODE_BIN" -e 'try { const v = require(process.argv[1])[process.argv[2]]; if (typeof v === "string") process.stdout.write(v); } catch (e) {}' "$1" "$2"
+}
+
+installed_package_json() {
+  local candidate
+  for candidate in "$PREFIX/lib/node_modules/$PACKAGE_NAME/package.json" "$PREFIX/node_modules/$PACKAGE_NAME/package.json"; do
+    if [ -f "$candidate" ]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+installed_command() {
+  local candidate
+  for candidate in "$PREFIX/bin/security-center" "$PREFIX/security-center"; do
+    if [ -f "$candidate" ] || [ -L "$candidate" ]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+acquire_lock() {
+  local waited=0
+  mkdir -p "$PACKAGES" "$PREFIX" 2>/dev/null || fail "cannot create $PREFIX and $PACKAGES (the Jenkins user must own $TOOLS_DIR)"
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+      log 'removing a stale bootstrap lock older than 30 minutes'
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
+      fail "another build has held the CI Engine bootstrap lock for more than ${LOCK_TIMEOUT}s ($LOCK_DIR)"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  LOCK_HELD=1
+}
+
+# Downloads $1 to $2. With $3=yes and a token configured, the token travels in a
+# private header file, never on the command line or in the log.
+download() {
+  local url="$1" destination="$2" with_token="${3:-no}" header_file status
+  rm -f "$destination"
+  if command -v curl >/dev/null 2>&1; then
+    if [ "$with_token" = yes ] && [ -n "$DOWNLOAD_TOKEN" ]; then
+      header_file="$PACKAGES/.auth-$$.header"
+      ( umask 077; printf 'Authorization: Bearer %s' "$DOWNLOAD_TOKEN" > "$header_file" )
+      if curl -fsSL --retry 2 -H "@$header_file" -o "$destination" "$url" 2>/dev/null; then status=0; else status=1; fi
+      rm -f "$header_file"
+      return "$status"
+    fi
+    if curl -fsSL --retry 2 -o "$destination" "$url" 2>/dev/null; then return 0; fi
+    return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    if [ "$with_token" = yes ] && [ -n "$DOWNLOAD_TOKEN" ]; then
+      if wget -q --header="Authorization: Bearer $DOWNLOAD_TOKEN" -O "$destination" "$url"; then return 0; fi
+      return 1
+    fi
+    if wget -q -O "$destination" "$url"; then return 0; fi
+    return 1
+  fi
+  fail 'neither curl nor wget is available on the Jenkins agent'
+}
+
+# Which build is expected: from the published manifest, or from the direct
+# fallback variables. Nothing is installed before this is known and valid.
+resolve_expected_build() {
+  local manifest fields key value
+  if [ -z "$MANIFEST_URL" ]; then
+    ENGINE_SOURCE='direct'
+    EXPECTED_SHA="$(printf '%s' "${SCENTER_ENGINE_SHA256:-}" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
+    [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || fail 'SCENTER_ENGINE_SHA256 is not configured on Jenkins, and no SCENTER_ENGINE_MANIFEST_URL is set (one of them is required)'
+    return 0
+  fi
+  ENGINE_SOURCE='manifest'
+  if [ -n "${SCENTER_ENGINE_TGZ_URL:-}${SCENTER_ENGINE_SHA256:-}" ]; then
+    log 'SCENTER_ENGINE_MANIFEST_URL is set: the direct SCENTER_ENGINE_TGZ_URL and SCENTER_ENGINE_SHA256 values are ignored'
+  fi
+  manifest="$PACKAGES/.manifest-latest-$$.json"
+  log "reading the CI Engine manifest from $(safe_url "$MANIFEST_URL")"
+  if ! download "$MANIFEST_URL" "$manifest" yes; then
+    rm -f "$manifest"
+    fail "CI Engine manifest unreachable: $(safe_url "$MANIFEST_URL")"
+  fi
+  if ! fields="$("$NODE_BIN" -e '
+    const fs = require("fs");
+    let m;
+    try { m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { console.error("not valid JSON"); process.exit(1); }
+    if (!m || typeof m !== "object" || Array.isArray(m)) { console.error("not a JSON object"); process.exit(1); }
+    const hex = (v, n) => typeof v === "string" && v.length === n && /^[0-9a-f]+$/.test(v);
+    const text = (v) => String(v).split("").filter((c) => c >= " " && c <= "~").join("");
+    const tgz = m.tgz && typeof m.tgz === "object" ? m.tgz : {};
+    const problems = [];
+    if (m.schemaVersion !== 1) problems.push("schemaVersion must be 1");
+    if (m.name !== "security-center-vscode") problems.push("name must be security-center-vscode");
+    if (typeof m.version !== "string" || !/^[0-9]+[.][0-9]+[.][0-9]+/.test(m.version)) problems.push("version is missing");
+    if (!hex(m.commit, 40)) problems.push("commit must be a 40-hex git SHA");
+    if (typeof m.buildTimestamp !== "string" || Number.isNaN(Date.parse(m.buildTimestamp))) problems.push("buildTimestamp is missing");
+    if (typeof tgz.url !== "string" || !/^(https?|file):[/][/]/.test(tgz.url)) problems.push("tgz.url must be an http(s) or file URL");
+    if (!hex(tgz.sha256, 64)) problems.push("tgz.sha256 must be a 64-hex SHA-256");
+    if (problems.length) { console.error(problems.join("; ")); process.exit(1); }
+    const nl = String.fromCharCode(10);
+    process.stdout.write(["TGZ_URL=" + text(tgz.url), "TGZ_SHA256=" + tgz.sha256, "COMMIT=" + m.commit, "VERSION=" + text(m.version), "BUILT=" + text(m.buildTimestamp)].join(nl) + nl);
+  ' "$manifest" 2>&1)"; then
+    rm -f "$manifest"
+    fail "invalid CI Engine manifest from $(safe_url "$MANIFEST_URL"): $fields"
+  fi
+  rm -f "$manifest"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TGZ_URL) ENGINE_URL="$value" ;;
+      TGZ_SHA256) EXPECTED_SHA="$value" ;;
+      COMMIT) BUILD_COMMIT="$value" ;;
+      VERSION) MANIFEST_VERSION="$value" ;;
+      BUILT) BUILD_TIMESTAMP="$value" ;;
+    esac
+  done <<FIELDS
+$fields
+FIELDS
+  [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid CI Engine manifest: no valid tgz.sha256'
+  log "manifest build: $PACKAGE_NAME@$MANIFEST_VERSION, commit $BUILD_COMMIT, built $BUILD_TIMESTAMP"
+}
+
+# The expected build is installed, verified by its recorded SHA-256 and by
+# actually running the command.
+engine_is_expected() {
+  local package_json command help marker_sha
+  [ -f "$MARKER" ] || return 1
+  marker_sha="$(json_field "$MARKER" sha256)"
+  [ "$marker_sha" = "$EXPECTED_SHA" ] || return 1
+  package_json="$(installed_package_json)" || return 1
+  command="$(installed_command)" || return 1
+  help="$("$command" --help 2>&1)" || return 1
+  case "$help" in *"$HELP_MARKER"*) ;; *) return 1 ;; esac
+  ENGINE_VERSION="$(json_field "$package_json" version)"
+  ENGINE_COMMAND="$command"
+  if [ -z "$BUILD_COMMIT" ]; then BUILD_COMMIT="$(json_field "$MARKER" commit)"; fi
+  return 0
+}
+
+fetch_package() {
+  local cached="$PACKAGES/sha256-$EXPECTED_SHA.tgz" download_file actual source token_mode=no
+  CACHED_PACKAGE="$cached"
+  if [ -f "$cached" ] && [ "$(sha_of "$cached")" = "$EXPECTED_SHA" ]; then
+    log "package found in the persistent cache: $cached"
+    return 0
+  fi
+  [ -n "$ENGINE_URL" ] || fail 'the CI Engine must be provisioned but SCENTER_ENGINE_TGZ_URL is not configured on Jenkins'
+  source="$(safe_url "$ENGINE_URL")"
+  # The download token only ever goes back to the host that served the manifest.
+  if [ "$ENGINE_SOURCE" = manifest ] && [ "$(url_authority "$ENGINE_URL")" = "$(url_authority "$MANIFEST_URL")" ]; then
+    token_mode=yes
+  fi
+  download_file="$PACKAGES/.download-$$.tgz"
+  log "downloading the CI Engine package from $source"
+  if ! download "$ENGINE_URL" "$download_file" "$token_mode"; then
+    rm -f "$download_file"
+    fail "download failed from $source"
+  fi
+  actual="$(sha_of "$download_file")"
+  if [ "$actual" != "$EXPECTED_SHA" ]; then
+    rm -f "$download_file"
+    fail "checksum mismatch for $source: expected $EXPECTED_SHA, got $actual. Package rejected, nothing installed."
+  fi
+  mv -f "$download_file" "$cached"
+  log "package verified (sha256 $EXPECTED_SHA) and cached: $cached"
+}
+
+validate_package() {
+  local package="$1" manifest name version entry
+  if ! tar -tzf "$package" package/package.json package/src/cli.js >/dev/null 2>&1; then
+    fail 'the configured package is not a Security Center CI Engine package'
+  fi
+  manifest="$PACKAGES/.manifest-$$.json"
+  if ! tar -xOzf "$package" package/package.json > "$manifest" 2>/dev/null; then
+    rm -f "$manifest"
+    fail 'cannot read package.json from the CI Engine package'
+  fi
+  name="$(json_field "$manifest" name)"
+  version="$(json_field "$manifest" version)"
+  rm -f "$manifest"
+  [ "$name" = "$PACKAGE_NAME" ] || fail "unexpected package name '$name' (expected $PACKAGE_NAME)"
+  [[ "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+ ]] || fail 'the CI Engine package has no valid version'
+  if [ "$ENGINE_SOURCE" = manifest ] && [ "$version" != "$MANIFEST_VERSION" ]; then
+    fail "the manifest names version $MANIFEST_VERSION but the package is version $version"
+  fi
+  # Byte-level check: some shells strip a trailing carriage return in command
+  # substitution, which would let a CRLF entrypoint pass a plain string compare.
+  entry="$PACKAGES/.entry-$$.js"
+  if ! tar -xOzf "$package" package/src/cli.js > "$entry" 2>/dev/null; then
+    rm -f "$entry"
+    fail 'cannot read the CI Engine entrypoint from the package'
+  fi
+  if ! "$NODE_BIN" -e 'const b = require("fs").readFileSync(process.argv[1]); const end = b.indexOf(10); const first = b.subarray(0, end < 0 ? b.length : end).toString("latin1"); process.exit(first === "#!/usr/bin/env node" ? 0 : 1);' "$entry"; then
+    rm -f "$entry"
+    fail 'the CI Engine entrypoint is not Linux-safe (missing shebang or CRLF line endings)'
+  fi
+  rm -f "$entry"
+  PACKAGE_VERSION="$version"
+}
+
+install_package() {
+  log "installing $PACKAGE_NAME@$PACKAGE_VERSION into $PREFIX"
+  if ! "$NPM_BIN" install --global --prefix "$PREFIX" "$CACHED_PACKAGE" --no-audit --no-fund --loglevel=error >/dev/null; then
+    fail 'npm install of the CI Engine failed'
+  fi
+}
+
+verify_install() {
+  local package_json command help
+  package_json="$(installed_package_json)" || fail "installed package not found under $PREFIX after npm install"
+  command="$(installed_command)" || fail "security-center command not created under $PREFIX"
+  help="$("$command" --help 2>&1)" || fail 'security-center --help failed after install'
+  case "$help" in *"$HELP_MARKER"*) ;; *) fail 'security-center --help did not print the Security Center help' ;; esac
+  ENGINE_VERSION="$(json_field "$package_json" version)"
+  [ "$ENGINE_VERSION" = "$PACKAGE_VERSION" ] || fail "installed version $ENGINE_VERSION differs from the package version $PACKAGE_VERSION"
+  ENGINE_COMMAND="$command"
+}
+
+write_marker() {
+  local previous="$1" temporary="$MARKER.tmp.$$" source
+  if [ "$ENGINE_SOURCE" = manifest ]; then source="$(safe_url "$MANIFEST_URL")"; else source="$(safe_url "$ENGINE_URL")"; fi
+  cat > "$temporary" <<MARKER_JSON
+{
+  "engine": "security-center",
+  "package": "$PACKAGE_NAME",
+  "version": "$(clean_text "$ENGINE_VERSION")",
+  "sha256": "$EXPECTED_SHA",
+  "commit": "$(clean_text "$BUILD_COMMIT")",
+  "buildTimestamp": "$(clean_text "$BUILD_TIMESTAMP")",
+  "resolvedBy": "$ENGINE_SOURCE",
+  "installedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "installedBy": "jenkins-bootstrap",
+  "source": "$(clean_text "$source")",
+  "previousSha256": "$previous",
+  "node": "$(clean_text "$NODE_VERSION")",
+  "npm": "$(clean_text "$NPM_VERSION")",
+  "command": "$(clean_text "$ENGINE_COMMAND")"
+}
+MARKER_JSON
+  mv -f "$temporary" "$MARKER"
+}
+
+emit() {
+  echo 'SCENTER_ENGINE_STATUS=READY'
+  echo "SCENTER_ENGINE_ACTION=$1"
+  echo "SCENTER_ENGINE_VERSION=$ENGINE_VERSION"
+  echo "SCENTER_ENGINE_SHA256=$EXPECTED_SHA"
+  echo "SCENTER_ENGINE_COMMIT=$BUILD_COMMIT"
+  echo "SCENTER_ENGINE_SOURCE=$ENGINE_SOURCE"
+  echo "SCENTER_ENGINE_COMMAND=$ENGINE_COMMAND"
+}
+
+main() {
+  local previous='' action='installed'
+  resolve_toolchain
+  log "node $NODE_VERSION, npm $NPM_VERSION"
+  acquire_lock
+  resolve_expected_build
+  if engine_is_expected; then
+    log "CI Engine $ENGINE_VERSION already installed with the expected build: nothing to do"
+    emit unchanged
+    release_lock
+    return 0
+  fi
+  if [ -f "$MARKER" ]; then
+    previous="$(json_field "$MARKER" sha256)"
+    [[ "$previous" =~ ^[0-9a-f]{64}$ ]] || previous=''
+  fi
+  if [ -n "$previous" ] || installed_package_json >/dev/null; then action='updated'; fi
+  fetch_package
+  validate_package "$CACHED_PACKAGE"
+  install_package
+  verify_install
+  write_marker "$previous"
+  log "CI Engine $ENGINE_VERSION $action and verified"
+  emit "$action"
+  release_lock
+}
+
+main "$@"
+'''
 
 pipeline {
   agent any
@@ -17,68 +493,145 @@ pipeline {
   options {
     timestamps()
     // Une analyse de sécurité qui ne finit pas ne doit pas bloquer l'agent.
-    timeout(time: 30, unit: 'MINUTES')
+    timeout(time: 45, unit: 'MINUTES')
+    // Un seul build à la fois : le CI Engine et les preuves ne se chevauchent pas.
+    disableConcurrentBuilds()
+  }
+
+  // Déclenchement après un push GitHub. Le webhook GitHub vers
+  // /git/notifyCommit (plugin Git) lance un build immédiat quand Jenkins est
+  // joignable depuis GitHub ; le polling reste le filet de sécurité quand il ne
+  // l'est pas (Jenkins sur un réseau privé).
+  triggers {
+    pollSCM('H/2 * * * *')
   }
 
   environment {
-    // Ces variables sont lues par le CLI ; elles ne sont jamais journalisées.
-    // Déclarez-les comme credentials Jenkins de type « Secret text ».
-    SONAR_TOKEN = credentials('security-center-sonar-token')
-    SNYK_TOKEN  = credentials('security-center-snyk-token')
+    // Emplacements persistants : jamais dans le workspace applicatif.
+    SCENTER_TOOLS_DIR = '/var/jenkins_home/tools'
+    PATH = "/var/jenkins_home/tools/security-center/bin:/var/jenkins_home/tools/node22/bin:${env.PATH}"
   }
 
   stages {
 
     stage('Checkout') {
       steps {
-        checkout scm
-      }
-    }
-
-    stage('Build & Test') {
-      steps {
-        sh 'npm ci'
-        sh 'npm test'
-      }
-    }
-
-    stage('Security Center') {
-      steps {
-        // `--ci-report` produit le rapport CI normalisé : schéma stable, sans
-        // finding brut et sans secret. C'est CE fichier que l'extension VS Code
-        // relit pour afficher le verdict réel de ce build.
-        // `--output` garde le rapport complet pour le reste de la chaîne.
-        //
-        // `returnStatus` est indispensable : on veut LIRE le code de sortie, pas
-        // laisser Jenkins interrompre le pipeline avant l'archivage.
-        //
-        // Le CLI est celui du dépôt fraîchement extrait, exactement comme dans le
-        // workflow GitHub. Il n'est jamais téléchargé : « security-center » n'est
-        // pas un paquet npm publié, et un `npx --yes` sur ce nom irait chercher
-        // sur le registre public ce qui l'occupe — précisément le risque de chaîne
-        // d'approvisionnement que ce pipeline est censé détecter.
         script {
-          env.SC_EXIT = sh(
-            returnStatus: true,
-            script: '''
-              node vscode-extension/src/cli.js scan \
-                --workspace "$WORKSPACE" \
-                --format json \
-                --output security-center-full-report.json \
-                --ci-report security-center-report.json \
-                --sbom \
-                --provenance
-            '''
-          ).toString()
+          env.SC_EXIT = '2'
+          env.SC_VERDICT = 'ERROR'
+          env.SC_ENGINE_READY = 'false'
+          env.SC_DEPLOY_STATUS = 'SKIPPED'
+          env.SC_DEPLOY_REASON = 'Analyse Security Center non terminée.'
+          env.SC_HEALTH_STATUS = 'SKIPPED'
+          env.SC_HEALTH_DETAIL = 'Aucun déploiement.'
+          if (env.SCENTER_PROJECT_REPO_URL) {
+            def repository = [url: env.SCENTER_PROJECT_REPO_URL, branch: env.SCENTER_PROJECT_BRANCH ?: 'master']
+            if (env.SCENTER_PROJECT_CREDENTIALS_ID) {
+              repository.credentialsId = env.SCENTER_PROJECT_CREDENTIALS_ID
+            }
+            git(repository)
+          } else {
+            checkout scm
+          }
+          // Les preuves d'un build précédent ne doivent jamais être attribuées à celui-ci.
+          sh(label: 'Clean previous Security Center outputs', script: 'rm -rf security-center-report.json security-center-full-report.json security-center-delivery.json security-center')
+          if (!fileExists('security-center.yml') && !fileExists('security-center.yaml')) {
+            echo 'security-center.yml absent : projet non configuré dans Security Center. Le Policy Gate sera NOT_CONFIGURED.'
+          }
+        }
+      }
+    }
+
+    stage('Bootstrap Security Center CI Engine') {
+      steps {
+        script {
+          def engineCredentials = []
+          if (env.SCENTER_ENGINE_TGZ_URL_CREDENTIAL) {
+            engineCredentials << string(credentialsId: env.SCENTER_ENGINE_TGZ_URL_CREDENTIAL, variable: 'SCENTER_ENGINE_TGZ_URL')
+          }
+          if (env.SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL) {
+            engineCredentials << string(credentialsId: env.SCENTER_ENGINE_DOWNLOAD_TOKEN_CREDENTIAL, variable: 'SCENTER_ENGINE_DOWNLOAD_TOKEN')
+          }
+          withCredentials(engineCredentials) {
+            withEnv(["SCENTER_BOOTSTRAP_FAILURE_REPORT=${env.WORKSPACE}/security-center-report.json"]) {
+              def status = sh(returnStatus: true, label: 'Bootstrap Security Center CI Engine', script: SCENTER_ENGINE_BOOTSTRAP)
+              env.SC_ENGINE_READY = status == 0 ? 'true' : 'false'
+              if (status != 0) {
+                // Jamais de repli silencieux sur un ancien moteur : l'analyse n'a pas lieu.
+                env.SC_EXIT = '2'
+                env.SC_VERDICT = 'ERROR'
+                env.SC_DEPLOY_REASON = 'CI Engine indisponible : bootstrap en échec.'
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Security Center Analysis') {
+      when {
+        expression { env.SC_ENGINE_READY == 'true' }
+      }
+      steps {
+        script {
+          // Liaison de credentials uniquement. Le choix des scanners, les seuils,
+          // les secrets et les exigences supply chain restent dans
+          // security-center.yml, lu par le CI Engine lui-même.
+          def enabledInPolicy = { String scanner ->
+            sh(returnStatus: true, script: "grep -Eqs '^  ${scanner}:[[:space:]]*true' security-center.yml security-center.yaml") == 0
+          }
+          def bindings = []
+          if (enabledInPolicy('sonarqube')) {
+            bindings << string(credentialsId: 'security-center-sonar-token', variable: 'SONAR_TOKEN')
+          }
+          if (enabledInPolicy('snyk')) {
+            bindings << string(credentialsId: 'security-center-snyk-token', variable: 'SNYK_TOKEN')
+          }
+          if (env.SECURITY_CENTER_COSIGN_KEY_CREDENTIAL) {
+            if (!env.SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL) {
+              error('Security Center : SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL est requis pour signer.')
+            }
+            bindings << file(credentialsId: env.SECURITY_CENTER_COSIGN_KEY_CREDENTIAL, variable: 'SC_COSIGN_KEY')
+            bindings << string(credentialsId: env.SECURITY_CENTER_COSIGN_PASSWORD_CREDENTIAL, variable: 'COSIGN_PASSWORD')
+            if (env.SECURITY_CENTER_COSIGN_PUBLIC_KEY_CREDENTIAL) {
+              bindings << file(credentialsId: env.SECURITY_CENTER_COSIGN_PUBLIC_KEY_CREDENTIAL, variable: 'SC_COSIGN_PUB')
+            }
+          }
+
+          withCredentials(bindings) {
+            // `returnStatus` : on LIT le code de sortie au lieu de laisser Jenkins
+            // interrompre le pipeline avant l'archivage des preuves.
+            def status = sh(
+              returnStatus: true,
+              label: 'Security Center Analysis',
+              script: '''
+                security-center scan \
+                  --workspace "$WORKSPACE" \
+                  --format json \
+                  --output security-center-full-report.json \
+                  --ci-report security-center-report.json \
+                  --sbom \
+                  --provenance \
+                  ${SONAR_PROJECT_KEY:+--sonar-project-key "$SONAR_PROJECT_KEY"} \
+                  ${SC_COSIGN_KEY:+--sign-key "$SC_COSIGN_KEY"} \
+                  ${SC_COSIGN_PUB:+--verify-key "$SC_COSIGN_PUB"}
+              '''
+            )
+            // Tout code hors du contrat (commande introuvable, crash) est un ERROR.
+            env.SC_EXIT = (status in [0, 1, 2]) ? status.toString() : '2'
+          }
+          if (env.SC_EXIT == '0' && !fileExists('security-center-report.json')) {
+            env.SC_EXIT = '2'
+          }
+          env.SC_VERDICT = ['0': 'PASS', '1': 'BLOCK', '2': 'ERROR'][env.SC_EXIT]
         }
       }
       post {
-        // Archivé dans TOUS les cas, avant que l'étape suivante n'interrompe le
-        // pipeline. Un build bloqué doit exposer ses preuves : c'est précisément
-        // le build qu'un développeur a besoin d'inspecter depuis son éditeur.
+        // Archivé dans TOUS les cas : un build bloqué doit exposer ses preuves.
         always {
           archiveArtifacts artifacts: 'security-center-report.json', allowEmptyArchive: true, fingerprint: true
           archiveArtifacts artifacts: 'security-center-full-report.json', allowEmptyArchive: true
+          archiveArtifacts artifacts: 'security-center/*.cdx.json, security-center/*.provenance.json, **/*.sigstore.json', excludes: '**/node_modules/**', allowEmptyArchive: true, fingerprint: true
         }
       }
     }
@@ -87,31 +640,47 @@ pipeline {
       steps {
         script {
           if (env.SC_EXIT == '2') {
-            // Une politique illisible ou un scanner en échec n'est pas un PASS.
-            error("Security Center : échec d'exécution ou politique invalide (code 2).")
+            if (env.SC_ENGINE_READY == 'true') {
+              env.SC_DEPLOY_REASON = 'Security Center ERROR : analyse incomplète ou non fiable.'
+            }
+            // Une politique illisible, un scanner en échec ou un CI Engine absent n'est pas un PASS.
+            error("Security Center : ERROR — échec d'exécution, CI Engine indisponible ou politique invalide (code 2). Déploiement ignoré.")
           }
           if (env.SC_EXIT == '1') {
-            // Refus de la politique projet. Le build est marqué en échec et le
-            // déploiement ne s'exécutera pas.
-            error('Security Center : Policy Gate BLOCK — livraison refusée.')
+            env.SC_DEPLOY_REASON = 'Policy Gate BLOCK : livraison refusée par security-center.yml.'
+            error('Security Center : Policy Gate BLOCK — livraison refusée. Déploiement ignoré.')
           }
-          echo 'Security Center : Policy Gate accepté.'
+          env.SC_DEPLOY_REASON = ''
+          echo 'Security Center : PASS — livraison autorisée par security-center.yml.'
         }
       }
     }
 
     stage('Supply chain evidence') {
       steps {
-        // Le SBOM et la provenance ont été produits par l'étape précédente.
-        // La signature exige une clé : elle reste un credential Jenkins et
-        // n'est jamais écrite dans le dépôt.
-        archiveArtifacts artifacts: '**/*.cdx.json, **/*.intoto.jsonl', allowEmptyArchive: true
+        // Le CI Engine a déjà appliqué require_sbom, require_provenance et
+        // require_signature de security-center.yml : une preuve exigée mais
+        // absente donne un verdict non PASS. Ce contrôle final vérifie qu'aucune
+        // preuve déclarée produite n'est absente du disque.
+        sh(label: 'Verify supply chain evidence', script: '''
+          node -e '
+            const fs = require("fs");
+            const report = JSON.parse(fs.readFileSync("security-center-report.json", "utf8"));
+            const supply = report.supplyChain || {};
+            const produced = ["generated", "signed", "verified"];
+            for (const [kind, file] of [["sbom", supply.sbomPath], ["provenance", supply.provenancePath], ["signature", supply.signaturePath]]) {
+              if (!produced.includes(supply[kind])) continue;
+              if (!file || !fs.existsSync(file)) { console.error("Preuve " + kind + " déclarée mais absente : " + file); process.exit(1); }
+              console.log("Preuve " + kind + " : " + file);
+            }
+          '
+        ''')
       }
     }
 
     stage('Deploy') {
-      // Le déploiement ne peut pas s'exécuter sur un BLOCK : l'étape Policy Gate
-      // ci-dessus a déjà interrompu le pipeline. Cette condition est une seconde
+      // Le déploiement ne peut pas s'exécuter sur BLOCK ou ERROR : l'étape Policy
+      // Gate a déjà interrompu le pipeline. Cette condition est une seconde
       // barrière explicite, pas une redondance décorative.
       when {
         allOf {
@@ -120,16 +689,66 @@ pipeline {
         }
       }
       steps {
-        echo 'Déploiement autorisé par la politique de sécurité.'
-        // Remplacez par votre étape de déploiement réelle.
+        script {
+          if (!env.SCENTER_DEPLOY_COMMAND) {
+            env.SC_DEPLOY_STATUS = 'NOT_CONFIGURED'
+            env.SC_DEPLOY_REASON = 'PASS, mais SCENTER_DEPLOY_COMMAND n’est pas configuré sur ce job.'
+            env.SC_HEALTH_DETAIL = 'Aucun déploiement exécuté.'
+            echo env.SC_DEPLOY_REASON
+            return
+          }
+          def status = sh(returnStatus: true, label: 'Deploy', script: env.SCENTER_DEPLOY_COMMAND)
+          env.SC_DEPLOY_STATUS = status == 0 ? 'SUCCEEDED' : 'FAILED'
+          env.SC_DEPLOY_REASON = status == 0 ? 'Déployé après PASS du Policy Gate.' : "Commande de déploiement en échec (code ${status})."
+          if (status != 0) {
+            error(env.SC_DEPLOY_REASON)
+          }
+        }
+      }
+    }
+
+    stage('Health Check') {
+      when {
+        expression { env.SC_DEPLOY_STATUS == 'SUCCEEDED' }
+      }
+      steps {
+        script {
+          if (!env.SCENTER_HEALTHCHECK_URL) {
+            env.SC_HEALTH_STATUS = 'NOT_CONFIGURED'
+            env.SC_HEALTH_DETAIL = 'SCENTER_HEALTHCHECK_URL n’est pas configuré.'
+            echo env.SC_HEALTH_DETAIL
+            return
+          }
+          def status = sh(returnStatus: true, label: 'Health Check', script: 'for attempt in 1 2 3 4 5 6 7 8 9 10; do curl -fsS -o /dev/null --max-time 10 "$SCENTER_HEALTHCHECK_URL" && exit 0; sleep 6; done; exit 1')
+          env.SC_HEALTH_STATUS = status == 0 ? 'PASSED' : 'FAILED'
+          env.SC_HEALTH_DETAIL = status == 0 ? 'Application joignable après déploiement.' : 'Application injoignable après 10 tentatives.'
+          if (status != 0) {
+            error('Health check en échec après déploiement.')
+          }
+        }
       }
     }
   }
 
   post {
     always {
-      // Le rapport reste consultable même quand le gate a refusé la livraison.
-      archiveArtifacts artifacts: 'security-center-report.json', allowEmptyArchive: true
+      script {
+        // L'état de livraison lu par Security Delivery : verdict, déploiement,
+        // health check. Uniquement ce que ce build a réellement établi.
+        def text = { String value -> value == null ? 'null' : '"' + value.replace('"', "'") + '"' }
+        writeFile file: 'security-center-delivery.json', text: """{
+  "schemaVersion": 1,
+  "verdict": ${text(env.SC_VERDICT ?: 'ERROR')},
+  "exitCode": ${env.SC_EXIT ?: '2'},
+  "engineReady": ${env.SC_ENGINE_READY == 'true'},
+  "deployment": { "status": ${text(env.SC_DEPLOY_STATUS ?: 'SKIPPED')}, "reason": ${text(env.SC_DEPLOY_REASON ?: '')} },
+  "healthCheck": { "status": ${text(env.SC_HEALTH_STATUS ?: 'SKIPPED')}, "detail": ${text(env.SC_HEALTH_DETAIL ?: '')} }
+}
+"""
+      }
+      // Le rapport reste consultable même quand le gate a refusé la livraison ou
+      // que le CI Engine n'a pas pu être installé.
+      archiveArtifacts artifacts: 'security-center-report.json, security-center-delivery.json', allowEmptyArchive: true, fingerprint: true
     }
   }
 }

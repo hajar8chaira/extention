@@ -1,0 +1,95 @@
+name: Security Center artifacts
+
+# Security Center's own build: every push to main that touches the extension or
+# the CI Engine bootstrap builds, tests, packages and publishes one immutable
+# release per commit, then moves the stable latest manifest to it.
+#
+# Jenkins reads one stable URL:
+#   https://github.com/<owner>/<repo>/releases/download/scenter-latest/security-center-latest.json
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vscode-extension/**'
+      - 'ci-engine/**'
+      - '.github/workflows/scenter-artifacts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Builds publish one at a time, in push order: the latest manifest is never
+# overwritten by an older build finishing late.
+concurrency:
+  group: scenter-artifacts
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # npm run check, npm test, VSIX, CLI .tgz, SHA-256, embedded identity and
+      # manifest. Any failure stops the job here: nothing below runs.
+      - name: Check, test and package
+        working-directory: vscode-extension
+        run: >-
+          node scripts/build-scenter-artifacts.js
+          --out ../dist
+          --base-url "https://github.com/${{ github.repository }}/releases/download/scenter-build-${{ github.sha }}"
+
+      - name: Keep the build as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-center-${{ github.sha }}
+          path: |
+            dist/security-center-vscode-*.vsix
+            dist/security-center-vscode-*.tgz
+            dist/security-center-build.json
+            dist/security-center-latest.json
+          retention-days: 30
+
+      # Immutable release named after the commit: the manifest's TGZ and VSIX
+      # URLs point here, so they can never change under a published SHA-256.
+      - name: Publish the build release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="scenter-build-${GITHUB_SHA}"
+          gh release create "$TAG" \
+            dist/security-center-vscode-*.vsix \
+            dist/security-center-vscode-*.tgz \
+            dist/security-center-build.json \
+            dist/security-center-latest.json \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Security Center build ${GITHUB_SHA::12}" \
+            --notes "Automated Security Center build of commit ${GITHUB_SHA}. CI Engine package and VS Code extension for this commit only."
+
+      - name: Promote the latest manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            echo "A newer commit is on main: the latest manifest is left to that build."
+            exit 0
+          fi
+          if ! gh release view scenter-latest >/dev/null 2>&1; then
+            gh release create scenter-latest \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Security Center latest build" \
+              --notes "Moving pointer. security-center-latest.json names the newest verified Security Center build; its artifacts live in that build's scenter-build-<commit> release."
+          fi
+          gh release upload scenter-latest dist/security-center-latest.json --clobber

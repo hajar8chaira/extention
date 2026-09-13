@@ -362,3 +362,57 @@ test('politique : la configuration et l analyse ne sont pas touchees', () => {
   assert.match(gateSource, /gate\?\.failOnSeverity/);
   assert.match(gateSource, /gate\?\.priorityThreshold/);
 });
+
+
+// Régression : `severityOf` lisait `severity` avant `rawSeverity`. Les findings
+// que `mergeIntelligence` enrichit gardent la forme de la couche findings, où
+// `severity` est le niveau SARIF (« error » pour CRITICAL comme pour HIGH) et
+// `rawSeverity` la vraie échelle. Ce sont ceux que `reevaluatePolicy` renvoie au
+// gate après un rechargement de VS Code ou une édition de politique : un gate
+// `fail_on_severity: [CRITICAL]` n'y bloquait donc jamais, alors que le même
+// scan bloquait sur le chemin de scan initial. Reproduit sur un scan Gitleaks
+// réel de Juice Shop (clé privée de lib/insecurity.ts).
+function normalizedFinding(overrides = {}) {
+  return {
+    id: 'n1', tool: 'Gitleaks', category: 'secret', ruleId: 'private-key',
+    title: 'Identified a Private Key', severity: 'error', rawSeverity: 'CRITICAL',
+    file: 'lib/insecurity.ts', absolutePath: '/r/lib/insecurity.ts', startLine: 10,
+    sourceContext: 'production', ...overrides
+  };
+}
+
+test('un finding normalisé CRITICAL bloque un gate fail_on_severity CRITICAL', () => {
+  const result = evaluatePolicyGate([normalizedFinding()], policy('gate:\n  fail_on_severity: [CRITICAL]\n'));
+  assert.equal(result.status, STATUS.BLOCK);
+  assert.equal(result.counts.violations, 1);
+  assert.equal(gateExitCode(result), 1);
+  assert.match(result.violations[0].message, /CRITICAL/);
+});
+
+test('un finding normalisé HIGH ne bloque pas un gate limité à CRITICAL', () => {
+  const high = normalizedFinding({ id: 'h1', rawSeverity: 'HIGH', severity: 'error' });
+  const result = evaluatePolicyGate([high], policy('gate:\n  fail_on_severity: [CRITICAL]\n'));
+  assert.equal(result.status, STATUS.PASS);
+  assert.equal(result.counts.violations, 0);
+});
+
+test('la forme unifiée et la forme normalisée donnent le même verdict', () => {
+  const gateYaml = 'gate:\n  fail_on_severity: [CRITICAL]\n';
+  const normalized = evaluatePolicyGate([normalizedFinding()], policy(gateYaml));
+  const unified = evaluatePolicyGate([finding({ id: 'n1', rawSeverity: 'CRITICAL' })], policy(gateYaml));
+  assert.equal(normalized.status, unified.status);
+  assert.equal(normalized.counts.violations, unified.counts.violations);
+});
+
+test('le gate et la politique projet comptent les mêmes bloquants', () => {
+  const { evaluatePolicy } = require('../src/project-policy');
+  const findings = [
+    normalizedFinding({ id: 'crit', rawSeverity: 'CRITICAL', severity: 'error' }),
+    normalizedFinding({ id: 'high', rawSeverity: 'HIGH', severity: 'error' }),
+    normalizedFinding({ id: 'med', rawSeverity: 'MEDIUM', severity: 'warning' })
+  ];
+  const gate = evaluatePolicyGate(findings, policy('gate:\n  fail_on_severity: [HIGH]\n'));
+  const banner = evaluatePolicy(findings, policy('version: 1\npolicy:\n  fail_on: HIGH\n'));
+  assert.equal(gate.counts.violations, banner.blockingCount);
+  assert.equal(gate.status === STATUS.BLOCK, banner.passed === false);
+});

@@ -43,6 +43,8 @@ import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -50,12 +52,27 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class SecurityCenterExtension implements BurpExtension {
     private static final Set<String> SENSITIVE_HEADERS = Set.of(
         "authorization", "cookie", "set-cookie", "proxy-authorization", "x-api-key"
     );
     private static final int MAX_BODY_LENGTH = 256 * 1024;
+
+    /**
+     * Where Security Center publishes the backend it is actually using.
+     *
+     * Burp is a separate application: it cannot read VS Code settings, and the
+     * address it needs is not a constant — in Auto mode the extension starts a
+     * local service on whatever port is free, and in Remote mode the backend is
+     * not local at all. So the connector reads the address instead of assuming
+     * it. Nothing here hard-codes a port.
+     */
+    private static final Path DISCOVERY_FILE =
+        Path.of(System.getProperty("user.home"), ".security-center", "backend.json");
+    private static final String EXPECTED_SERVICE = "security-center-backend";
 
     private MontoyaApi api;
     private final HttpClient httpClient = HttpClient.newBuilder().proxy(new ProxySelector() {
@@ -69,11 +86,16 @@ public final class SecurityCenterExtension implements BurpExtension {
             // The next direct request will report its own connection error.
         }
     }).build();
-    private final JTextField backendUrl = new JTextField("http://127.0.0.1:8765", 28);
+    private final JTextField backendUrl = new JTextField("", 28);
     private final JPasswordField apiKey = new JPasswordField(16);
     private final JLabel status = new JLabel("Prêt — sélectionnez une requête dans Proxy ou Repeater.");
-    private final JCheckBox automaticCapture = new JCheckBox("Capture automatique des requêtes locales", true);
+    private final JCheckBox automaticCapture = new JCheckBox("Capture automatique : local et cible autorisée", true);
     private final Set<String> sentFingerprints = ConcurrentHashMap.newKeySet();
+    /**
+     * The Dynamic Security target Security Center authorised, published in the
+     * discovery file. Only these origins — besides loopback — are captured.
+     */
+    private final Set<String> captureOrigins = ConcurrentHashMap.newKeySet();
     private Timer heartbeat;
 
     @Override
@@ -83,6 +105,7 @@ public final class SecurityCenterExtension implements BurpExtension {
         api.userInterface().registerContextMenuItemsProvider(new SecurityCenterMenu());
         api.proxy().registerResponseHandler(new AutomaticProxyCapture());
         api.userInterface().registerSuiteTab("Security Center", createSuiteTab());
+        loadDiscoveredBackend(true);
         heartbeat = new Timer(5000, event -> sendHeartbeat());
         heartbeat.setInitialDelay(0);
         heartbeat.start();
@@ -109,10 +132,76 @@ public final class SecurityCenterExtension implements BurpExtension {
         JButton diagnostic = new JButton("Envoyer un test");
         diagnostic.addActionListener(event -> sendDiagnosticScenario());
         connection.add(diagnostic);
+        JButton rediscover = new JButton("Recharger la configuration");
+        rediscover.setToolTipText("Relit l'adresse publiée par Security Center, par exemple après un changement de port.");
+        rediscover.addActionListener(event -> loadDiscoveredBackend(true));
+        connection.add(rediscover);
         connection.add(automaticCapture);
         panel.add(connection, BorderLayout.NORTH);
         panel.add(status, BorderLayout.CENTER);
         return panel;
+    }
+
+    /**
+     * Reads the address Security Center published, and fills the form with it.
+     *
+     * A missing file is not an error: it means Security Center has not run yet
+     * on this machine. The message says so, instead of leaving the connector
+     * pointing at a port that may belong to something else entirely.
+     */
+    private void loadDiscoveredBackend(boolean announce) {
+        try {
+            if (!Files.isReadable(DISCOVERY_FILE)) {
+                if (announce) {
+                    setStatus("Ouvrez Security Center dans VS Code : le connecteur y lira l'adresse du backend.");
+                }
+                return;
+            }
+            String content = Files.readString(DISCOVERY_FILE, StandardCharsets.UTF_8);
+            if (!EXPECTED_SERVICE.equals(jsonField(content, "service"))) {
+                if (announce) setStatus("Le fichier de découverte ne décrit pas un backend Security Center.");
+                return;
+            }
+            String url = jsonField(content, "url");
+            String key = jsonField(content, "api_key");
+            if (!url.isBlank()) backendUrl.setText(url);
+            // The key travels with the address: both come from the same
+            // installation, and neither is written to the Burp log.
+            if (!key.isBlank() && !key.equals(configuredApiKey())) apiKey.setText(key);
+            Set<String> origins = new java.util.HashSet<>();
+            for (String entry : jsonStringArray(content, "capture_origins")) {
+                try { origins.add(originOf(URI.create(entry))); } catch (RuntimeException ignored) { /* invalid entries are not captured */ }
+            }
+            captureOrigins.retainAll(origins);
+            captureOrigins.addAll(origins);
+            if (announce) setStatus("Backend Security Center : " + backendUrl.getText().trim()
+                + (captureOrigins.isEmpty() ? "" : " — cible autorisée : " + String.join(", ", captureOrigins)));
+        } catch (IOException error) {
+            if (announce) setStatus("Configuration du backend illisible — " + error.getMessage());
+        }
+    }
+
+    /** One string field of the discovery file. The file is small, flat, and written by us. */
+    private static String jsonField(String json, String field) {
+        Matcher matcher = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+        return matcher.find() ? matcher.group(1) : "";
+    }
+
+    /** One array of strings of the discovery file, or an empty list. */
+    private static List<String> jsonStringArray(String json, String field) {
+        Matcher array = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*\\[([^\\]]*)\\]").matcher(json);
+        List<String> values = new ArrayList<>();
+        if (!array.find()) return values;
+        Matcher item = Pattern.compile("\"([^\"]*)\"").matcher(array.group(1));
+        while (item.find()) values.add(item.group(1));
+        return values;
+    }
+
+    /** scheme://host:port, with the default port made explicit, so both sides compare equal. */
+    private static String originOf(URI uri) {
+        String scheme = uri.getScheme().toLowerCase(Locale.ROOT);
+        int port = uri.getPort() >= 0 ? uri.getPort() : ("https".equals(scheme) ? 443 : 80);
+        return scheme + "://" + uri.getHost().toLowerCase(Locale.ROOT) + ":" + port;
     }
 
     private final class AutomaticLocalCapture implements HttpHandler {
@@ -124,7 +213,7 @@ public final class SecurityCenterExtension implements BurpExtension {
         @Override
         public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived response) {
             String requestUrl = response.initiatingRequest().url();
-            if (automaticCapture.isSelected() && isLocalUrl(requestUrl) && !isBackendUrl(requestUrl)) {
+            if (automaticCapture.isSelected() && isCapturableUrl(requestUrl) && !isBackendUrl(requestUrl)) {
                 HttpRequestResponse pair = HttpRequestResponse.httpRequestResponse(
                     response.initiatingRequest(),
                     response
@@ -154,7 +243,7 @@ public final class SecurityCenterExtension implements BurpExtension {
 
     private void captureProxyResponse(InterceptedResponse response) {
         String requestUrl = response.initiatingRequest().url();
-        if (!automaticCapture.isSelected() || !isLocalUrl(requestUrl) || isBackendUrl(requestUrl)) return;
+        if (!automaticCapture.isSelected() || !isCapturableUrl(requestUrl) || isBackendUrl(requestUrl)) return;
         HttpRequestResponse pair = HttpRequestResponse.httpRequestResponse(response.initiatingRequest(), response);
         String fingerprint = fingerprint(pair);
         if (sentFingerprints.add(fingerprint)) {
@@ -221,15 +310,30 @@ public final class SecurityCenterExtension implements BurpExtension {
     }
 
     private void sendHeartbeat() {
+        // Security Center republishes the address, the key and the authorised
+        // target when they change: each beat follows the current values.
+        loadDiscoveredBackend(false);
         try {
             java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
                 .uri(URI.create(normalizedBackend() + "/api/v1/integrations/burp/heartbeat"))
                 .header("X-Security-Center-Key", configuredApiKey())
                 .POST(BodyPublishers.noBody())
                 .build();
-            httpClient.sendAsync(request, BodyHandlers.discarding()).exceptionally(error -> null);
-        } catch (RuntimeException ignored) {
+            httpClient.sendAsync(request, BodyHandlers.discarding())
+                .thenAccept(response -> {
+                    if (response.statusCode() == 401) {
+                        setStatus("Clé API refusée par Security Center — cliquez « Recharger la configuration ».");
+                    } else if (response.statusCode() >= 400) {
+                        setStatus("Heartbeat refusé : backend HTTP " + response.statusCode());
+                    }
+                })
+                .exceptionally(error -> {
+                    setStatus("Backend Security Center injoignable : " + rootMessage(error));
+                    return null;
+                });
+        } catch (RuntimeException error) {
             // Le prochain heartbeat réessaiera après correction de l’URL ou redémarrage du backend.
+            setStatus("Adresse du backend invalide : " + rootMessage(error));
         }
     }
 
@@ -278,7 +382,7 @@ public final class SecurityCenterExtension implements BurpExtension {
 
     private String scenarioJson(HttpRequestResponse pair, String captureMode) {
         HttpRequest request = pair.request();
-        validateLocalUrl(request.url());
+        validateCapturableUrl(request.url());
         HttpResponse response = pair.response();
         String requestBody = limited(request.bodyToString());
         String responseBody = response == null ? "" : limited(response.bodyToString());
@@ -327,20 +431,26 @@ public final class SecurityCenterExtension implements BurpExtension {
             .orElse("[]");
     }
 
-    private static void validateLocalUrl(String value) {
+    /**
+     * Loopback, or the Dynamic Security target Security Center authorised.
+     *
+     * The remote lab target used to be dropped here silently: every request to
+     * it passed through Burp and never reached Security Center.
+     */
+    private void validateCapturableUrl(String value) {
         URI uri = URI.create(value);
         String host = uri.getHost();
         if (!"http".equals(uri.getScheme()) && !"https".equals(uri.getScheme())) {
             throw new IllegalArgumentException("Seules les URL HTTP/HTTPS sont acceptées.");
         }
-        if (!Set.of("127.0.0.1", "localhost", "::1").contains(host)) {
-            throw new IllegalArgumentException("Le connecteur MVP accepte uniquement les cibles locales.");
-        }
+        if (host != null && Set.of("127.0.0.1", "localhost", "::1").contains(host)) return;
+        if (host != null && captureOrigins.contains(originOf(uri))) return;
+        throw new IllegalArgumentException("Hors périmètre : ni locale, ni cible Dynamic Security autorisée dans Security Center.");
     }
 
-    private static boolean isLocalUrl(String value) {
+    private boolean isCapturableUrl(String value) {
         try {
-            validateLocalUrl(value);
+            validateCapturableUrl(value);
             return true;
         } catch (RuntimeException error) {
             return false;

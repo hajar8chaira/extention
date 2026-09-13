@@ -47,8 +47,22 @@ function historyScript() {
     });`;
 }
 
+/**
+ * Le mode du résultat ZAP d'un scan enregistré : « ZAP Passif », « ZAP Actif »,
+ * ou rien quand le scan n'a pas lancé ZAP ou date d'avant cette information.
+ */
+function zapModeLabel(scan) {
+  const zap = (Array.isArray(scan?.scanners) ? scan.scanners : []).find((scanner) => scanner?.tool === 'ZAP');
+  const fromFindings = (Array.isArray(scan?.findings) ? scan.findings : []).find((finding) => finding?.tool === 'ZAP' && finding.scanMode)?.scanMode;
+  const mode = zap?.scanMode
+    || (zap?.mode === 'baseline' ? 'passive' : zap?.mode === 'active' || zap?.mode === 'openapi' ? 'active' : '')
+    || fromFindings
+    || '';
+  return ({ passive: 'ZAP Passif', active: 'ZAP Actif' })[mode] || '';
+}
+
 function renderScanHistoryHtml(localScans, backendScans, backendError, nonce, selectedTheme = 'light', assets = {}) {
-  const localCards = (localScans || []).map((scan) => `<article class="scan"><div><span class="origin">LOCAL</span><h2>${escapeHtml(new Date(scan.savedAt).toLocaleString('fr-FR'))}</h2><p>${escapeHtml(scan.workspace || 'Projet')} • ${Number(scan.findings?.length || 0)} résultat(s) • ${Number(scan.scanners?.length || 0)} scanner(s)</p><p class="state">${escapeHtml(scan.dashboardOptions?.scanStatus || 'terminé')}</p></div><button data-source="local" data-id="${escapeHtml(scan.localId)}">Ouvrir ce scan</button></article>`).join('');
+  const localCards = (localScans || []).map((scan) => `<article class="scan"><div><span class="origin">LOCAL</span><h2>${escapeHtml(new Date(scan.savedAt).toLocaleString('fr-FR'))}</h2><p>${escapeHtml(scan.workspace || 'Projet')} • ${Number(scan.findings?.length || 0)} résultat(s) • ${Number(scan.scanners?.length || 0)} scanner(s)${zapModeLabel(scan) ? ` • <span class="zap-mode" data-scan-mode="${zapModeLabel(scan) === 'ZAP Actif' ? 'active' : 'passive'}">${escapeHtml(zapModeLabel(scan))}</span>` : ''}</p><p class="state">${escapeHtml(scan.dashboardOptions?.scanStatus || 'terminé')}</p></div><button data-source="local" data-id="${escapeHtml(scan.localId)}">Ouvrir ce scan</button></article>`).join('');
   const backendCards = (backendScans || []).map((scan) => `<article class="scan"><div><span class="origin">BACKEND #${escapeHtml(scan.scan_id)}</span><h2>${escapeHtml(new Date(scan.finished_at).toLocaleString('fr-FR'))}</h2><p>${escapeHtml(scan.workspace)} • ${Number(scan.finding_count || 0)} résultat(s) • ${Number(scan.scanner_count || 0)} scanner(s)</p></div><button data-source="backend" data-id="${escapeHtml(scan.scan_id)}">Ouvrir ce scan</button></article>`).join('');
   const total = (localScans || []).length + (backendScans || []).length;
   const content = `
@@ -112,6 +126,6 @@ function comparableLocalScans(history = []) {
 }
 
 module.exports = {
-  HISTORY_KEY, HISTORY_LIMIT, appendLocalHistory, renderScanHistoryHtml,
+  HISTORY_KEY, HISTORY_LIMIT, appendLocalHistory, renderScanHistoryHtml, zapModeLabel,
   localScanAsComparable, comparableLocalScans
 };

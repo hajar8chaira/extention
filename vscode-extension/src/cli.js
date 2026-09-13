@@ -3,12 +3,19 @@ const fs = require('fs/promises');
 const path = require('path');
 const { runSecurityScan } = require('./orchestrator');
 const { toSarif } = require('./sarif');
-const { loadProjectPolicy, SEVERITY_RANK } = require('./project-policy');
+const { loadProjectPolicy, SEVERITY_RANK, gateDecides, legacyPolicyNotice } = require('./project-policy');
 const { changedFilesAgainstBase, incrementalScanPlan } = require('./incremental');
 const { analyzeWorkspace, mergeIntelligence, runSupplyChainStages, buildPipelineResult, describeStages } = require('./pipeline');
 const { evaluatePolicyGate, formatGateResult, gateExitCode, policyGateError, STATUS } = require('./intelligence/policy-gate');
 const { signBlob, verifyBlob } = require('./supply-chain/cosign');
 const { buildCiReport, CI_REPORT_FILENAME } = require('./ci-report');
+// The installed package identifies the CI Engine in the reports it writes.
+const { name: ENGINE_PACKAGE, version: ENGINE_VERSION } = require('../package.json');
+// The source commit stamped by the Security Center build. Absent in a source
+// checkout: the report then says nothing about a commit rather than guessing one.
+const ENGINE_COMMIT = (() => {
+  try { return require('../build-info.json').commit || null; } catch { return null; }
+})();
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
@@ -62,7 +69,13 @@ async function main(argv = process.argv.slice(2)) {
     process.stderr.write(`${formatGateResult(policyGateError(error.message))}\n\nExit code: 2\n`);
     return 2;
   }
-  if (args.failOn) policy = {
+  // One verdict decider. With a Policy Gate configured, the legacy thresholds —
+  // from the file or from `--fail-on` — no longer take part in the verdict, and
+  // the log says so instead of pretending they apply.
+  const policyNotice = legacyPolicyNotice(policy, { cliFailOn: args.failOn || '' });
+  if (policyNotice) process.stderr.write(`[policy] ${policyNotice}` + '\n');
+  // `--fail-on` keeps its legacy meaning only where the legacy policy decides.
+  if (args.failOn && !gateDecides(policy)) policy = {
     version: 1, scanners: {}, failOn: String(args.failOn).toUpperCase(), maxActive: policy?.maxActive ?? 999999,
     includeTests: policy?.includeTests ?? true, licensesDenied: policy?.licensesDenied || [],
     gitleaksHistory: policy?.gitleaksHistory || false, gitleaksHistoryIncremental: policy?.gitleaksHistoryIncremental ?? true,
@@ -85,14 +98,16 @@ async function main(argv = process.argv.slice(2)) {
       gitleaksHistory: incremental ? true : undefined, gitleaksSinceCommit: incremental ? args.baseRef : '',
       // SonarQube runs headless only when the caller asked for it and supplied a
       // token through the environment. It is never derived from the workspace.
-      sonarEnabled: selectedTools.includes('SonarQube') && !incremental,
+      // Without --tools, security-center.yml selects the scanners — SonarQube
+      // and Snyk included — so a CI pipeline never duplicates that choice.
+      sonarEnabled: (selectedTools.includes('SonarQube') || (!selectedTools.length && policy?.scanners?.SonarQube === true)) && !incremental,
       sonarMode: args.sonarMode || 'auto',
       sonarHostUrl: args.sonarHostUrl || process.env.SONAR_HOST_URL || 'http://127.0.0.1:9000',
       sonarProjectKey: args.sonarProjectKey || '',
       sonarToken: process.env.SONAR_TOKEN || '',
       // Snyk follows the exact same headless contract as SonarQube: explicitly
       // requested, and authenticated only through the environment.
-      snykEnabled: selectedTools.includes('Snyk') && !incremental,
+      snykEnabled: (selectedTools.includes('Snyk') || (!selectedTools.length && policy?.scanners?.Snyk === true)) && !incremental,
       snykMode: args.snykMode || 'auto',
       snykToken: process.env.SNYK_TOKEN || '',
       snykIncludeOpenSource: true,
@@ -102,6 +117,7 @@ async function main(argv = process.argv.slice(2)) {
     onScannerUpdate: (event) => process.stderr.write(`[${event.tool}] ${event.status}${event.details ? ` — ${event.details}` : ''}\n`)
   }) : { workspace: workspacePath, findings: [], scanners: [], correlations: [], policyResult: policy ? { passed: true, activeCount: 0, blockingCount: 0, reasons: [], policy } : null, failures: [], finishedAt: new Date().toISOString() };
   if (incremental) report.incremental = incremental;
+  if (policyNotice) report.policyNotice = policyNotice;
   report.audit = args.zapAuthorized ? { action: 'zap:headless:authorized', actor: args.actor.trim(), comment: args.justification.trim(), createdAt: new Date().toISOString() } : undefined;
 
   // The very same pipeline services the extension uses. There is no separate
@@ -122,14 +138,16 @@ async function main(argv = process.argv.slice(2)) {
       policy: analysis.policy,
       startedAt
     });
-    // The gate is re-evaluated once the artefacts exist so `require_sbom` is
-    // judged on what was actually produced rather than on an empty stage.
-    const gate = Object.keys(artifacts).length
-      ? evaluatePolicyGate(analysis.findings, policy, { artifacts })
-      : analysis.policy;
+    // The gate reads a signature under `signature`; the CLI keeps Cosign's
+    // record under `signing`, like the extension. Same record, both names —
+    // otherwise `require_signature` could never be satisfied.
+    const gateArtifacts = () => gateArtifactsFrom(artifacts);
 
     if (args.signKey) {
-      if (gate.status === STATUS.BLOCK) {
+      // Signing is refused on a BLOCK, but not on the one requirement signing
+      // itself satisfies: a required signature cannot exist before it is made.
+      const beforeSigning = evaluatePolicyGate(analysis.findings, withoutSignatureRequirement(policy), { artifacts: gateArtifacts() });
+      if (beforeSigning.status === STATUS.BLOCK) {
         artifacts.signing = { status: 'failed', reason: 'Signature refusée : la politique projet a bloqué ce scan.' };
       } else {
         const subject = args.signArtifact || artifacts.sbom?.path || '';
@@ -153,6 +171,13 @@ async function main(argv = process.argv.slice(2)) {
       } catch (error) { artifacts.signing = { ...artifacts.signing, status: 'failed', reason: error.message }; }
     }
 
+    // The gate is evaluated once every artefact exists, so `require_sbom`,
+    // `require_provenance` and `require_signature` are judged on what was
+    // actually produced rather than on an empty stage.
+    const gate = gateArtifacts()
+      ? evaluatePolicyGate(analysis.findings, policy, { artifacts: gateArtifacts() })
+      : analysis.policy;
+
     pipeline = buildPipelineResult({
       scanId: `headless-${Date.now()}`, workspace: workspacePath, startedAt,
       scanners: report.scanners, rawFindings: report.findings,
@@ -167,16 +192,21 @@ async function main(argv = process.argv.slice(2)) {
       stages: describeStages({ ...pipeline, ...analysis, policy: gate, scanners: report.scanners })
     };
     report.policyGate = gate;
+  }
+
+  // One verdict, computed once: the exit code and the CI report cannot disagree.
+  const verdict = verdictOf(report);
+  if (report.policyGate) {
     // The gate verdict and the exit code are printed together so a CI log states
     // the decision and its consequence in one place.
-    process.stderr.write(`${formatGateResult(gate)}\n\nExit code: ${report.failures.length ? 2 : gateExitCode(gate)}\n`);
+    process.stderr.write(`${formatGateResult(report.policyGate)}` + '\n\nExit code: ' + verdict.exitCode + '\n');
   }
 
   // The CI report contract: a small, sanitized projection Jenkins can archive and
   // the extension can read back. The full JSON output is unchanged.
   if (args.ciReport) {
     const { commit, branch } = await gitIdentity(workspacePath);
-    const ciReport = buildCiReport(report, { commit, branch });
+    const ciReport = buildCiReport(report, { commit, branch, verdict, workspace: workspacePath, engine: { name: ENGINE_PACKAGE, version: ENGINE_VERSION, commit: ENGINE_COMMIT } });
     await fs.writeFile(path.resolve(args.ciReport), `${JSON.stringify(ciReport, null, 2)}
 `, 'utf8');
     process.stderr.write(`[ci-report] ${path.resolve(args.ciReport)}
@@ -187,16 +217,47 @@ async function main(argv = process.argv.slice(2)) {
   const serialized = `${JSON.stringify(output, null, 2)}\n`;
   if (args.output) await fs.writeFile(path.resolve(args.output), serialized, 'utf8');
   else process.stdout.write(serialized);
-  // Exit codes keep the historical contract: 2 = execution or configuration
-  // problem, 1 = the project policy refuses this state, 0 = accepted. WARN is
-  // accepted: promoting a warning to a block is done in the policy itself.
-  if (report.failures.length) return 2;
-  if (report.policyGate) {
-    const code = gateExitCode(report.policyGate);
-    if (code) return code;
-  }
-  if (report.policyResult && !report.policyResult.passed) return 1;
-  return 0;
+  return verdict.exitCode;
+}
+
+/**
+ * The CI verdict contract: 0 = PASS, 1 = BLOCK, 2 = ERROR.
+ *
+ *   PASS  — the analysis completed and the policy permits delivery.
+ *   BLOCK — the analysis completed and the policy rejects delivery.
+ *   ERROR — the analysis is incomplete or unreliable: a scanner failed or was
+ *           cancelled, or the policy could not be applied.
+ *
+ * Execution failure takes precedence over the policy: a verdict drawn from an
+ * incomplete analysis is not a verdict. The gate keeps its own result (it may
+ * still say BLOCK in the report); only the overall CI verdict is ERROR.
+ * WARN and NOT_CONFIGURED are accepted (0).
+ */
+function verdictOf(report = {}) {
+  const scannerFailed = (report.scanners || []).some((scanner) => ['failed', 'cancelled'].includes(scanner?.status));
+  if ((report.failures || []).length || scannerFailed) return { status: 'ERROR', exitCode: 2 };
+  // A configured gate is the only decider: when it did not run (for example
+  // `--no-intelligence`), there is no verdict — never a legacy fallback.
+  if (report.policyResult?.decidedBy === 'gate' && !report.policyGate) return { status: 'ERROR', exitCode: 2 };
+  const gateCode = report.policyGate ? gateExitCode(report.policyGate) : 0;
+  if (gateCode === 2) return { status: 'ERROR', exitCode: 2 };
+  if (gateCode === 1 || (report.policyResult && !report.policyResult.passed)) return { status: 'BLOCK', exitCode: 1 };
+  return { status: 'PASS', exitCode: 0 };
+}
+
+/** The artefacts as the gate reads them, or null when no supply-chain stage ran. */
+function gateArtifactsFrom(artifacts = {}) {
+  if (!artifacts || !Object.keys(artifacts).length) return null;
+  return { ...artifacts, ...(artifacts.signing ? { signature: artifacts.signing } : {}) };
+}
+
+/** The policy as it stands before signing: every rule except the signature. */
+function withoutSignatureRequirement(policy) {
+  if (!policy?.supplyChain?.requireSignature) return policy;
+  return {
+    ...policy,
+    supplyChain: { ...policy.supplyChain, requireSignature: false, configured: policy.supplyChain.requireProvenance === true }
+  };
 }
 
 /**
@@ -219,4 +280,4 @@ async function gitIdentity(workspacePath) {
 
 if (require.main === module) main().then((code) => { process.exitCode = code; }).catch((error) => { process.stderr.write(`Security Center: ${error.message}\n`); process.exitCode = 2; });
 
-module.exports = { parseArgs, help, main };
+module.exports = { parseArgs, help, main, verdictOf, withoutSignatureRequirement, gateArtifactsFrom };

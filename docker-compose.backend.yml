@@ -1,3 +1,10 @@
+# Backend FastAPI — développement, tests d'intégration, CI et débogage.
+#
+# Ce n'est plus le backend du produit : l'extension embarque son propre service
+# local (vscode-extension/backend/) et le démarre elle-même. Cette stack reste
+# utile pour développer contre l'implémentation Python, pour la CI, et pour
+# relire un historique SQLite écrit avant cette version — dans ce cas, régler
+# securityCenter.backend.mode sur « docker ».
 services:
   backend:
     build:

@@ -264,7 +264,9 @@ test('le Jenkinsfile d’exemple bloque le déploiement et ne contient aucun sec
   assert.match(template, /stage\('Deploy'\)[\s\S]*when\s*\{[\s\S]*SC_EXIT == '0'/);
   // Aucun identifiant en dur.
   assert.ok(!/[A-Za-z0-9+/]{32,}={0,2}/.test(template.replace(/[A-Za-z-]+\.jsonl?/g, '')), 'aucun secret encodé');
-  assert.match(template, /credentials\('security-center-sonar-token'\)/);
+  // Lié seulement quand SonarQube est activé dans security-center.yml.
+  assert.match(template, /string\(credentialsId: 'security-center-sonar-token', variable: 'SONAR_TOKEN'\)/);
+  assert.doesNotMatch(template, /credentials\('security-center-sonar-token'\)/);
 });
 
 // ---------------------------------------------------- régressions (Phase J)

@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const crypto = require('crypto');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
@@ -8,17 +9,34 @@ const { runSemgrep } = require('./semgrep');
 const { runGitleaks } = require('./gitleaks');
 const { runTrivy, generateSbom } = require('./trivy');
 const { runOsv } = require('./osv');
-const { runZap } = require('./zap');
+const { runZap, removeZapContainer, ZAP_SCAN_TIMEOUT_MS } = require('./zap');
+const { detectJavaRuntime } = require('./java-runtime');
+// Le déroulé d'exécution ZAP : un modèle pur, alimenté par les événements du
+// moteur et lu par la carte Dynamic Security.
+const {
+  createZapExecution, applyZapLifecycle, applyZapStage, skipZapStage, failZapExecution,
+  restoreZapExecution, ZAP_STAGE, STAGE_STATUS
+} = require('./zap-execution');
+// Le choix du moteur ZAP et ses étapes sont du raisonnement pur : ils vivent
+// dans leur propre module, hors de l'hôte d'extension.
+const { zapEngineChoice, zapEngineLabel, zapAvailabilityFrom, zapPhaseText } = require('./zap-engines');
 const { detectLocalZap } = require('./zap-local');
+const mitmproxy = require('./mitmproxy');
+const trafficAnalytics = require('./traffic-analytics');
+const {
+  runNuclei, ensureTemplates, installedTemplates: installedNucleiTemplates,
+  DEFAULT_RATE_LIMIT: NUCLEI_DEFAULT_RATE_LIMIT, DEFAULT_CONCURRENCY: NUCLEI_DEFAULT_CONCURRENCY,
+  SCAN_TIMEOUT_MS: NUCLEI_SCAN_TIMEOUT_MS
+} = require('./nuclei');
 const { ensureDockerAvailable } = require('./docker');
 const { runSonarQube, detectLocalScanner: detectLocalSonarScanner } = require('./sonarqube');
 const { checkServerStatus: checkSonarServer, validateToken: validateSonarToken, normalizeHostUrl: normalizeSonarHostUrl } = require('./sonarqube-api');
 const { SERVER_URL: SONAR_LOCAL_SERVER_URL, inspectLocalServer, localServerState, startLocalServer, stopLocalServer, waitForLocalServer } = require('./sonarqube-server');
 const { runSnyk, detectLocalCli: detectLocalSnykCli } = require('./snyk');
 const { validateToken: validateSnykToken, looksLikeSnykToken } = require('./snyk-api');
-const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeZapOutput, normalizeOsvOutput, normalizeSonarQubeOutput, normalizeSnykOutput, deduplicateFindings, hasReportableLocation } = require('./findings');
+const { normalizeSemgrepOutput, normalizeGitleaksOutput, normalizeTrivyOutput, normalizeZapOutput, normalizeNucleiOutput, normalizeOsvOutput, normalizeSonarQubeOutput, normalizeSnykOutput, deduplicateFindings, hasReportableLocation } = require('./findings');
 const { groupFindings, summarizeFindings } = require('./tree');
-const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpStatus, updateFindingStatus, listAuditEvents, createAuditEvent, listScans, getScan, requestText, scanExportUrl } = require('./backend');
+const { setApiKey, saveScanResult, saveHttpScenario, listHttpScenarios, getBurpStatus, getMitmproxyStatus, updateFindingStatus, listAuditEvents, createAuditEvent, listScans, getScan, requestText, scanExportUrl } = require('./backend');
 const { CACHE_KEY: LOCAL_SCAN_CACHE_KEY, createLocalScanCache, restoreLocalScanCache } = require('./local-scan-cache');
 const { normalizeJenkinsUrl, deliveryStatusFrom, artifactUrl: jenkinsArtifactUrl } = require('./jenkins');
 const { renderDeliveryPageHtml } = require('./delivery-page');
@@ -51,13 +69,22 @@ const {
   toTransaction: dynamicTransaction, restoreCampaign: restoreDynamicCampaign,
   legacyBucket: dynamicLegacyBucket, captureSessionFrom
 } = require('./dynamic-campaign');
+// Le socle d'exécution commun aux quatre moteurs dynamiques. La campagne
+// ci-dessus reste ce qu'elle est — le détail des étapes d'un scan ZAP — et le
+// runtime porte ce que ZAP, Nuclei, mitmproxy et Burp ont réellement en commun.
+const {
+  RUN_KIND, RUN_STATUS, RUN_ERROR, TERMINAL_RUN_STATUSES, createRun: createDynamicRun, transitionRun,
+  recordActivity, failRun, completeRun, reconcileRun, restoreRun, availability: engineAvailability,
+  unknownAvailability, dynamicRuntimeModel
+} = require('./dynamic-runtime');
+const { createRefreshCoordinator } = require('./dynamic-refresh');
 const {
   createExecution, snapshotFromLegacy, normalizeSnapshot, beginRefresh, updateRefresh,
   completeExecution, projectSnapshot, aggregateRunStatus, finishedScannerCount, successfulScannerCount
 } = require('./security-snapshot');
 const { HISTORY_KEY: LOCAL_SCAN_HISTORY_KEY, appendLocalHistory, renderScanHistoryHtml, comparableLocalScans } = require('./scan-history-page');
 const { buildDashboardModel, renderDashboardHtml, buildSafeHttpPreview, linkedFindingsForScenario, summarizeScannerError } = require('./dashboard');
-const { normalizeTargetUrl, checkTargetReachability } = require('./dynamic-target');
+const { normalizeTargetUrl, checkTargetReachability, assertTargetAuthorized, TARGET_MODE, TARGET_STATE, TARGET_STATE_LABELS } = require('./dynamic-target');
 const { renderFindingDetailsHtml } = require('./finding-details');
 const {
   CHAT_STATE, ROLE: CHAT_ROLE, buildAssistantContext, contextIndicator, quickQuestionsFor,
@@ -72,8 +99,8 @@ const {
   FIX_SOURCE, VERIFIER, verifyFindingFix, markFixApplied, markValidating, applyVerification,
   detectRegressions, verificationRecord, restoreVerification, restoreVerificationOnFindings, verificationIdentity
 } = require('./fix-verification');
-const { normalizeHar, replayScenario, CONTROLLED_WRITE_METHODS } = require('./http-scenarios');
-const { renderHttpReplayHtml, renderSafeHttpRequestHtml } = require('./http-details');
+const { normalizeHar, replayScenario, replayAuthorization, CONTROLLED_WRITE_METHODS, REPLAY_STATE } = require('./http-scenarios');
+const { renderHttpReplayHtml, renderSafeHttpRequestHtml, renderReplayConfirmationHtml } = require('./http-details');
 const { compareScans, renderScanComparisonHtml } = require('./scan-comparison');
 const { modifiedGitFiles, createIncrementalWorkspace, retainUnchangedFindings } = require('./incremental');
 const { renderAuditLogHtml } = require('./audit');
@@ -81,10 +108,11 @@ const { navCommands } = require('./security-center-shell');
 const { renderSidebarLauncherHtml } = require('./sidebar-launcher');
 const { scannerToolFromId } = require('./scanner-presentation');
 const { loadProjectPolicy, evaluatePolicy } = require('./project-policy');
+const { readProjectConfiguration, saveProjectScanners } = require('./project-configuration');
 const { evaluatePolicyGate, policyGateError, policyResultFromGate, STATUS: GATE_STATUS } = require('./intelligence/policy-gate');
 const { readPolicyGateConfig, savePolicyGate, createStarterPolicy, policyGateHash, policyFilePath } = require('./policy-config');
 const { analyzeLicenses, renderLicenseReportHtml } = require('./license-compliance');
-const { probeBackend, normalizeBackendUrl, BACKEND_STATE, DEFAULT_BACKEND_URL } = require('./backend-config');
+const { probeBackend, normalizeBackendUrl, BACKEND_STATE, DEFAULT_BACKEND_URL, classifyBackendError, describeBackend } = require('./backend-config');
 const {
   BackendManager, BACKEND_MODE, BACKEND_MODE_LABELS, RESOLVED_MODE, MODE_SETTING, REMOTE_URL_SETTING,
   resolveBackendMode, resolveDataDirectory, generateLocalApiKey,
@@ -187,7 +215,7 @@ const WAZUH_PASSWORD_SECRET_KEY = 'securityCenter.wazuh.password';
 const VERIFICATION_STATE_KEY = 'securityCenter.fixVerification';
 const PIPELINE_STATE_KEY = 'securityCenter.pipelineState';
 // Every scanner Security Center can run, in the order the UI presents them.
-const ALL_SCANNER_TOOLS = Object.freeze(['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP']);
+const ALL_SCANNER_TOOLS = Object.freeze(['Semgrep', 'Gitleaks', 'Trivy', 'OSV-Scanner', 'SonarQube', 'Snyk', 'ZAP', 'Nuclei']);
 // Scanners that can be switched off from the settings, so the dashboard can
 // report « Désactivé » instead of leaving them silently absent.
 const OPTIONAL_SCANNERS = Object.freeze([
@@ -216,7 +244,12 @@ const PROVIDER_LOGO_FILES = Object.freeze({
   newrelic: 'newrelic.svg',
   influxdb: 'influxdb.svg',
   opentelemetry: 'opentelemetry.svg',
-  jenkins: 'jenkins.svg'
+  jenkins: 'jenkins.svg',
+  'gitlab-ci': 'gitlab.svg',
+  'github-actions': 'github.svg',
+  'azure-pipelines': 'azure-devops.svg',
+  circleci: 'circleci.svg',
+  'bitbucket-pipelines': 'bitbucket.svg'
 });
 
 /**
@@ -231,6 +264,68 @@ const PROVIDER_LOGO_FILES = Object.freeze({
  * page puisse continuer son propre traitement sinon.
  */
 const SHELL_NAV_COMMANDS = new Set(navCommands());
+
+/**
+ * Le seul élément d'un document qui change à chaque rendu sans que rien d'autre
+ * n'ait bougé : le nonce CSP, présent dans l'en-tête et sur chaque balise de
+ * script. Mesuré sur la page Dynamic Security, deux rendus consécutifs d'un même
+ * modèle ne diffèrent que par lui, en deux endroits.
+ */
+const RENDER_NONCE_PATTERN = /nonce-[A-Za-z0-9+/=]+|nonce="[A-Za-z0-9+/=]+"/g;
+
+/** Empreinte d'un document, insensible au seul nonce. */
+function renderedDocumentDigest(html) {
+  return crypto.createHash('sha1').update(String(html).replace(RENDER_NONCE_PATTERN, 'nonce')).digest('hex');
+}
+
+const lastRenderedDigests = new Map();
+
+/** Où la date du dernier enregistrement du compte de test ZAP est notée. */
+const ZAP_ACCOUNT_UPDATED_AT_KEY = 'securityCenter.zapAccountUpdatedAt';
+
+/** Où le dernier déroulé d'exécution ZAP est conservé entre deux ouvertures. */
+const ZAP_EXECUTION_STATE_KEY = 'securityCenter.zapExecution';
+const { zapScanMode, stampZapFindings, recordZapRunResult } = require('./zap-results');
+const { burpConnectorProblem } = require('./burp-connector-state');
+
+/**
+ * Les états que la campagne dynamique sait recevoir.
+ *
+ * Le moteur ZAP publie désormais des étapes plus fines que la campagne — attente
+ * de l'API, arrêt du démon, scan actif sauté. `applyProgress` lève sur un état
+ * qu'elle ne connaît pas, donc le tri se fait ici, à l'entrée.
+ */
+const DYNAMIC_CAMPAIGN_STATES = new Set([
+  'STARTING', 'SPIDERING', 'PASSIVE_WAIT', 'ACTIVE_SCANNING', 'COLLECTING_RESULTS'
+]);
+
+/**
+ * Pose un document dans un webview, sauf s'il est déjà le même.
+ *
+ * Affecter `webview.html` recharge tout le document : VS Code jette le DOM,
+ * réanalyse la feuille de style et relance les scripts. Le webview est visuellement
+ * vide pendant ce temps — c'est l'écran noir observé. Or la navigation rend deux
+ * fois de suite (une fois tout de suite, une fois après le rafraîchissement
+ * réseau), et le second document est le plus souvent identique au premier : la
+ * page était donc rechargée pour rien, et clignotait.
+ *
+ * Comparer avec le nonce neutralisé est ce qui rend le test possible, puisque
+ * c'est la seule chose qui change autrement. Aucun document n'est jamais rendu
+ * avec un nonce réutilisé : quand les deux sont équivalents, on garde simplement
+ * celui qui est déjà affiché, avec son propre nonce toujours valide.
+ */
+function applyWebviewHtml(webview, html, key) {
+  const digest = renderedDocumentDigest(html);
+  if (lastRenderedDigests.get(key) === digest) return false;
+  lastRenderedDigests.set(key, digest);
+  webview.html = html;
+  return true;
+}
+
+/** Oublie l'empreinte d'une surface fermée : le prochain rendu doit repartir. */
+function forgetRenderedDocument(key) {
+  lastRenderedDigests.delete(key);
+}
 
 async function handleShellNavMessage(message) {
   // La carte Companion existe sur plusieurs surfaces : l'ouverture de la
@@ -276,8 +371,21 @@ async function isBurpRunning() {
   } catch { return false; }
 }
 
+/**
+ * Le runtime Java, mesuré plutôt que deviné par un code de sortie.
+ *
+ * La sonde précédente concluait « pas de Java » dès que `java -version` sortait
+ * non nul — ce qui arrive sur une machine dont le fichier de pagination est
+ * saturé, la JVM s'identifiant puis échouant à réserver son tas. ZAP local
+ * basculait alors INDISPONIBLE sans que rien n'ait changé sur le poste.
+ */
+async function javaRuntime() {
+  return detectJavaRuntime({ run: execFileAsync });
+}
+
+/** Conservé pour les appelants qui ne veulent qu'un oui ou non. */
 async function javaAvailable() {
-  try { await execFileAsync('java', ['-version'], { windowsHide: true, timeout: 10000 }); return true; } catch { return false; }
+  return (await javaRuntime()).found;
 }
 
 function zapRequestedForScan(cfg, projectPolicy, requested) {
@@ -322,7 +430,22 @@ class DashboardProvider {
     this.zapPreflightHost = undefined;
     this.zapPreflightSurface = undefined;
     this.resolveZapPreflight = undefined;
+    // La saisie du compte de test ZAP est un formulaire rendu dans la page, pas
+    // une chaîne de boîtes natives : il lui faut le même état que le préflight —
+    // ce qui est demandé, par quelle surface, et qui attend la réponse.
+    this.zapAccountForm = undefined;
+    this.zapAccountHost = undefined;
+    this.zapAccountSurface = undefined;
+    this.resolveZapAccount = undefined;
     this.model = buildDashboardModel();
+    // Le coordinateur de rafraîchissement doit savoir si quelqu'un regarde
+    // encore ces données : une horloge qui bat pour une page fermée est un
+    // sondage à vide. L'appelant remplace ce rappel à l'activation.
+    this.onDynamicSurfaceChange = () => {};
+    // Dernière visibilité relayée : seuls les vrais changements sont transmis.
+    this.lastDynamicSurfaceOpen = false;
+    // Filtre Scanner demandé pour la prochaine ouverture de la page Findings.
+    this.findingsToolPreset = '';
     this.onCommand = onCommand;
     this.themeSubscription = themeController?.onDidChange((theme) => {
       this.selectedTheme = theme;
@@ -356,6 +479,9 @@ class DashboardProvider {
       ['OSV-Scanner', 'osv-scanner.svg'],
       ['SonarQube', 'sonarqube.svg'],
       ['Snyk', 'snyk.svg'],
+      ['Nuclei', 'nuclei.png'],
+      ['mitmproxy', 'mitmproxy.png'],
+      ['Burp', 'burp-suite.svg'],
       ['ZAP', 'zap.png']
     ]) {
       if (scannerRoot) scannerLogoUris[tool] = webview.asWebviewUri(vscode.Uri.joinPath(scannerRoot, file)).toString();
@@ -366,7 +492,7 @@ class DashboardProvider {
     }
     return {
       companionImageUri: webview.asWebviewUri(vscode.Uri.joinPath(root, 'security-companion.png')).toString(),
-      // L'identite Secenter. 256 px : la marque est rendue entre 28 et 34 px,
+      // L'identite SCenter. 256 px : la marque est rendue entre 28 et 34 px,
       // ce qui laisse la place a un ecran 3x sans image floue.
       brandLogoUri: brandingRoot
         ? webview.asWebviewUri(vscode.Uri.joinPath(brandingRoot, 'secenter-icon-256.png')).toString()
@@ -423,6 +549,13 @@ class DashboardProvider {
         this.resolveZapPreflightDecision(message);
         return;
       }
+      // La saisie du compte de test. Le message porte un mot de passe : il va
+      // directement à SecretStorage par l'appelant, n'est jamais conservé ici,
+      // jamais journalisé et jamais renvoyé au webview.
+      if (message?.type === 'zapAccountResolved') {
+        this.resolveZapAccountInput(message);
+        return;
+      }
       // A click on an inventory row. The webview sends an index into the
       // inventory it was rendered from, never a URL — so a crafted message
       // cannot make the extension request an arbitrary target.
@@ -432,9 +565,26 @@ class DashboardProvider {
         if (endpoint) this.onCommand('securityCenter.showDynamicEndpoint', endpoint);
         return;
       }
+      if (message?.type === 'dynamicTargetMode') {
+        this.onCommand('securityCenter.changeDynamicTarget', {
+          mode: message.mode === TARGET_MODE.REMOTE ? TARGET_MODE.REMOTE : TARGET_MODE.LOCAL,
+          targetUrl: typeof message.targetUrl === 'string' ? message.targetUrl : '',
+          modeOnly: true
+        });
+        return;
+      }
+      if (message?.type === 'dynamicTargetSave') {
+        this.onCommand('securityCenter.changeDynamicTarget', {
+          mode: message.mode === TARGET_MODE.REMOTE ? TARGET_MODE.REMOTE : TARGET_MODE.LOCAL,
+          targetUrl: typeof message.targetUrl === 'string' ? message.targetUrl : ''
+        });
+        return;
+      }
       const allowed = new Set([
         'securityCenter.openDashboard',
         'securityCenter.openFindingsPage',
+        'securityCenter.openNucleiFindings',
+        'securityCenter.openZapFindings',
         'securityCenter.openScansPage',
         'securityCenter.openDynamicPage',
         'securityCenter.openBurpSettingsPage',
@@ -445,11 +595,18 @@ class DashboardProvider {
         'securityCenter.scanSelected',
         'securityCenter.showLogs',
         'securityCenter.scanZap',
+        'securityCenter.stopZapScan',
+        'securityCenter.scanNuclei',
         'securityCenter.configureZap',
         'securityCenter.configureZapCredentials',
         'securityCenter.configureBurp',
         'securityCenter.testBurpConnection',
         'securityCenter.importHttpCapture',
+        'securityCenter.installMitmproxy',
+        'securityCenter.startMitmproxyCapture',
+        'securityCenter.stopMitmproxyCapture',
+        'securityCenter.openMitmproxyBrowser',
+        'securityCenter.refreshHttpTraffic',
         'securityCenter.replayHttpScenario',
         'securityCenter.showScanHistory',
         'securityCenter.showScanHistoryPage',
@@ -504,16 +661,18 @@ class DashboardProvider {
         this.onCommand('securityCenter.retryScanner', message.tool);
       }
       if (message?.type === 'finding' && Number.isInteger(message.index)) {
-        const finding = this.model.findings[message.index];
+        const finding = this.findingAt(message.index);
         if (finding) this.onCommand('securityCenter.showFindingDetails', finding);
+        else this.reportUnresolvableFinding();
       }
       if (message?.type === 'findingFromTraffic' && Number.isInteger(message.findingIndex) && Number.isInteger(message.trafficIndex)) {
         const finding = this.model.findings[message.findingIndex];
         if (finding) this.onCommand('securityCenter.showFindingDetails', finding, { trafficIndex: message.trafficIndex });
       }
       if (message?.type === 'findingCode' && Number.isInteger(message.index)) {
-        const finding = this.model.findings[message.index];
+        const finding = this.findingAt(message.index);
         if (finding) this.onCommand('securityCenter.openFindingCode', finding);
+        else this.reportUnresolvableFinding();
       }
       if (message?.type === 'httpTrafficDetails' && Number.isInteger(message.index)) {
         const scenario = this.model.httpScenarios[message.index];
@@ -525,6 +684,23 @@ class DashboardProvider {
       }
       if (message?.type === 'openFullHttpRequest' && Number.isInteger(message.index)) this.openFullHttpRequest(message.index);
     });
+  }
+  /**
+   * The finding at a position the webview sent, or nothing.
+   *
+   * A position only means something inside the list the page was rendered from.
+   * `findings[-1]` is `undefined`, and the previous `if (finding)` turned that
+   * into a click that did nothing at all — no action, no message, no log.
+   */
+  findingAt(index) {
+    const findings = this.model?.findings || [];
+    return Number.isInteger(index) && index >= 0 && index < findings.length ? findings[index] : undefined;
+  }
+  /** An action that cannot name its finding says so instead of disappearing. */
+  reportUnresolvableFinding() {
+    vscode.window.showInformationMessage(
+      'Security Center : ce résultat n’est plus dans le rapport courant. Relancez l’analyse ou rouvrez la page pour le retrouver.'
+    );
   }
   openFullHttpRequest(index) {
     const scenario = this.model.httpScenarios[index];
@@ -586,10 +762,42 @@ class DashboardProvider {
     this.registerMessages(panel.webview);
     panel.onDidDispose(() => {
       this.cancelZapPreflightForWebview(panel.webview);
+      this.cancelZapAccountForWebview(panel.webview);
       this.fullPanel = undefined;
     });
     this.renderWebview(panel.webview);
   }
+  /** Les surfaces qui affichent l'état d'exécution dynamique et son trafic. */
+  static get DYNAMIC_SURFACES() { return ['dynamic', 'burp-settings']; }
+
+  /**
+   * Si une de ces surfaces est ouverte **et visible** en ce moment.
+   *
+   * La visibilité, et non la simple existence du panneau : un onglet masqué ne
+   * justifie aucun sondage. La Phase B avait élargi cette règle à tout panneau
+   * ouvert ; le sondage continuait alors derrière un onglet caché, et chaque
+   * battement coûtait des processus. Au retour sur l'onglet, l'état est relu
+   * immédiatement, donc rien n'est perdu.
+   */
+  hasDynamicSurface() {
+    return DashboardProvider.DYNAMIC_SURFACES.some((page) => this.pagePanels.get(page)?.visible === true);
+  }
+
+  /**
+   * Prévient le coordinateur, mais seulement quand la visibilité change.
+   *
+   * `onDidChangeViewState` se déclenche aussi à chaque changement de focus entre
+   * groupes d'éditeurs, sans que la page ait été masquée ni révélée. Relayer
+   * chacun de ces événements relançait une relecture complète du trafic à
+   * chaque clic ailleurs dans VS Code.
+   */
+  notifyDynamicSurface() {
+    const open = this.hasDynamicSurface();
+    if (open === this.lastDynamicSurfaceOpen) return;
+    this.lastDynamicSurfaceOpen = open;
+    try { this.onDynamicSurfaceChange(open); } catch { /* un rappel fautif ne casse pas l'ouverture d'une page */ }
+  }
+
   openPage(page) {
     const titles = { findings: 'Security Center — Findings', scans: 'Security Center — Scans', dynamic: 'Security Center — Dynamic Security', analytics: 'Security Center — Analytics', 'burp-settings': 'Security Center — Burp Settings', 'scanner-details': 'Security Center — Scanner Details' };
     const existing = this.pagePanels.get(page);
@@ -599,10 +807,35 @@ class DashboardProvider {
     this.registerMessages(panel.webview);
     panel.onDidDispose(() => {
       this.cancelZapPreflightForWebview(panel.webview);
+      this.cancelZapAccountForWebview(panel.webview);
       this.pagePanels.delete(page);
+      forgetRenderedDocument(`dashboard:${page}`);
+      this.notifyDynamicSurface();
     });
+    if (DashboardProvider.DYNAMIC_SURFACES.includes(page)) {
+      // Masquer un onglet suffit à arrêter le rafraîchissement : ce que
+      // personne ne voit n'a pas besoin d'être relu.
+      panel.onDidChangeViewState(() => this.notifyDynamicSurface());
+      this.notifyDynamicSurface();
+    }
     this.renderWebview(panel.webview, page);
   }
+  /**
+   * Ouvre la page Findings complète, déjà filtrée sur un scanner.
+   *
+   * « Voir les findings Nuclei » menait vers la section Dynamic Findings, qui ne
+   * liste que les priorités HIGH et CRITICAL : une carte annonçant 12 findings
+   * aboutissait à « Nuclei 0 ». Le bouton ouvre désormais la vue complète, où
+   * toutes les sévérités sont présentes, avec le filtre Scanner prérempli.
+   */
+  openFindingsForTool(toolId) {
+    this.findingsToolPreset = String(toolId || '');
+    const existing = this.pagePanels.get('findings');
+    if (!existing) return this.openPage('findings');
+    existing.reveal(vscode.ViewColumn.Active);
+    this.renderWebview(existing.webview, 'findings');
+  }
+
   openScannerDetails(scannerIdOrName) {
     this.activeScanner = scannerToolFromId(scannerIdOrName);
     const existing = this.pagePanels.get('scanner-details');
@@ -656,6 +889,55 @@ class DashboardProvider {
   cancelZapPreflightForWebview(webview) {
     if (webview && this.zapPreflightHost === webview) this.resolveZapPreflightDecision({ id: this.zapPreflight?.id, decision: 'cancel' });
   }
+  /**
+   * Demande le compte de test ZAP dans un formulaire rendu par la page.
+   *
+   * Deux essais réels ont montré qu'une chaîne de `showInputBox` déclenchée par un
+   * clic dans la webview ne survit pas à son deuxième maillon : la boîte
+   * identifiant s'ouvre, accepte la saisie, puis la boîte mot de passe ouverte
+   * juste après n'est pas utilisable — `ignoreFocusOut` compris. Le préflight ZAP
+   * n'a jamais eu ce problème parce qu'il ne quitte pas la page : il rend son
+   * dialogue dans le webview et attend un message. La saisie du compte emprunte
+   * exactement ce chemin, et les deux champs sont alors visibles ensemble.
+   *
+   * Retourne `null` si aucune surface Security Center n'est ouverte : l'appelant
+   * retombe alors sur les boîtes natives, seule option depuis la palette.
+   */
+  requestZapAccount({ username = '', passwordStored = false } = {}) {
+    const host = this.selectZapPreflightHost();
+    if (!host) return Promise.resolve(null);
+    if (this.resolveZapAccount) this.resolveZapAccountInput({ id: this.zapAccountForm?.id, decision: 'cancel' });
+    const id = crypto.randomBytes(8).toString('hex');
+    // Seul l'identifiant est renvoyé à la page. Le mot de passe enregistré n'y
+    // entre pas : la page n'apprend que son existence.
+    this.zapAccountForm = { id, username: String(username || ''), passwordStored: Boolean(passwordStored) };
+    this.zapAccountHost = host.webview;
+    this.zapAccountSurface = host.surface;
+    return new Promise((resolve) => {
+      this.resolveZapAccount = resolve;
+      this.renderWebview(host.webview, host.surface);
+    });
+  }
+  resolveZapAccountInput(message = {}) {
+    if (!this.zapAccountForm || message.id !== this.zapAccountForm.id) return;
+    const entry = message.decision === 'save'
+      ? { username: String(message.username || ''), password: String(message.password || '') }
+      : message.decision === 'remove' ? { remove: true } : { cancelled: true };
+    const resolve = this.resolveZapAccount;
+    const host = this.zapAccountHost;
+    const surface = this.zapAccountSurface;
+    this.zapAccountForm = undefined;
+    this.zapAccountHost = undefined;
+    this.zapAccountSurface = undefined;
+    this.resolveZapAccount = undefined;
+    // Le formulaire disparaît du document avant que l'appelant n'enregistre quoi
+    // que ce soit : le mot de passe saisi ne reste pas dans un DOM affiché.
+    if (host) this.renderWebview(host, surface || 'full');
+    resolve?.(entry);
+  }
+  cancelZapAccountForWebview(webview) {
+    if (webview && this.zapAccountHost === webview) this.resolveZapAccountInput({ id: this.zapAccountForm?.id, decision: 'cancel' });
+  }
   setData(findings, scanners, options) {
     this.model = buildDashboardModel(findings, scanners, {
       ...options,
@@ -686,9 +968,17 @@ class DashboardProvider {
     // son propre rendu compact. Toutes les autres surfaces gardent le document
     // du dashboard, inchange.
     const uiState = webview === this.zapPreflightHost ? { zapPreflight: this.zapPreflight } : {};
-    webview.html = surface === 'sidebar'
+    if (webview === this.zapAccountHost && this.zapAccountForm) uiState.zapAccount = this.zapAccountForm;
+    // Un filtre demandé par un bouton s'applique à l'ouverture, une seule fois :
+    // la page Findings ouverte ensuite par la navigation reste non filtrée.
+    if (surface === 'findings' && this.findingsToolPreset) {
+      uiState.findingsTool = this.findingsToolPreset;
+      this.findingsToolPreset = '';
+    }
+    const html = surface === 'sidebar'
       ? renderSidebarLauncherHtml(model, nonce, this.selectedTheme, {}, this.companionAssetOptions(webview))
       : renderDashboardHtml(model, nonce, surface, this.selectedTheme, uiState, this.companionAssetOptions(webview));
+    applyWebviewHtml(webview, html, `dashboard:${surface}`);
   }
   dispose() { this.themeSubscription?.dispose(); }
 }
@@ -790,6 +1080,102 @@ function publishDiagnostics(collection, findings) {
   for (const { uri, diagnostics } of grouped.values()) collection.set(uri, diagnostics);
 }
 
+/**
+ * Ce que SecretStorage contient pour le compte de test ZAP.
+ *
+ * Les deux secrets sont lus ensemble : c'est ce qui distingue « rien
+ * d'enregistré » d'un compte à moitié enregistré, l'identifiant seul
+ * n'autorisant aucun scan authentifié. Le mot de passe n'est jamais retourné,
+ * seulement le fait qu'il existe.
+ */
+async function readZapTestAccount({ secrets, usernameKey, passwordKey }) {
+  const username = (await secrets.get(usernameKey)) || '';
+  const passwordStored = Boolean(await secrets.get(passwordKey));
+  return { username, passwordStored, configured: Boolean(username) && passwordStored };
+}
+
+/**
+ * La saisie de secours, quand aucune surface Security Center n'est ouverte.
+ *
+ * C'est l'ancienne chaîne de boîtes natives, réduite à ses deux étapes utiles.
+ * Elle n'est plus le chemin normal — elle ne l'est que depuis la palette de
+ * commandes, fenêtre sans webview, où elle fonctionne.
+ */
+async function promptZapTestAccountInputs({ window, existing }) {
+  const entered = await window.showInputBox({
+    title: 'Compte de test ZAP authentifié — étape 1 sur 2',
+    prompt: 'Adresse e-mail ou identifiant du compte de test. Le mot de passe est demandé à l’étape suivante.',
+    value: existing.username,
+    ignoreFocusOut: true,
+    validateInput: (value) => String(value || '').trim() ? undefined : 'Saisissez l’adresse e-mail ou l’identifiant du compte de test.'
+  });
+  if (entered === undefined || entered === null) return { cancelled: true };
+  const password = await window.showInputBox({
+    title: 'Mot de passe du compte de test ZAP — étape 2 sur 2',
+    prompt: existing.passwordStored
+      ? 'Conservé dans VS Code SecretStorage. Laissez le champ vide pour garder le mot de passe déjà enregistré.'
+      : 'Conservé dans VS Code SecretStorage : jamais dans settings.json, jamais dans le projet, jamais dans les journaux.',
+    password: true,
+    ignoreFocusOut: true
+  });
+  if (password === undefined || password === null) return { cancelled: true };
+  return { username: entered, password };
+}
+
+/**
+ * Demande puis enregistre le compte de test ZAP authentifié.
+ *
+ * Le parcours précédent s'arrêtait avant le mot de passe. Il commençait par un
+ * QuickPick — la seule saisie de la chaîne sans `ignoreFocusOut` — ouvert depuis
+ * un clic dans la webview Dynamic Security : dès que le focus revenait à la
+ * page, VS Code refermait ce sélecteur, `showQuickPick` rendait `undefined` et la
+ * commande se terminait sur `if (!action) return;`. Aucun champ mot de passe,
+ * aucun message, aucune trace. Les autres sorties silencieuses — annulation,
+ * champ laissé vide — étaient elles aussi indistinguables d'un enregistrement
+ * réussi.
+ *
+ * Le parcours est donc : identifiant → mot de passe masqué → enregistrement.
+ * Chaque étape garde le focus, le sélecteur n'apparaît plus que lorsqu'il a
+ * quelque chose à offrir — un compte existe et peut être supprimé —, et chaque
+ * sortie nomme son issue à l'appelant, qui la rapporte.
+ *
+ * Rien n'est écrit avant que les deux étapes aient abouti : annuler laisse les
+ * identifiants enregistrés intacts, et un mot de passe laissé vide conserve
+ * celui déjà présent dans SecretStorage au lieu de l'effacer.
+ *
+ * Le mot de passe ne sort d'ici que vers SecretStorage : il n'est ni journalisé,
+ * ni renvoyé à l'appelant, ni écrit dans la configuration.
+ */
+async function configureZapTestAccount({ window, secrets, usernameKey, passwordKey, log = () => {}, requestForm } = {}) {
+  const existing = await readZapTestAccount({ secrets, usernameKey, passwordKey });
+  let submitted = requestForm
+    ? await requestForm({ username: existing.username, passwordStored: existing.passwordStored })
+    : null;
+  if (!submitted) submitted = await promptZapTestAccountInputs({ window, existing });
+  if (submitted.remove) {
+    if (!existing.username && !existing.passwordStored) return { status: 'nothing-to-remove', account: existing };
+    await secrets.delete(usernameKey);
+    await secrets.delete(passwordKey);
+    log('compte de test supprimé de SecretStorage.');
+    return { status: 'cleared', account: { username: '', passwordStored: false, configured: false } };
+  }
+  if (submitted.cancelled) return { status: 'cancelled', account: existing };
+  const username = String(submitted.username ?? '').trim();
+  if (!username) return { status: 'username-required', account: existing };
+  const password = String(submitted.password ?? '');
+  // Un mot de passe vide ne remplace jamais un secret valide ; sans secret
+  // déjà enregistré, il n'y a rien à stocker et l'appelant doit le dire.
+  if (!password && !existing.passwordStored) return { status: 'password-required', account: existing };
+  await secrets.store(usernameKey, username);
+  if (password) await secrets.store(passwordKey, password);
+  log(`compte de test enregistré pour ${username} (mot de passe ${password ? 'remplacé' : 'inchangé'}).`);
+  return {
+    status: 'saved',
+    passwordKept: !password,
+    account: { username, passwordStored: true, configured: true }
+  };
+}
+
 async function activate(context) {
   // The backend is a local service this extension owns, not a container the
   // user is asked to run. Its key is generated on first activation and kept in
@@ -811,6 +1197,15 @@ async function activate(context) {
     getConfiguration: () => vscode.workspace.getConfiguration('securityCenter'),
     apiKey: activeBackendKey,
     version: context.extension?.packageJSON?.version || '',
+    // La cible Dynamic Security que Burp peut verser en plus du local : locale,
+    // ou distante seulement quand son autorisation a été confirmée.
+    captureOrigins: () => {
+      const cfg = vscode.workspace.getConfiguration('securityCenter');
+      let origin = '';
+      try { origin = new URL(cfg.get('zap.targetUrl', '')).origin; } catch { return []; }
+      const remote = cfg.get('zap.targetMode', 'local') === 'remote';
+      return remote && cfg.get('zap.remoteAuthorized', false) !== true ? [] : [origin];
+    },
     log: (message) => scanLog.appendLine(`Backend — ${message}`)
   });
   context.subscriptions.push({ dispose: () => backendManager && backendManager.dispose() });
@@ -822,6 +1217,590 @@ async function activate(context) {
   const themeController = new ThemeController(context.globalState.get('securityCenter.theme', 'light'), (theme) => context.globalState.update('securityCenter.theme', theme));
   const scannerToolManager = new ScannerToolManager(context.globalStorageUri.fsPath);
   await scannerToolManager.activateManagedPath();
+
+  /**
+   * Session de capture mitmproxy en cours.
+   *
+   * Un seul proxy à la fois : deux mitmdump concurrents écriraient dans le même
+   * répertoire de configuration et se disputeraient l'autorité de certification.
+   */
+  let mitmSession = null;
+  let mitmState = mitmproxy.MITM_STATE.NOT_INSTALLED;
+  let mitmError = '';
+  /**
+   * Échanges capturés qui n'ont pas atteint Security Center.
+   *
+   * L'addon les signale par un marqueur dans sa sortie ; sans ce compte, un
+   * proxy parfaitement vivant pouvait perdre chaque échange sans que la page en
+   * dise un mot. Un échange perdu est une donnée manquante, pas une ligne de
+   * journal.
+   */
+  let mitmLostExchanges = 0;
+  let mitmLostReason = '';
+  /** Un arrêt demandé par l'utilisateur : la sortie du processus est attendue. */
+  let mitmStopRequested = false;
+
+  /**
+   * Publication regroupée des pertes d'ingestion.
+   *
+   * Un backend qui refuse tout — un 401, par exemple — fait échouer chaque
+   * échange. Publier à chaque ligne rendait la page des dizaines de fois par
+   * seconde. Le compte est tenu immédiatement ; l'état est publié une fois par
+   * seconde au plus.
+   */
+  const MITM_LOSS_FLUSH_MS = 1000;
+  let mitmLossFlushTimer = null;
+
+  function clearMitmLossFlush() {
+    if (mitmLossFlushTimer) clearTimeout(mitmLossFlushTimer);
+    mitmLossFlushTimer = null;
+  }
+
+  function scheduleMitmLossFlush() {
+    if (mitmLossFlushTimer) return;
+    mitmLossFlushTimer = setTimeout(() => {
+      mitmLossFlushTimer = null;
+      flushMitmLoss();
+    }, MITM_LOSS_FLUSH_MS);
+    mitmLossFlushTimer.unref?.();
+  }
+
+  /** Porte les pertes accumulées sur la capture en cours — jamais sur une capture close. */
+  function flushMitmLoss() {
+    const run = dynamicEngines.mitmproxy.run;
+    if (!mitmLostExchanges || !run || run.status === RUN_STATUS.COMPLETED || run.status === RUN_STATUS.FAILED) return;
+    updateEngineRun('mitmproxy', {
+      errorCode: RUN_ERROR.INGESTION_FAILED,
+      errorReason: `${mitmLostExchanges} échange(s) capturé(s) n’ont pas atteint Security Center (${mitmLostReason}).`
+    });
+  }
+
+  /**
+   * Le navigateur de capture lancé par Security Center, s'il y en a un :
+   * `{ process, profile, captureId, label, exited }`. Jamais un autre navigateur.
+   */
+  let captureBrowser = null;
+
+  /** Ferme le navigateur de capture suivi, puis efface son profil de capture managé. */
+  async function closeTrackedCaptureBrowser() {
+    const browser = captureBrowser;
+    if (!browser) return;
+    captureBrowser = null;
+    const outcome = await mitmproxy.closeCaptureBrowser(browser).catch((error) => ({ closed: false, reason: error.message }));
+    scanLog.appendLine(`mitmproxy — navigateur de capture ${outcome.closed ? `fermé (${outcome.reason})` : `non fermé : ${outcome.reason}`}`);
+    if (!outcome.closed) return;
+    await mitmproxy.removeCaptureProfile(context.globalStorageUri.fsPath, browser.profile).catch((error) => {
+      scanLog.appendLine(`mitmproxy — profil de capture conservé : ${error.message}`);
+    });
+  }
+
+  /**
+   * Détection de mitmproxy, mémorisée.
+   *
+   * `detect()` lance `mitmdump --version` : un démarrage complet de Python, que
+   * l'antivirus inspecte à chaque fois. Le sondage du trafic l'appelait toutes
+   * les trois secondes, et le poste a fini par saturer. La détection réelle n'a
+   * désormais lieu qu'à l'activation, à l'ouverture de la page (au plus une fois
+   * par minute), à l'installation et au démarrage d'une capture. Le sondage lit la
+   * dernière valeur connue sans rien lancer, et deux détections ne tournent
+   * jamais en même temps.
+   */
+  const MITM_DETECTION_TTL_MS = 60000;
+  let mitmDetectionCache = null;
+  let mitmDetectionInFlight = null;
+
+  function invalidateMitmDetection() {
+    mitmDetectionCache = null;
+  }
+
+  function rememberMitmDetection(detected) {
+    mitmDetectionCache = { at: Date.now(), detected: detected || null };
+    return mitmDetectionCache.detected;
+  }
+
+  function detectMitmTool({ force = false } = {}) {
+    if (!force && mitmDetectionCache && Date.now() - mitmDetectionCache.at < MITM_DETECTION_TTL_MS) {
+      return Promise.resolve(mitmDetectionCache.detected);
+    }
+    if (mitmDetectionInFlight) return mitmDetectionInFlight;
+    mitmDetectionInFlight = mitmproxy.detect(context.globalStorageUri.fsPath)
+      .catch(() => null)
+      .then((detected) => rememberMitmDetection(detected))
+      .finally(() => { mitmDetectionInFlight = null; });
+    return mitmDetectionInFlight;
+  }
+
+  /**
+   * La détection connue, sans rien lancer.
+   *
+   * Tant qu'aucune détection n'a abouti, l'état déjà publié est conservé : un
+   * sondage ne doit pas faire clignoter la carte vers « non installé » pendant
+   * que la détection de l'activation est encore en cours.
+   */
+  function knownMitmDetection() {
+    if (mitmDetectionCache) return mitmDetectionCache.detected;
+    const previous = currentDashboardOptions.mitmproxy;
+    return previous
+      ? { installed: previous.installed === true, version: previous.version || '', executable: previous.executable || '' }
+      : null;
+  }
+
+  /**
+   * Modèle mitmproxy tel que la page le rend. Rien n'y est supposé.
+   *
+   * `detect: false` est réservé aux chemins répétitifs — le sondage, la sortie
+   * du processus : ils lisent la détection connue et ne lancent aucun processus.
+   */
+  async function mitmModel({ detect = true } = {}) {
+    const detected = detect ? await detectMitmTool() : knownMitmDetection();
+    // L'état HTTPS se lit sur le disque : un accès fichier, pas un processus.
+    const https = await mitmproxy.httpsState(context.globalStorageUri.fsPath).catch(() => null);
+    const running = Boolean(mitmSession?.process && mitmSession.process.exitCode === null && mitmSession.process.signalCode === null);
+    // « CAPTURING » n'est vrai que si le backend a reçu du trafic récemment :
+    // un proxy démarré que personne ne traverse ne capture rien.
+    const state = mitmError ? mitmproxy.MITM_STATE.FAILED
+      : !detected?.installed ? mitmproxy.MITM_STATE.NOT_INSTALLED
+        : running ? mitmState
+          : mitmSession ? mitmproxy.MITM_STATE.STOPPED : mitmproxy.MITM_STATE.READY;
+    return {
+      state,
+      // La détection est publiée telle quelle : l'état d'installation ne se
+      // déduit ni de l'état de capture ni d'une erreur de démarrage.
+      installed: detected?.installed === true,
+      version: detected?.version || '',
+      executable: detected?.executable || '',
+      proxyUrl: running ? mitmSession.proxyUrl : '',
+      port: running ? mitmSession.port : 0,
+      startedAt: running ? mitmSession.startedAt : '',
+      httpsState: https?.state || mitmproxy.HTTPS_STATE.CERTIFICATE_REQUIRED,
+      certificateAuthority: https?.certificateAuthority || '',
+      error: mitmError
+    };
+  }
+
+  /**
+   * Republie le modèle mitmproxy sans toucher au reste des options.
+   *
+   * La détection passe par le cache : appelée à chaque geste et à chaque sortie
+   * de processus, elle ne relance `mitmdump --version` qu'au plus une fois par
+   * minute, et jamais quand `detect` vaut `false`.
+   */
+  async function refreshMitmModel({ detect = true } = {}) {
+    const model = await mitmModel({ detect });
+    currentDashboardOptions = { ...currentDashboardOptions, mitmproxy: model };
+    setEngineAvailability('mitmproxy', mitmAvailability(model));
+    publishDashboard();
+  }
+
+  /**
+   * État d'installation de Nuclei, tel que Scanner Configuration l'établit.
+   *
+   * C'est la seule source qui fasse autorité : la présence réelle de
+   * l'exécutable managé et une réponse effective à `-version`. La page Dynamic
+   * Security déduisait cet état de `model.scanners`, qui décrit l'historique
+   * d'exécution et non l'outillage installé — un Nuclei parfaitement installé
+   * mais jamais lancé s'y affichait donc « NOT INSTALLED », en contradiction
+   * avec la page Scanner Configuration qui, elle, interrogeait la détection.
+   */
+  /**
+   * Détection de Nuclei, mémorisée quelques secondes.
+   *
+   * `status('nuclei')` lance `nuclei.exe -version` — un binaire de 145 Mo, mesuré
+   * à 370 ms. Le faire à chaque ouverture de Dynamic Security relançait ce
+   * processus pour redécouvrir un état qui n'avait pas bougé. La mémorisation ne
+   * masque aucun changement réel : une installation l'invalide explicitement, et
+   * la page Scanner Configuration republie l'état qu'elle vient de mesurer.
+   */
+  const NUCLEI_DETECTION_TTL_MS = 10000;
+  /** Le processus Nuclei d'un scan en cours, arrêté si la fenêtre se ferme. */
+  let activeNucleiProcess = null;
+  /** Le démon ZAP local d'un scan en cours, et le conteneur Docker s'il y en a un. */
+  let activeZapProcess = null;
+  // Le contrôleur d'annulation du scan en cours. Il existe pour qu'un bouton de
+  // la carte puisse arrêter ce que la notification de progression sait déjà
+  // arrêter : c'est le même chemin d'annulation, pas un second.
+  let activeScanAbort = null;
+  let activeZapContainer = '';
+  let nucleiToolCache = null;
+
+  function invalidateNucleiToolCache() { nucleiToolCache = null; }
+
+  async function nucleiToolModel() {
+    if (nucleiToolCache && Date.now() - nucleiToolCache.at < NUCLEI_DETECTION_TTL_MS) return nucleiToolCache.model;
+    const model = await detectNucleiTool();
+    nucleiToolCache = { at: Date.now(), model };
+    return model;
+  }
+
+  async function detectNucleiTool() {
+    const detected = await scannerToolManager.status('nuclei').catch(() => null);
+    const templates = detected?.installed ? await nucleiTemplatesManifest().catch(() => null) : null;
+    return {
+      installed: Boolean(detected?.installed),
+      version: detected?.version || '',
+      executable: detected?.executable || '',
+      managed: detected?.managed === true,
+      templatesVersion: templates?.version || '',
+      templatesCount: Number(templates?.templates || 0),
+      templatesDirectory: templates?.directory || ''
+    };
+  }
+
+  /** Republie l'état outil de Nuclei sans toucher au reste des options. */
+  async function refreshNucleiToolModel() {
+    currentDashboardOptions = { ...currentDashboardOptions, nucleiTool: await nucleiToolModel() };
+    setEngineAvailability('nuclei', nucleiAvailability(currentDashboardOptions.nucleiTool));
+    publishDashboard();
+  }
+
+  // ------------------------------------------------- socle d'exécution commun
+  //
+  // Un seul registre porte l'état courant des quatre moteurs dynamiques. Les
+  // cartes le lisent, et rien d'autre : `model.scanners` continue de décrire ce
+  // qui a été trouvé, jamais ce qu'un moteur est en train de faire.
+  //
+  // Deux faits y sont séparés, parce qu'ils répondent à deux questions
+  // différentes : la **disponibilité** vient d'une détection réelle, l'**exécution**
+  // de ce que le moteur a effectivement fait. Un Nuclei installé et jamais lancé
+  // est disponible et n'a jamais tourné ; il n'est pas « indisponible ».
+
+  const dynamicEngines = {
+    zap: { kind: RUN_KIND.SCAN, availability: unknownAvailability(), run: null, lastRun: null },
+    nuclei: { kind: RUN_KIND.SCAN, availability: unknownAvailability(), run: null, lastRun: null },
+    mitmproxy: { kind: RUN_KIND.CAPTURE, availability: unknownAvailability(), run: null, lastRun: null },
+    burp: { kind: RUN_KIND.CONNECTOR, availability: unknownAvailability(), run: null, lastRun: null }
+  };
+
+  /**
+   * Publication d'un changement d'état, liée tardivement.
+   *
+   * `publishDashboard` est déclaré plus bas ; l'appeler directement d'ici
+   * exposerait à sa zone morte temporelle pendant l'activation. Cette
+   * indirection est remplacée dès que le tableau de bord est prêt, et reste
+   * inoffensive avant.
+   */
+  let publishRuntimeChange = () => {};
+
+  /**
+   * Publication différée et regroupée.
+   *
+   * Plusieurs transitions arrivent souvent ensemble — disponibilité, activité,
+   * connecteur. Chacune rendait toute la page, pour chaque panneau ouvert. Elles
+   * sont regroupées en une seule publication, annulée si une publication
+   * explicite a déjà rendu l'état entre-temps.
+   */
+  const RUNTIME_PUBLISH_DELAY_MS = 150;
+  let pendingRuntimePublish = null;
+
+  function cancelPendingRuntimePublish() {
+    if (!pendingRuntimePublish) return;
+    clearTimeout(pendingRuntimePublish);
+    pendingRuntimePublish = null;
+  }
+
+  /**
+   * Ce qui compte dans l'instantané, sans les horodatages d'observation.
+   *
+   * `observedAt` et `checkedAt` changent à chaque appel : les comparer faisait de
+   * chaque sondage un « changement », donc une publication. Seuls l'état, la
+   * raison, la disponibilité mesurée et l'exécution décident d'une publication.
+   */
+  let lastPublishedRuntimeSignature = '';
+  function runtimeSignature(model) {
+    return JSON.stringify((model?.list || []).map((state) => ({
+      engine: state.engine,
+      status: state.status,
+      reason: state.reason,
+      availability: {
+        installed: state.availability?.installed,
+        usable: state.availability?.usable,
+        version: state.availability?.version,
+        reason: state.availability?.reason,
+        detail: state.availability?.detail,
+        prerequisites: state.availability?.prerequisites
+      },
+      execution: state.execution
+    })));
+  }
+
+  /**
+   * Recompose l'instantané publié, et le pousse vers la page **s'il a changé**.
+   *
+   * Sans publication, une transition — proxy passé en RUNNING, processus sorti
+   * seul, ingestion perdue — n'atteignait la page qu'au prochain sondage. Mais
+   * publier sans condition rendait la page à chaque battement, même quand rien
+   * de ce qu'elle montre n'avait bougé.
+   */
+  function refreshDynamicRuntimeOptions() {
+    const model = dynamicRuntimeModel(dynamicEngines);
+    currentDashboardOptions = { ...currentDashboardOptions, dynamicRuntime: model };
+    const signature = runtimeSignature(model);
+    if (signature === lastPublishedRuntimeSignature) return;
+    lastPublishedRuntimeSignature = signature;
+    publishRuntimeChange();
+  }
+
+  function setEngineAvailability(engine, availability) {
+    if (!dynamicEngines[engine]) return;
+    dynamicEngines[engine].availability = availability;
+    refreshDynamicRuntimeOptions();
+  }
+
+  function setEngineRun(engine, run) {
+    if (!dynamicEngines[engine]) return null;
+    const entry = dynamicEngines[engine];
+    // Une exécution close devient de l'histoire : elle quitte l'état courant
+    // pour `lastRun`, où la carte peut la citer sans la faire passer pour en cours.
+    if (run && (run.status === RUN_STATUS.COMPLETED || run.status === RUN_STATUS.FAILED)) {
+      entry.lastRun = run;
+      entry.run = run;
+    } else {
+      entry.run = run;
+    }
+    refreshDynamicRuntimeOptions();
+    return run;
+  }
+
+  /**
+   * Fait avancer l'exécution d'un moteur.
+   *
+   * Une transition interdite est un défaut de câblage, pas un état : elle est
+   * journalisée et l'exécution reste telle qu'elle était, plutôt que de faire
+   * tomber la commande qui l'a demandée.
+   */
+  function updateEngineRun(engine, changes) {
+    const current = dynamicEngines[engine]?.run;
+    if (!current) return null;
+    try {
+      return setEngineRun(engine, transitionRun(current, changes));
+    } catch (error) {
+      scanLog.appendLine(`Dynamic Security — transition refusée pour ${engine} : ${error.message}`);
+      return current;
+    }
+  }
+
+  function beginEngineRun(engine, { kind, target = '', phase = '' } = {}) {
+    const entry = dynamicEngines[engine];
+    if (!entry) return null;
+    return setEngineRun(engine, createDynamicRun({ engine, kind: kind || entry.kind, target, phase }));
+  }
+
+  function failEngineRun(engine, errorCode, errorReason) {
+    const current = dynamicEngines[engine]?.run;
+    if (!current) return null;
+    return setEngineRun(engine, failRun(current, { errorCode, errorReason }));
+  }
+
+  /** La disponibilité de Nuclei, telle que la détection d'outil l'a mesurée. */
+  function nucleiAvailability(tool) {
+    if (!tool) return unknownAvailability();
+    return engineAvailability({
+      installed: tool.installed === true,
+      version: tool.version,
+      executable: tool.executable,
+      managed: tool.managed,
+      detail: tool.templatesVersion ? `Templates ${tool.templatesVersion}` : '',
+      reason: tool.installed ? '' : 'Nuclei n’est pas installé. Installez-le depuis Scanner Configuration.',
+      checkedAt: new Date().toISOString()
+    });
+  }
+
+  /** La disponibilité de mitmproxy, telle que la détection du proxy managé la mesure. */
+  function mitmAvailability(detected) {
+    return engineAvailability({
+      installed: detected?.installed === true,
+      version: detected?.version || '',
+      executable: detected?.executable || '',
+      managed: true,
+      reason: detected?.installed ? '' : 'mitmproxy n’est pas installé. Installez-le depuis Dynamic Security.',
+      checkedAt: new Date().toISOString()
+    });
+  }
+
+  /**
+   * Ce dont chaque moteur ZAP est capable, mesuré séparément.
+   *
+   * Trois faits indépendants : Java, l'installation locale, le moteur Docker.
+   * Aucun n'est déduit d'un autre, et aucun n'est déduit d'un historique de
+   * scans — un ZAP installé et jamais lancé reste un ZAP disponible.
+   */
+  /**
+   * Ce que chaque moteur ZAP vient de répondre.
+   *
+   * Tout est mesuré ici, à chaque appel : rien n'est lu d'un état persisté, d'un
+   * scan précédent ni d'une exécution passée. Docker n'est interrogé que pour
+   * savoir s'il constitue une alternative — son absence ne retire rien à un ZAP
+   * local valide.
+   */
+  async function zapEnginesDetected() {
+    const configured = vscode.workspace.getConfiguration('securityCenter');
+    const [localPath, java, dockerVersion] = await Promise.all([
+      Promise.resolve(detectLocalZap(configured.get('zap.localPath', ''))).catch(() => ''),
+      javaRuntime().catch(() => ({ found: false, version: '', warning: '', reason: 'Sonde Java impossible.' })),
+      ensureDockerAvailable(8000).then((version) => version).catch(() => '')
+    ]);
+    return {
+      localPath: String(localPath || ''),
+      hasJava: java.found === true,
+      javaVersion: String(java.version || ''),
+      javaWarning: String(java.warning || ''),
+      javaReason: String(java.reason || ''),
+      dockerVersion: String(dockerVersion || ''),
+      localUsable: Boolean(localPath) && java.found === true,
+      dockerUsable: Boolean(dockerVersion)
+    };
+  }
+
+  /**
+   * Journalise ce que la détection a observé, à chaque évaluation.
+   *
+   * Sans cela, « INDISPONIBLE » ne disait pas lequel des deux chemins manquait,
+   * et rien ne permettait de le vérifier depuis le produit. Aucun secret n'y
+   * passe : des chemins, une version, deux booléens.
+   */
+  function logZapAvailability(detected, tool) {
+    scanLog.appendLine('ZAP availability :');
+    scanLog.appendLine(`  Java: ${detected.hasJava ? `found${detected.javaVersion ? ` (${detected.javaVersion})` : ''}` : `not found${detected.javaReason ? ` — ${detected.javaReason}` : ''}`}`);
+    if (detected.javaWarning) scanLog.appendLine(`  Java warning: ${detected.javaWarning}`);
+    scanLog.appendLine(`  Local ZAP: ${detected.localPath || 'not detected'}`);
+    scanLog.appendLine(`  Local usable: ${detected.localUsable ? 'yes' : 'no'}`);
+    scanLog.appendLine(`  Docker usable: ${detected.dockerUsable ? `yes (${detected.dockerVersion})` : 'no'}`);
+    scanLog.appendLine(`  Final: ${tool.usable ? RUN_STATUS.READY : RUN_STATUS.UNAVAILABLE}${tool.usable ? '' : ` — ${tool.reason}`}`);
+  }
+
+  async function zapAvailability() {
+    const detected = await zapEnginesDetected();
+    const tool = zapAvailabilityFrom(detected, lastProjectPolicy?.zapEngine || 'auto');
+    logZapAvailability(detected, tool);
+    return tool;
+  }
+
+  /**
+   * L'état du connecteur Burp, à partir du seul fait observable : son battement.
+   *
+   * Un connecteur silencieux n'est pas une panne de Security Center — c'est une
+   * attente, et elle est dite comme telle avec sa raison, au lieu d'un booléen
+   * « déconnecté » qui n'explique rien.
+   */
+  function applyBurpConnectorState(status) {
+    const connected = status?.connected === true;
+    const received = Number(status?.received_requests ?? status?.receivedRequests ?? 0) || 0;
+    const lastSeen = status?.last_seen || status?.lastSeen || '';
+    const entry = dynamicEngines.burp;
+    // La disponibilité est posée directement, sans publier : l'unique
+    // `refreshDynamicRuntimeOptions()` de la fin couvre les deux mises à jour.
+    // Passer par `setEngineAvailability` publiait deux fois par sondage.
+    entry.availability = engineAvailability({
+      installed: true,
+      version: String(status?.connector || 'security-center-burp'),
+      managed: false,
+      reason: '',
+      checkedAt: new Date().toISOString()
+    });
+    if (!entry.run) {
+      entry.run = createDynamicRun({ engine: 'burp', kind: RUN_KIND.CONNECTOR, target: currentDynamicTargetUrl() });
+    }
+    // La raison vient du statut publié par le backend : clé refusée, ingestion en
+    // échec, heartbeat absent — ou backend injoignable, posé par l'appelant.
+    const problem = burpConnectorProblem(status);
+    if (connected) {
+      const withActivity = recordActivity(entry.run, { requestCount: received, at: lastSeen || undefined });
+      const running = withActivity.status === RUN_STATUS.RUNNING
+        ? withActivity
+        : transitionRun(withActivity, { status: RUN_STATUS.RUNNING, requestCount: received });
+      // Connecté : l'ancienne raison de déconnexion ne décrit plus rien. Une
+      // ingestion en échec, elle, reste dite pendant la connexion.
+      entry.run = { ...running, errorCode: problem?.code || '', errorReason: problem?.reason || '' };
+    } else if (entry.run.status !== RUN_STATUS.WAITING_EXTERNAL
+      || entry.run.errorCode !== problem.code || entry.run.errorReason !== problem.reason) {
+      entry.run = transitionRun(entry.run, {
+        status: RUN_STATUS.WAITING_EXTERNAL,
+        errorCode: problem.code,
+        errorReason: problem.reason
+      });
+    }
+    refreshDynamicRuntimeOptions();
+  }
+
+  /** Le moteur dynamique correspondant à un scanner, ou rien si ce n'en est pas un. */
+  function dynamicEngineOf(tool) {
+    const name = String(tool || '').toUpperCase();
+    if (name === 'ZAP') return 'zap';
+    if (name === 'NUCLEI') return 'nuclei';
+    return '';
+  }
+
+  /**
+   * Si un échange capturé appartient à l'exécution en cours.
+   *
+   * L'horodatage du backend fait foi : c'est le seul que Security Center a
+   * lui-même écrit. Un scénario sans horodatage lisible est compté — mieux vaut
+   * l'inclure que de perdre une observation réelle.
+   */
+  function sinceRunStart(scenario, startedAt) {
+    if (!startedAt) return true;
+    const stamp = scenario?.created_at || scenario?.timestamp || '';
+    if (!stamp) return true;
+    const at = Date.parse(stamp);
+    return Number.isNaN(at) ? true : at >= Date.parse(startedAt) - 1000;
+  }
+
+  /** La cible dynamique courante, telle que la configuration la déclare. */
+  function currentDynamicTargetUrl() {
+    return vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
+  }
+
+  /**
+   * Relit les exécutions persistées dans le cache local.
+   *
+   * Elles ne sont pas encore crues : une exécution restaurée décrit ce qui était
+   * vrai avant le rechargement. `reconcileRestoredRuns` tranche ensuite.
+   */
+  function restoreDynamicRuns(persisted) {
+    for (const [engine, state] of Object.entries(persisted?.engines || {})) {
+      const entry = dynamicEngines[engine];
+      const execution = state?.execution;
+      if (!entry || !execution?.runId) continue;
+      const run = restoreRun({ ...execution, id: execution.runId, engine, kind: entry.kind });
+      if (!run) continue;
+      entry.run = run;
+      if (run.status === RUN_STATUS.COMPLETED || run.status === RUN_STATUS.FAILED) entry.lastRun = run;
+    }
+    refreshDynamicRuntimeOptions();
+  }
+
+  /**
+   * Confronte les exécutions restaurées à la réalité du moment.
+   *
+   * Un rechargement de fenêtre tue les processus enfants. Une capture persistée
+   * « en cours » décrirait donc un proxy qui n'existe plus, et un connecteur
+   * « connecté » un battement qui date d'avant. Chacune est vérifiée par un fait
+   * — processus vivant, battement récent —, jamais par une supposition.
+   */
+  function reconcileRestoredRuns() {
+    const captureAlive = Boolean(mitmSession?.process && mitmSession.process.exitCode === null && mitmSession.process.signalCode === null);
+    for (const [engine, entry] of Object.entries(dynamicEngines)) {
+      if (!entry.run) continue;
+      const alive = engine === 'mitmproxy' ? captureAlive
+        : engine === 'burp' ? Boolean(currentDashboardOptions.burpConnected)
+          : false;
+      entry.run = reconcileRun(entry.run, { alive });
+    }
+    refreshDynamicRuntimeOptions();
+  }
+
+  /**
+   * Corpus de templates Nuclei, installé et vérifié dans le stockage de
+   * l'extension. Aucune commande de terminal n'est demandée à l'utilisateur :
+   * l'archive officielle est téléchargée, son empreinte SHA-256 officielle est
+   * vérifiée, puis elle est extraite ici.
+   */
+  function ensureNucleiTemplates(options = {}) {
+    return ensureTemplates(context.globalStorageUri.fsPath, options);
+  }
+  function nucleiTemplatesManifest() {
+    return installedNucleiTemplates(context.globalStorageUri.fsPath);
+  }
   const dashboardProvider = new DashboardProvider(
     (command, ...args) => vscode.commands.executeCommand(command, ...args),
     themeController,
@@ -839,6 +1818,9 @@ async function activate(context) {
     'OSV-Scanner': 'osv-scanner.svg',
     SonarQube: 'sonarqube.svg',
     Snyk: 'snyk.svg',
+    Nuclei: 'nuclei.png',
+    mitmproxy: 'mitmproxy.png',
+    Burp: 'burp-suite.svg',
     ZAP: 'zap.png'
   });
   const companionAssetOptions = (webview) => {
@@ -875,7 +1857,48 @@ async function activate(context) {
     backendStatus: DASHBOARD_BACKEND_STATUS.UNKNOWN
   };
 
-  const publishDashboard = () => dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+  const publishDashboard = () => {
+    // Une publication explicite rend l'état courant : une publication différée
+    // en attente n'aurait plus rien de neuf à montrer.
+    cancelPendingRuntimePublish();
+    dashboardProvider.setData(currentFindings, currentScanStatuses, currentDashboardOptions);
+  };
+  publishRuntimeChange = () => {
+    if (pendingRuntimePublish) return;
+    pendingRuntimePublish = setTimeout(() => {
+      pendingRuntimePublish = null;
+      publishDashboard();
+    }, RUNTIME_PUBLISH_DELAY_MS);
+    pendingRuntimePublish.unref?.();
+  };
+  context.subscriptions.push({ dispose: cancelPendingRuntimePublish });
+
+  /**
+   * The project configuration state, read from security-center.yml. Refreshed
+   * when the file is created, changed or deleted — the file stays the only
+   * source of truth; nothing is mirrored into VS Code state.
+   */
+  async function refreshProjectConfiguration() {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const projectConfiguration = folder ? await readProjectConfiguration(folder.uri.fsPath).catch(() => null) : null;
+    currentDashboardOptions = { ...currentDashboardOptions, projectConfiguration };
+    publishDashboard();
+    return projectConfiguration;
+  }
+  const projectConfigurationFolder = vscode.workspace.workspaceFolders?.[0];
+  if (projectConfigurationFolder && typeof vscode.workspace.createFileSystemWatcher === 'function') {
+    const projectConfigurationWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(projectConfigurationFolder, 'security-center.{yml,yaml}')
+    );
+    const onProjectConfigurationChange = () => {
+      refreshProjectConfiguration().then(() => renderScannerSetup()).catch(() => {});
+    };
+    projectConfigurationWatcher.onDidCreate(onProjectConfigurationChange);
+    projectConfigurationWatcher.onDidChange(onProjectConfigurationChange);
+    projectConfigurationWatcher.onDidDelete(onProjectConfigurationChange);
+    context.subscriptions.push(projectConfigurationWatcher);
+  }
+  refreshProjectConfiguration().catch(() => {});
 
   /** Le dossier ouvert a change : l'affichage suit l'editeur, sans cache a invalider. */
   const refreshWorkspaceIdentity = () => {
@@ -1009,6 +2032,11 @@ async function activate(context) {
     findingDetailsPanel.webview.html = renderFindingDetailsHtml(finding, nonce, { relatedTraffic, backTrafficIndex: Number.isInteger(findingDetailsContext.trafficIndex) ? findingDetailsContext.trafficIndex : null, theme: dashboardProvider.selectedTheme, findings: currentFindings, ...companionAssetOptions(findingDetailsPanel.webview) });
   }
   let scanInProgress = false;
+  // Le déroulé d'exécution ZAP du run courant, ou le dernier observé.
+  // Une exécution persistée « en cours » décrit un démon que le rechargement a
+  // tué : elle est restaurée interrompue, jamais en cours.
+  let currentZapExecution = restoreZapExecution(context.workspaceState.get(ZAP_EXECUTION_STATE_KEY, null), { assumeInterrupted: true });
+  if (currentZapExecution) currentDashboardOptions = { ...currentDashboardOptions, zapExecution: currentZapExecution };
   let httpWriteReplayAuthorized = false;
   let lastAiRollback;
   let lastProjectPolicy;
@@ -1016,6 +2044,29 @@ async function activate(context) {
   const zapCredentialScope = crypto.createHash('sha256').update(workspacePath || 'workspace').digest('hex').slice(0, 16);
   const zapUsernameSecretKey = `securityCenter.zap.username.${zapCredentialScope}`;
   const zapPasswordSecretKey = `securityCenter.zap.password.${zapCredentialScope}`;
+  /**
+   * Publie l'état du compte de test ZAP vers les surfaces.
+   *
+   * Dynamic Security ne lisait rien de SecretStorage : un compte correctement
+   * enregistré n'y changeait rien, et la carte ZAP continuait d'afficher le refus
+   * d'authentification du dernier scan, seule information dont elle disposait.
+   * Ce qui est publié ici est l'existence du compte et son identifiant — le mot
+   * de passe ne quitte pas SecretStorage.
+   */
+  async function publishZapTestAccount() {
+    const account = await readZapTestAccount({
+      secrets: context.secrets, usernameKey: zapUsernameSecretKey, passwordKey: zapPasswordSecretKey
+    }).catch(() => null);
+    // La date du dernier enregistrement est une métadonnée, pas un secret : elle
+    // vit dans l'état du workspace. C'est elle qui permet de dire qu'un refus
+    // d'authentification appartient à un scan antérieur au compte actuel.
+    const updatedAt = context.workspaceState.get(ZAP_ACCOUNT_UPDATED_AT_KEY, '') || '';
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      zapTestAccount: account ? { configured: account.configured, username: account.username, updatedAt } : null
+    };
+    publishDashboard();
+  }
   /**
    * The dynamic target state, with the evidence that established it.
    *
@@ -1029,9 +2080,14 @@ async function activate(context) {
   function refreshDynamicTargetModel(state = currentDashboardOptions.dynamicTargetState || 'unknown', evidence = null) {
     const targetUrl = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
     const sameTarget = currentDashboardOptions.dynamicTargetUrl === targetUrl;
+    // La cible autorisée a pu changer : le connecteur Burp la relit dans le
+    // fichier de découverte, qui n'est réécrit que si elle a réellement changé.
+    backendManager?.republishDiscovery?.();
     currentDashboardOptions = {
       ...currentDashboardOptions,
       dynamicTargetUrl: targetUrl,
+      dynamicTargetMode: vscode.workspace.getConfiguration('securityCenter').get('zap.targetMode', TARGET_MODE.LOCAL),
+      dynamicTargetRemoteAuthorized: vscode.workspace.getConfiguration('securityCenter').get('zap.remoteAuthorized', false) === true,
       dynamicTargetState: state,
       dynamicTargetEvidence: evidence
         ? { ...evidence, at: new Date().toISOString(), target: targetUrl }
@@ -1076,9 +2132,100 @@ async function activate(context) {
    * schedule. An event arriving without an open campaign is dropped rather than
    * attributed to whatever ran last.
    */
+  /**
+   * Le déroulé d'exécution ZAP courant.
+   *
+   * Il est publié vers la carte à chaque observation : c'est ce qui permet de
+   * distinguer un scan qui avance d'un scan qui attend le démon ou qui ne
+   * progresse plus. Il n'existe que pendant et après un run — jamais avant.
+   */
+  function publishZapExecution(execution) {
+    currentZapExecution = execution || null;
+    currentDashboardOptions = { ...currentDashboardOptions, zapExecution: currentZapExecution };
+    publishDashboard();
+  }
+
+  /** Clôt le déroulé sur les étapes qui tournaient, en nommant la panne et son code. */
+  function failZapExecutionNow(reason, code = '') {
+    if (!currentZapExecution) return;
+    try { publishZapExecution(failZapExecution(currentZapExecution, { reason, code })); } catch { /* la clôture n'empêche jamais le rapport d'échec */ }
+  }
+
+  /**
+   * Le diagnostic technique du démon ZAP, écrit dans la sortie « Security Center ».
+   *
+   * Il n'existait pas : le démon était lancé avec ses flux ignorés, donc un
+   * démarrage qui échouait ne laissait ni commande, ni PID, ni sortie, ni code de
+   * fin. Tout ce qui passe ici a déjà été débarrassé de la clé d'API et des
+   * identifiants par `zap-local`.
+   */
+  function logZapDiagnostic(info) {
+    if (!info) return;
+    if (info.launch) {
+      const { command, args, cwd, pid } = info.launch;
+      scanLog.appendLine(`ZAP — démon lancé : ${command} ${args.join(' ')}`);
+      scanLog.appendLine(`ZAP — répertoire de travail : ${cwd} · PID ${pid ?? '—'}`);
+    }
+    if (info.message) scanLog.appendLine(`ZAP — ${info.message}`);
+    if (info.stopped) {
+      scanLog.appendLine(`ZAP — démon arrêté${info.stopped.forced ? ' de force' : ''} (code ${info.stopped.exitCode ?? '—'}${info.stopped.exitSignal ? `, signal ${info.stopped.exitSignal}` : ''})`);
+    }
+  }
+
+  /** Les dernières lignes de sortie d'un démon mort, pour le journal. */
+  function logZapProcessOutput(diagnostics) {
+    if (!diagnostics) return;
+    scanLog.appendLine(`ZAP — fin du démon : code ${diagnostics.exitCode ?? '—'}${diagnostics.exitSignal ? `, signal ${diagnostics.exitSignal}` : ''}${diagnostics.spawnError ? ` · erreur de lancement : ${diagnostics.spawnError}` : ''}`);
+    for (const line of diagnostics.stderr.slice(-12)) scanLog.appendLine(`ZAP — stderr : ${line}`);
+    for (const line of diagnostics.stdout.slice(-12)) scanLog.appendLine(`ZAP — stdout : ${line}`);
+  }
+
+  /**
+   * Remet l'état ZAP en accord avec la réalité du moment.
+   *
+   * Une exécution annoncée « en cours » alors que le processus qu'elle possédait
+   * n'existe plus est un état fantôme : il attendait une API que plus rien ne
+   * servait. Vérifier est immédiat — le processus est possédé par ce run — et le
+   * constat vaut mieux que l'attente.
+   */
+  function reconcileZapRun({ reason = 'Le démon ZAP local n’existe plus : l’analyse est terminée sans résultat.' } = {}) {
+    const run = dynamicEngines.zap?.run;
+    if (!run || TERMINAL_RUN_STATUSES.includes(run.status)) return false;
+    const owned = activeZapProcess;
+    const alive = Boolean(owned) && owned.exitCode === null && owned.signalCode === null;
+    if (alive || scanInProgress) return false;
+    failEngineRun('zap', RUN_ERROR.PROCESS_EXITED, reason);
+    failZapExecutionNow(reason, 'ZAP_PROCESS_EXITED');
+    scanLog.appendLine(`ZAP — état réconcilié : ${reason}`);
+    publishDashboard();
+    return true;
+  }
+
+  /**
+   * Conserve le déroulé du dernier run.
+   *
+   * Il survit à la fermeture de la fenêtre comme le reste de l'état dynamique :
+   * rouvrir Dynamic Security doit encore pouvoir répondre « où le scan s'est-il
+   * arrêté ? ». Ce sont des métadonnées d'étapes, rien d'autre.
+   */
+  async function persistZapExecution() {
+    if (!currentZapExecution) return;
+    await context.workspaceState.update(ZAP_EXECUTION_STATE_KEY, currentZapExecution);
+  }
+
+  /** Applique une observation au déroulé, si un run est ouvert. */
+  function recordZapStage(observation) {
+    if (!currentZapExecution) return;
+    try { publishZapExecution(applyZapStage(currentZapExecution, observation)); } catch { /* une étape inconnue ne casse pas un scan */ }
+  }
+
   function publishDynamicLifecycle(event) {
     const campaign = currentDynamicCampaign();
     if (!campaign || campaign.legacy) return;
+    // La campagne ne connaît que ses propres états. Les étapes fines publiées
+    // par le moteur — attente de l'API, arrêt du démon, scan actif sauté — la
+    // feraient lever : elles vont au déroulé d'exécution, qui les modélise.
+    if (!DYNAMIC_CAMPAIGN_STATES.has(String(event?.state || ''))) return;
     setDynamicCampaign(applyDynamicProgress(campaign, event));
   }
 
@@ -1086,14 +2233,22 @@ async function activate(context) {
   async function finishZapCampaign(status, { findingIds = [], scenarios = null } = {}) {
     const campaign = currentDynamicCampaign();
     if (!campaign || campaign.legacy) return;
-    const transactions = (scenarios || currentDashboardOptions.httpScenarios || [])
-      .map((scenario, index) => dynamicTransaction(scenario, { campaignId: campaign.id, index }));
-    setDynamicCampaign(completeDynamicCampaign(campaign, { status, findingIds, transactions }));
-    // The campaign closing is the moment the coverage inputs are final: the
-    // findings are in, so endpoint-level evidence can be attributed.
-    rebuildDynamicWorkspace();
-    await persistDynamicWorkspace();
-    await saveLocalScanCache();
+    // Closing the campaign is bookkeeping, never the scanner's verdict. It runs
+    // between the status assignment and the snapshot update, and on both the
+    // success and the failure path — so a throw here used to leave ZAP recorded
+    // as « running » forever and abort the whole consolidation with it.
+    try {
+      const transactions = (scenarios || currentDashboardOptions.httpScenarios || [])
+        .map((scenario, index) => dynamicTransaction(scenario, { campaignId: campaign.id, index }));
+      setDynamicCampaign(completeDynamicCampaign(campaign, { status, findingIds, transactions }));
+      // The campaign closing is the moment the coverage inputs are final: the
+      // findings are in, so endpoint-level evidence can be attributed.
+      rebuildDynamicWorkspace();
+      await persistDynamicWorkspace();
+      await saveLocalScanCache();
+    } catch (error) {
+      scanLog.appendLine(`Campagne dynamique — clôture impossible : ${error.message}`);
+    }
   }
 
   /**
@@ -1129,8 +2284,16 @@ async function activate(context) {
     return workspace;
   }
 
-  /** Persists the workspace through the existing cache. Metadata only. */
+  /**
+   * Persists the workspace through the existing cache. Metadata only.
+   *
+   * The workspace is read from where `rebuildDynamicWorkspace()` publishes it —
+   * every caller rebuilds immediately before persisting. It used to read a bare
+   * `workspace`, which exists only inside that other function: the lookup threw
+   * `ReferenceError: workspace is not defined` on every call.
+   */
   async function persistDynamicWorkspace() {
+    const workspace = currentDashboardOptions.dynamicWorkspace;
     if (!workspace) return;
     currentDashboardOptions = { ...currentDashboardOptions, dynamicWorkspaceState: dynamicWorkspaceState(workspace) };
     await saveLocalScanCache();
@@ -1355,8 +2518,18 @@ async function activate(context) {
     // but they are never attributed to a run that cannot be proven.
     const restoredCampaign = restoreDynamicCampaign(restoredScan.dashboardOptions?.dynamicCampaign);
     const scenarioCount = (restoredScan.dashboardOptions?.httpScenarios || []).length;
+    // Les exécutions persistées reviennent d'abord dans le registre commun, où
+    // elles seront confrontées à la réalité : `restoreDynamicRuns` ne fait que
+    // relire, `reconcileRestoredRuns` décide de ce qui est encore vrai.
+    restoreDynamicRuns(restoredScan.dashboardOptions?.dynamicRuntime);
     currentDashboardOptions = {
       ...restoredScan.dashboardOptions,
+      // Le déroulé ZAP et l'état des moteurs ont déjà été restaurés — le premier
+      // en le supposant interrompu, le second confronté à la réalité. La copie du
+      // cache, écrite pendant un run, ne doit pas les remplacer par un état « en
+      // cours » que plus aucun processus ne sert.
+      zapExecution: currentZapExecution,
+      dynamicRuntime: currentDashboardOptions.dynamicRuntime,
       dynamicCampaign: restoredCampaign || (scenarioCount ? dynamicLegacyBucket(scenarioCount) : null),
       // Les resultats viennent du cache ; l'etat du service, lui, sera demande
       // au gestionnaire. Le declarer « offline » ici serait une supposition.
@@ -2070,7 +3243,7 @@ async function activate(context) {
     if (!pipelinePanel) return;
     const model = await buildPipelineModel();
     if (!pipelinePanel) return;
-    pipelinePanel.webview.html = renderPipelinePageHtml(model, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(pipelinePanel.webview));
+    applyWebviewHtml(pipelinePanel.webview, renderPipelinePageHtml(model, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(pipelinePanel.webview)), 'pipeline');
   }
 
   /** Audit trail for a policy edit. The rules travel, never the file's secrets. */
@@ -2300,9 +3473,92 @@ async function activate(context) {
     }
     snyk.installing = scannerSetupOperations.snyk;
     const statuses = await withScannerDiagnostics(rawStatuses.filter((item) => !['sonarscanner', 'snyk'].includes(item.id)));
+    // Scanner Configuration vient de mesurer l'état réel : Dynamic Security en
+    // hérite immédiatement, au lieu de conserver le sien jusqu'au redémarrage.
+    const nucleiStatus = rawStatuses.find((item) => item.id === 'nuclei');
+    if (nucleiStatus) {
+      const templates = nucleiStatus.installed ? await nucleiTemplatesManifest().catch(() => null) : null;
+      invalidateNucleiToolCache();
+      currentDashboardOptions = {
+        ...currentDashboardOptions,
+        nucleiTool: {
+          installed: Boolean(nucleiStatus.installed),
+          version: nucleiStatus.version || '',
+          executable: nucleiStatus.executable || '',
+          managed: nucleiStatus.managed === true,
+          templatesVersion: templates?.version || '',
+          templatesCount: Number(templates?.templates || 0),
+          templatesDirectory: templates?.directory || ''
+        }
+      };
+      publishDashboard();
+    }
     if (!scannerSetupPanel) return;
-    scannerSetupPanel.webview.html = renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar, snyk, companionAssetOptions(scannerSetupPanel.webview));
+    // The project's scanner selection, read from security-center.yml on every render.
+    const projectFolder = vscode.workspace.workspaceFolders?.[0];
+    const projectConfiguration = projectFolder ? await readProjectConfiguration(projectFolder.uri.fsPath).catch(() => null) : null;
+    if (!scannerSetupPanel) return;
+    applyWebviewHtml(scannerSetupPanel.webview, renderScannerSetupHtml(statuses, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), scannerSetupOperations, scannerSetupConfirmation, sonar, snyk, companionAssetOptions(scannerSetupPanel.webview), projectConfiguration), 'scanner-setup');
   }
+  // A progress tick must never queue its own full re-render: every render
+  // re-probes each managed tool (where.exe plus `--version` per scanner). Fired
+  // once per received chunk they piled up until the event loop was so far behind
+  // that the download socket was reset — the installation that stayed at 1 %
+  // before failing with a bare « aborted ». Concurrent requests now collapse
+  // into the render in flight plus a single trailing one.
+  let scannerSetupRenderInFlight = null;
+  let scannerSetupRenderQueued = false;
+  function queueScannerSetupRender() {
+    if (scannerSetupRenderInFlight) { scannerSetupRenderQueued = true; return scannerSetupRenderInFlight; }
+    scannerSetupRenderInFlight = renderScannerSetup().catch(() => {}).finally(() => {
+      scannerSetupRenderInFlight = null;
+      if (scannerSetupRenderQueued) { scannerSetupRenderQueued = false; queueScannerSetupRender(); }
+    });
+    return scannerSetupRenderInFlight;
+  }
+
+  /**
+   * The origins the user confirmed for HTTP replay.
+   *
+   * Deliberately its own setting: authorising a ZAP scan and authorising a
+   * replayed request are two different decisions about two different actions,
+   * so `zap.remoteAuthorized` is never read here.
+   */
+  function replayAuthorizedOrigins() {
+    const configured = vscode.workspace.getConfiguration('securityCenter').get('dynamic.replayAuthorizedOrigins', []);
+    return Array.isArray(configured) ? configured.map((entry) => String(entry)) : [];
+  }
+
+  /**
+   * Resolves replay permission, asking once per remote origin.
+   *
+   * A refusal returns false and the caller sends nothing. A confirmation is
+   * stored against the exact origin — another host or another port is another
+   * origin, and asks again.
+   */
+  async function authorizeReplayTarget(scenario) {
+    let decision;
+    try { decision = replayAuthorization(scenario, { authorizedOrigins: replayAuthorizedOrigins() }); }
+    catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); return false; }
+    if (decision.state === REPLAY_STATE.ALLOWED) return true;
+    const confirmation = await vscode.window.showWarningMessage(
+      `Rejouer une requête vers ${decision.origin} ?`,
+      {
+        modal: true,
+        detail: 'Le replay envoie une requête réelle vers cette origine distante. N’autorisez que des systèmes que vous êtes autorisé à tester. L’autorisation ne vaut que pour cette origine exacte (schéma, hôte et port).'
+      },
+      'Je confirme être autorisé'
+    );
+    if (confirmation !== 'Je confirme être autorisé') {
+      vscode.window.showInformationMessage(`Security Center : replay annulé — ${decision.origin} n’a pas été autorisée.`);
+      return false;
+    }
+    const origins = [...new Set([...replayAuthorizedOrigins(), decision.origin])];
+    await vscode.workspace.getConfiguration('securityCenter')
+      .update('dynamic.replayAuthorizedOrigins', origins, vscode.ConfigurationTarget.Workspace);
+    return true;
+  }
+
   async function installManagedScanners(ids) {
     // Never two runs for the same tool: a second click finds a controller
     // already in flight and is ignored, so no competing download starts over
@@ -2336,12 +3592,40 @@ async function activate(context) {
                 : event.phase);
               scannerSetupOperations[id] = { state: 'installing', title: `Installation de ${label}`, message, percent, cancellable: true };
               if (Number.isFinite(percent)) { progress.report({ increment: Math.max(0, percent - previousPercent), message: `${percent}%` }); previousPercent = percent; }
-              renderScannerSetup().catch(() => {});
+              queueScannerSetupRender();
             }, { signal: installController.signal });
           });
+          // Le binaire Nuclei ne contient aucun contrôle : sans le corpus de
+          // templates il démarre, ne teste rien et rend un scan vide. Les deux
+          // artefacts sont donc installés dans le même geste, sinon « Nuclei est
+          // prêt » annoncerait un outil incapable de détecter quoi que ce soit.
+          if (id === 'nuclei') {
+            const manifest = await ensureNucleiTemplates({
+              signal: scannerInstallControllers.get(id)?.signal,
+              onProgress: (event) => {
+                const percent = event.total > 0 ? Math.min(100, Math.round(event.received / event.total * 100)) : undefined;
+                scannerSetupOperations[id] = {
+                  state: 'installing',
+                  title: `Installation de ${label}`,
+                  message: event.message || (Number.isFinite(percent) ? `Templates ${percent}%` : 'Téléchargement des templates…'),
+                  percent,
+                  cancellable: true
+                };
+                queueScannerSetupRender();
+              }
+            });
+            scanLog.appendLine(`Nuclei — templates ${manifest.version} : ${manifest.templates} templates dans ${manifest.directory}`);
+          }
           scannerSetupOperations[id] = { state: 'ready', title: `${label} est prêt`, message: 'Installation vérifiée. Le prochain scan utilisera automatiquement cette version locale.' };
+          // La page Dynamic Security lit le même état : elle doit le voir changer
+          // au moment de l'installation, pas au prochain démarrage.
+          if (id === 'nuclei') { invalidateNucleiToolCache(); await refreshNucleiToolModel().catch(() => {}); }
           // Snyk names its execution mode `snyk.mode`, not `snyk.command`.
-          await vscode.workspace.getConfiguration('securityCenter').update(id === 'snyk' ? 'snyk.mode' : `${id}.command`, 'auto', vscode.ConfigurationTarget.Global).catch(() => {});
+          // Nuclei n'a qu'un mode d'exécution — le binaire managé — donc aucun réglage
+          // de commande à basculer : lui en écrire un créerait un paramètre mort.
+          if (id !== 'nuclei') {
+            await vscode.workspace.getConfiguration('securityCenter').update(id === 'snyk' ? 'snyk.mode' : `${id}.command`, 'auto', vscode.ConfigurationTarget.Global).catch(() => {});
+          }
         } catch (error) {
           // A user who cancels has not suffered a failure: the two states are
           // kept apart so the card offers « Réessayer » without claiming
@@ -2497,6 +3781,21 @@ async function activate(context) {
       scannerSetupPanel.webview.onDidReceiveMessage(async (message) => {
         if (await handleShellNavMessage(message)) return;
         if (message?.type === 'refresh') await renderScannerSetup();
+        // The explicit save: on first use, this is what creates security-center.yml,
+        // with exactly the scanners the user selected.
+        if (message?.type === 'saveProjectScanners' && Array.isArray(message.tools)) {
+          const projectFolder = vscode.workspace.workspaceFolders?.[0];
+          if (!projectFolder) {
+            vscode.window.showWarningMessage('Ouvrez un dossier avant de configurer le projet.');
+            return;
+          }
+          const saved = await saveProjectScanners(projectFolder.uri.fsPath, message.tools.map(String));
+          if (saved.ok) vscode.window.showInformationMessage(`Security Center : ${saved.message}`);
+          else vscode.window.showErrorMessage(`Security Center : configuration non enregistrée — ${saved.message}`);
+          await refreshProjectConfiguration();
+          await renderScannerSetup();
+          return;
+        }
         if (message?.type === 'requestInstall' && MANAGED_SCANNER_TOOLS[message.tool] && !scannerInstallationRunning) {
           scannerSetupConfirmation = { ids: [message.tool], labels: [MANAGED_SCANNER_TOOLS[message.tool].label], destination: scannerToolManager.root };
           await renderScannerSetup();
@@ -2730,7 +4029,7 @@ async function activate(context) {
             : `SonarQube activé, mais ${diagnosis.label} : ${diagnosis.hint}`);
         }
       });
-      scannerSetupPanel.onDidDispose(() => { scannerSetupPanel = undefined; scannerSetupConfirmation = undefined; });
+      scannerSetupPanel.onDidDispose(() => { scannerSetupPanel = undefined; scannerSetupConfirmation = undefined; forgetRenderedDocument('scanner-setup'); });
     } else scannerSetupPanel.reveal(vscode.ViewColumn.Active);
     await renderScannerSetup();
   }));
@@ -2738,7 +4037,7 @@ async function activate(context) {
     if (typeof tab === 'string') pipelineTab = tab;
     if (!pipelinePanel) {
       pipelinePanel = vscode.window.createWebviewPanel('securityCenter.pipeline', 'Security Center — Security Pipeline', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
-      pipelinePanel.onDidDispose(() => { pipelinePanel = undefined; });
+      pipelinePanel.onDidDispose(() => { pipelinePanel = undefined; forgetRenderedDocument('pipeline'); });
       pipelinePanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'tab') { pipelineTab = message.tab; return renderPipelinePage(); }
         if (message?.type === 'companion') {
@@ -2821,6 +4120,7 @@ async function activate(context) {
 
     if (action === 'savePolicy') {
       policySaveResult = await savePolicyGate(folder.uri.fsPath, selection || {});
+      await refreshProjectConfiguration();
       if (policySaveResult.ok) {
         await auditPolicyChange(policySaveResult, 'Politique de gate enregistrée depuis l’interface.');
         vscode.window.showInformationMessage(`Security Center : ${policySaveResult.message}`);
@@ -2832,6 +4132,7 @@ async function activate(context) {
 
     if (action === 'createStarterPolicy') {
       policySaveResult = await createStarterPolicy(folder.uri.fsPath);
+      await refreshProjectConfiguration();
       if (policySaveResult.ok) {
         await auditPolicyChange(policySaveResult, 'Politique de départ créée depuis l’interface.');
         await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(policySaveResult.filePath)));
@@ -3015,7 +4316,23 @@ async function activate(context) {
   for (const page of ['findings', 'scans', 'dynamic', 'analytics']) {
     const command = `securityCenter.open${page[0].toUpperCase()}${page.slice(1)}Page`;
     context.subscriptions.push(vscode.commands.registerCommand(command, () => {
-      if (page === 'dynamic') refreshDynamicTargetModel();
+      if (page === 'dynamic') {
+        refreshDynamicTargetModel();
+        // L'état outil est relu à chaque ouverture : une installation faite
+        // depuis Scanner Configuration doit se voir ici sans rechargement.
+        refreshNucleiToolModel().catch(() => {});
+        // La disponibilité de ZAP et du proxy managé est mesurée au même moment,
+        // pour la même raison : ce que la page affiche doit venir d'une détection
+        // faite maintenant, jamais d'un historique d'exécutions.
+        zapAvailability().then((tool) => { setEngineAvailability('zap', tool); publishDashboard(); }).catch(() => {});
+        refreshMitmModel().catch(() => {});
+        // Le compte de test peut avoir été enregistré depuis la palette ou lors
+        // d'un scan précédent : la carte ZAP doit l'annoncer sans rechargement.
+        publishZapTestAccount().catch(() => {});
+        // Et une exécution annoncée « en cours » dont le processus n'existe plus
+        // est corrigée ici, plutôt que laissée à attendre indéfiniment.
+        reconcileZapRun();
+      }
       dashboardProvider.openPage(page);
     }));
   }
@@ -3159,7 +4476,8 @@ async function activate(context) {
     // validated fix — including on the automatic path that follows an AI patch.
     const writeAuthorized = await authorizeVerificationWriteReplay(method);
     if (!writeAuthorized) throw new Error('Vérification annulée : replay en écriture non autorisé.');
-    const replay = await replayScenario(scenario, { allowWrite: CONTROLLED_WRITE_METHODS.has(method), timeoutMs: 30000 });
+    if (!await authorizeReplayTarget(scenario)) throw new Error('Vérification annulée : origine distante non autorisée pour le replay.');
+    const replay = await replayScenario(scenario, { allowWrite: CONTROLLED_WRITE_METHODS.has(method), timeoutMs: 30000, authorizedOrigins: replayAuthorizedOrigins() });
     return {
       findingId: finding.id,
       verdict: retestVerdict({
@@ -3319,23 +4637,39 @@ async function activate(context) {
     return deliveryStatus;
   }
 
+  // Vue courante de Security Delivery. Purement présentationnel : aucun
+  // adaptateur, aucun contrat backend et aucun identifiant de commande n'en
+  // dépend — seule la page choisit entre le hub et l'espace d'un fournisseur.
+  let deliveryView = 'hub';
+  let deliveryConfiguring = false;
+
   function renderDeliveryPage() {
     if (!deliveryPanel) return;
     const selectedProvider = deliveryFormProvider();
-    deliveryPanel.webview.html = renderDeliveryProviderPageHtml({
+    // La configuration publique de chaque fournisseur alimente le hub. Les
+    // secrets ne sont jamais lus ici : seule leur présence compte, et elle est
+    // décrite par deliverySecretsConfigured.
+    const configurations = Object.fromEntries(DELIVERY_PROVIDERS
+      .filter((provider) => provider.implemented)
+      .map((provider) => [provider.id, deliveryConfiguration.getProviderConfig(provider.id) || {}]));
+    applyWebviewHtml(deliveryPanel.webview, renderDeliveryProviderPageHtml({
       model: deliveryStatus,
       providers: DELIVERY_PROVIDERS,
       selectedProvider,
       selectedProviderDefinition: deliveryProvider(selectedProvider),
       configuration: deliveryConfiguration.getProviderConfig(selectedProvider),
-      secretsConfigured: deliverySecretsConfigured
-    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview));
+      secretsConfigured: deliverySecretsConfigured,
+      view: deliveryView,
+      configuring: deliveryConfiguring,
+      activeProvider: deliveryConfiguration.getActiveProviderId() || '',
+      configurations
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(deliveryPanel.webview)), 'delivery');
   }
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openSecurityDelivery', async () => {
     if (!deliveryPanel) {
       deliveryPanel = vscode.window.createWebviewPanel('securityCenter.delivery', 'Security Center — Security Delivery', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
-      deliveryPanel.onDidDispose(() => { deliveryPanel = undefined; });
+      deliveryPanel.onDidDispose(() => { deliveryPanel = undefined; forgetRenderedDocument('delivery'); });
       deliveryPanel.webview.onDidReceiveMessage(async (message) => {
         // handleShellNavMessage keeps the shared shell navigation live for securityCenter.delivery.
         if (message?.type === 'command') {
@@ -3432,7 +4766,45 @@ async function activate(context) {
           catch (error) { vscode.window.showErrorMessage(`Security Center : ${error.message}`); }
           return;
         }
-        if (message.action === 'deliveryConfigure') { renderDeliveryPage(); return; }
+        if (message.action === 'deliveryConfigure') { deliveryConfiguring = true; renderDeliveryPage(); return; }
+        // Navigation maître/détail, dans le même panneau : aucune seconde
+        // fenêtre, aucun nouvel identifiant de commande.
+        if (message.action === 'deliveryOpenWorkspace' || message.action === 'deliveryConfigureSelected') {
+          const requested = String(message.provider || '').toLowerCase();
+          const provider = deliveryProvider(requested);
+          // Un fournisseur du catalogue sans adaptateur n'ouvre rien : il n'a ni
+          // schéma ni appel, et lui donner un espace serait le faire passer pour
+          // fonctionnel.
+          if (!provider?.implemented) return;
+          deliveryView = 'provider';
+          deliveryConfiguring = message.action === 'deliveryConfigureSelected';
+          if (requested !== deliveryFormProvider()) {
+            // Même chemin de sélection que le sélecteur existant : rien n'est
+            // dupliqué, et l'état des secrets reste celui du fournisseur affiché.
+            deliverySelectedProvider = requested;
+            await refreshDeliverySecretState();
+            if (deliveryConfiguration.getActiveProviderId() === requested) {
+              await refreshDeliveryStatus();
+            } else {
+              deliveryStatus = await buildDeliveryModelFor(requested, {});
+              renderDeliveryPage();
+            }
+            return;
+          }
+          renderDeliveryPage();
+          // Un fournisseur déjà actif est relu à l'ouverture : la page montre
+          // son état réel, pas celui de la dernière synchronisation.
+          if (!deliveryConfiguring && deliveryConfiguration.getActiveProviderId() === requested) {
+            await refreshDeliveryStatus().catch(() => {});
+          }
+          return;
+        }
+        if (message.action === 'deliveryBackToHub') {
+          deliveryView = 'hub';
+          deliveryConfiguring = false;
+          renderDeliveryPage();
+          return;
+        }
         if (message.action === 'deliveryOpenSettings') return void await openIntegrationsPage({ openConfig: 'delivery' });
         if (message.action === 'deliveryDisconnect') return void await confirmDisconnectDeliveryProvider();
         if (message.action === 'openJenkinsfile') return void await vscode.commands.executeCommand('securityCenter.openJenkinsfileTemplate');
@@ -3639,7 +5011,7 @@ async function activate(context) {
     if (!integrationsPanel) return;
     const cfg = vscode.workspace.getConfiguration('securityCenter');
     const selectedDeliveryProvider = deliveryFormProvider();
-    integrationsPanel.webview.html = renderIntegrationPageHtml({
+    applyWebviewHtml(integrationsPanel.webview, renderIntegrationPageHtml({
       view: integrationsView,
       openConfig: integrationsOpenConfig,
       ...companionAssetOptions(integrationsPanel.webview),
@@ -3663,7 +5035,7 @@ async function activate(context) {
         provider: runtimeFormProvider()
       },
       team: teamIntegrationStatus()
-    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme());
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme()), 'integrations');
     integrationsOpenConfig = '';
   }
 
@@ -3682,7 +5054,7 @@ async function activate(context) {
   function renderRuntimeSecurityPage() {
     if (!runtimeSecurityPanel) return;
     const cfg = vscode.workspace.getConfiguration('securityCenter');
-    runtimeSecurityPanel.webview.html = renderRuntimeSecurityPageHtml({
+    applyWebviewHtml(runtimeSecurityPanel.webview, renderRuntimeSecurityPageHtml({
       runtime: {
         ...runtimeSecurityStatus,
         // Non-secret values for the form, read through the provider-neutral
@@ -3701,12 +5073,12 @@ async function activate(context) {
       vulnerabilities: runtimeVulnerabilities,
       vulnerabilitiesQuery: runtimeVulnerabilitiesQuery,
       capabilityEvidence: runtimeCapabilityEvidence
-    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(runtimeSecurityPanel.webview));
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(runtimeSecurityPanel.webview)), 'runtime-security');
   }
 
   function renderInfrastructurePage() {
     if (!infrastructurePanel) return;
-    infrastructurePanel.webview.html = renderInfrastructurePageHtml({
+    applyWebviewHtml(infrastructurePanel.webview, renderInfrastructurePageHtml({
       prometheus: {
         ...prometheusStatus,
         // Non-secret values for the form; secrets are described as booleans
@@ -3717,7 +5089,7 @@ async function activate(context) {
       },
       openConfig: infrastructureOpenConfig,
       actionState: infrastructureActionState
-    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(infrastructurePanel.webview));
+    }, crypto.randomBytes(16).toString('base64'), themeController.getTheme(), companionAssetOptions(infrastructurePanel.webview)), 'infrastructure');
   }
 
   function integrationActionState(status, successLabel) {
@@ -4026,7 +5398,7 @@ async function activate(context) {
     await refreshDeliverySecretState();
     if (!integrationsPanel) {
       integrationsPanel = vscode.window.createWebviewPanel('securityCenter.integrations', 'Security Center — Integrations', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
-      integrationsPanel.onDidDispose(() => { integrationsPanel = undefined; });
+      integrationsPanel.onDidDispose(() => { integrationsPanel = undefined; forgetRenderedDocument('integrations'); });
       integrationsPanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'command') {
           if (await handleShellNavMessage(message)) return;
@@ -4134,7 +5506,7 @@ async function activate(context) {
     runtimeOpenConfig = Boolean(configure);
     if (!runtimeSecurityPanel) {
       runtimeSecurityPanel = vscode.window.createWebviewPanel('securityCenter.runtimeSecurity', 'Security Center — Runtime Security', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
-      runtimeSecurityPanel.onDidDispose(() => { runtimeSecurityPanel = undefined; });
+      runtimeSecurityPanel.onDidDispose(() => { runtimeSecurityPanel = undefined; forgetRenderedDocument('runtime-security'); });
       runtimeSecurityPanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'command') {
           if (await handleShellNavMessage(message)) return;
@@ -4251,7 +5623,7 @@ async function activate(context) {
     infrastructureOpenConfig = Boolean(configure);
     if (!infrastructurePanel) {
       infrastructurePanel = vscode.window.createWebviewPanel('securityCenter.infrastructure', 'Security Center — Infrastructure', vscode.ViewColumn.Active, companionWebviewOptions({ enableScripts: true, retainContextWhenHidden: true }));
-      infrastructurePanel.onDidDispose(() => { infrastructurePanel = undefined; });
+      infrastructurePanel.onDidDispose(() => { infrastructurePanel = undefined; forgetRenderedDocument('infrastructure'); });
       infrastructurePanel.webview.onDidReceiveMessage(async (message) => {
         if (message?.type === 'command') {
           if (await handleShellNavMessage(message)) return;
@@ -4332,21 +5704,103 @@ async function activate(context) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.checkDynamicTarget', async () => {
-    const targetUrl = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', '');
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    const targetUrl = cfg.get('zap.targetUrl', '');
+    const mode = cfg.get('zap.targetMode', TARGET_MODE.LOCAL);
     refreshDynamicTargetModel('unknown');
-    const result = await checkTargetReachability(targetUrl);
-    refreshDynamicTargetModel(result.state, { source: 'probe' });
+    // A probe, never a scan: one HEAD request that says whether the target can
+    // be reached at all, and why not when it cannot.
+    const result = await checkTargetReachability(targetUrl, 5000, { mode });
+    refreshDynamicTargetModel(result.state, { source: 'probe', statusCode: result.statusCode || null, reason: result.error || '' });
+    const label = TARGET_STATE_LABELS[result.state] || result.state;
+    const detail = result.statusCode ? ` (HTTP ${result.statusCode})` : result.error ? ` — ${result.error}` : '';
+    const notify = result.state === TARGET_STATE.ONLINE ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
+    notify(`Security Center : cible ${targetUrl || 'non configurée'} — ${label}${detail}`);
   }));
 
-  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.changeDynamicTarget', async () => {
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.changeDynamicTarget', async (request = null) => {
     const cfg = vscode.workspace.getConfiguration('securityCenter');
     const current = cfg.get('zap.targetUrl', '');
+    const currentMode = cfg.get('zap.targetMode', TARGET_MODE.LOCAL);
+    if (request && typeof request === 'object') {
+      const mode = request.mode === TARGET_MODE.REMOTE ? TARGET_MODE.REMOTE : TARGET_MODE.LOCAL;
+      if (request.modeOnly === true) {
+        await cfg.update('zap.targetMode', mode, vscode.ConfigurationTarget.Workspace);
+        await cfg.update('zap.remoteAuthorized', false, vscode.ConfigurationTarget.Workspace);
+        refreshDynamicTargetModel('unknown');
+        return;
+      }
+      let normalized;
+      try {
+        normalized = normalizeTargetUrl(String(request.targetUrl || ''), { mode });
+      } catch (error) {
+        vscode.window.showWarningMessage(`Security Center : ${error.message}`);
+        return;
+      }
+      let remoteAuthorized = false;
+      if (mode === TARGET_MODE.REMOTE) {
+        const confirmation = await vscode.window.showWarningMessage(
+          `Analyser ${normalized} ?\n\nJe confirme disposer de l’autorisation nécessaire pour tester cette cible.`,
+          { modal: true, detail: 'Une analyse dynamique envoie du trafic réel vers cette adresse. N’analysez que des systèmes que vous êtes autorisé à tester.' },
+          'Je confirme être autorisé'
+        );
+        if (confirmation !== 'Je confirme être autorisé') {
+          vscode.window.showInformationMessage('Security Center : cible distante non enregistrée — autorisation non confirmée.');
+          return;
+        }
+        remoteAuthorized = true;
+      }
+      await cfg.update('zap.targetUrl', normalized, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('zap.targetMode', mode, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('zap.remoteAuthorized', remoteAuthorized, vscode.ConfigurationTarget.Workspace);
+      refreshDynamicTargetModel('unknown');
+      return;
+    }
+    // The mode is asked first: it decides what counts as a valid address, so it
+    // cannot be inferred from the address afterwards.
+    const chosen = await vscode.window.showQuickPick([
+      { label: 'Application locale', description: 'localhost ou 127.0.0.1', value: TARGET_MODE.LOCAL },
+      { label: 'Environnement distant autorisé', description: 'VM de laboratoire, serveur de test, préproduction', value: TARGET_MODE.REMOTE }
+    ], { title: 'Cible Dynamic Security', placeHolder: `Mode actuel : ${currentMode === TARGET_MODE.REMOTE ? 'distant' : 'local'}` });
+    if (!chosen) return;
+    const mode = chosen.value;
     const value = await vscode.window.showInputBox({
-      title: 'Dynamic Security target', prompt: 'Local HTTP/HTTPS target used by ZAP', value: current, ignoreFocusOut: true,
-      validateInput: (input) => { try { return normalizeTargetUrl(input) ? undefined : 'Enter a local target URL.'; } catch (error) { return error.message; } }
+      title: mode === TARGET_MODE.REMOTE ? 'Cible distante (HTTP/HTTPS)' : 'Cible locale (HTTP/HTTPS)',
+      prompt: mode === TARGET_MODE.REMOTE
+        ? 'Adresse de l’environnement distant analysé par ZAP, par exemple http://192.168.1.10:3000'
+        : 'Adresse locale analysée par ZAP',
+      value: current,
+      ignoreFocusOut: true,
+      validateInput: (input) => {
+        try { return normalizeTargetUrl(input, { mode }) ? undefined : 'Renseignez une URL de cible.'; }
+        catch (error) { return error.message; }
+      }
     });
     if (value === undefined) return;
-    await cfg.update('zap.targetUrl', normalizeTargetUrl(value), vscode.ConfigurationTarget.Workspace);
+    const normalized = normalizeTargetUrl(value, { mode });
+
+    // A remote target is never saved as usable without an explicit answer. The
+    // confirmation is a guard rail, not proof of anything — and it is asked for
+    // this address, not once and for all.
+    let remoteAuthorized = false;
+    if (mode === TARGET_MODE.REMOTE) {
+      const confirmation = await vscode.window.showWarningMessage(
+        `Analyser ${normalized} ?\n\nJe confirme disposer de l’autorisation nécessaire pour tester cette cible.`,
+        { modal: true, detail: 'Une analyse dynamique envoie du trafic réel vers cette adresse. N’analysez que des systèmes que vous êtes autorisé à tester.' },
+        'Je confirme être autorisé'
+      );
+      if (confirmation !== 'Je confirme être autorisé') {
+        vscode.window.showInformationMessage('Security Center : cible distante non enregistrée — autorisation non confirmée.');
+        return;
+      }
+      remoteAuthorized = true;
+    }
+
+    await cfg.update('zap.targetUrl', normalized, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('zap.targetMode', mode, vscode.ConfigurationTarget.Workspace);
+    // Switching back to local clears the authorisation: it belongs to the
+    // remote address that was confirmed, never to the next one.
+    await cfg.update('zap.remoteAuthorized', remoteAuthorized, vscode.ConfigurationTarget.Workspace);
     refreshDynamicTargetModel('unknown');
   }));
 
@@ -4585,7 +6039,10 @@ async function activate(context) {
       // Les données ont répondu : l'état de démarrage n'a plus à être affiché.
       backendError = '';
     } catch (error) {
-      backendError = error.message;
+      // Même lecture que l'état du backend : une clé refusée se lit « clé
+      // refusée » avec son adresse, pas comme le corps brut d'une réponse 401.
+      const failure = describeBackend({ state: classifyBackendError(error), url: baseUrl, message: error.message });
+      backendError = `${failure.label} — ${baseUrl} : ${failure.message}${failure.hint ? ` (${failure.hint})` : ''}`;
     }
     const renderTrends = () => { panel.webview.html = renderTrendReportHtml(reports, nonce, themeController.getTheme(), backendError, companionAssetOptions(panel.webview)); };
     renderTrends();
@@ -4632,57 +6089,20 @@ async function activate(context) {
     const existing = ['security-center.yml', 'security-center.yaml']
       .map((name) => path.join(folder.uri.fsPath, name))
       .find((filePath) => fs.existsSync(filePath));
-    const filePath = existing || path.join(folder.uri.fsPath, 'security-center.yml');
+    // Opening the policy never creates it. A project without security-center.yml
+    // is not configured yet: the user configures it from the UI (scanners, Policy
+    // Gate, supply chain), and the file is created by that explicit save — never
+    // by visiting a page, and never with choices the user did not make.
     if (!existing) {
-      const template = [
-        'version: 1',
-        'scanners:',
-        '  semgrep: true',
-        '  gitleaks: true',
-        '  trivy: true',
-        '  osv: true',
-        '  zap: true',
-        'policy:',
-        '  fail_on: HIGH',
-        '  max_active: 0',
-        '  include_tests: false',
-        'licenses:',
-        '  denied: [AGPL-3.0, GPL-3.0]',
-        'gitleaks:',
-        '  history: false',
-        '  history_incremental: true',
-        '  config: ""',
-        'semgrep:',
-        '  custom_rules: ""',
-        'zap:',
-        '  mode: auto',
-        '  local_path: ""',
-        '  policy_min_severity: HIGH',
-        '  active: false',
-        '  openapi: ""',
-        '  context: ""',
-        '  user: ""',
-        '  auth_login: ""',
-        '  auth_username_env: SECURITY_CENTER_ZAP_USERNAME',
-        '  auth_password_env: SECURITY_CENTER_ZAP_PASSWORD',
-        '  auth_token_path: authentication.token',
-        '  auth_username_field: email',
-        '  auth_password_field: password',
-        '  auth_header: Authorization',
-        '  auth_prefix: Bearer',
-        'exclusions:',
-        '  global_files: [node_modules/**, dist/**]',
-        '  semgrep_files: []',
-        '  semgrep_rules: []',
-        '  trivy_files: []',
-        '  zap_routes: [/logout]',
-        'execution:',
-        '  max_parallel_scanners: 2',
-        ''
-      ].join('\n');
-      await fs.promises.writeFile(filePath, template, { encoding: 'utf8', flag: 'wx' });
+      const choice = await vscode.window.showInformationMessage(
+        'Security Center n’est pas encore configuré pour ce projet. Choisissez les scanners et le Policy Gate : security-center.yml sera créé à votre enregistrement.',
+        'Configurer le projet'
+      );
+      if (choice === 'Configurer le projet') await vscode.commands.executeCommand('securityCenter.openScannerSetup');
+      return;
     }
-    const document = await vscode.workspace.openTextDocument(filePath);
+    // Advanced view: the raw file, for users who want to edit the YAML directly.
+    const document = await vscode.workspace.openTextDocument(existing);
     await vscode.window.showTextDocument(document, { preview: false });
   }));
 
@@ -5098,25 +6518,91 @@ async function activate(context) {
     await vscode.window.showInformationMessage(`${state}\n\n1. Installez Java 17 ou supérieur.\n2. Installez OWASP ZAP Desktop.\n3. Relancez cet assistant : ZAP sera détecté et démarré automatiquement au prochain scan.\n\nZAP reste optionnel : Semgrep, Gitleaks, Trivy et OSV continuent sans lui.`, { modal: true });
   }));
 
+  /**
+   * La configuration du compte de test ZAP, telle que Dynamic Security l'appelle.
+   *
+   * Le parcours lui-même est `configureZapTestAccount` : cette commande lui confie
+   * les clés SecretStorage du workspace, republie l'état vers les surfaces, puis
+   * nomme l'issue. Une sortie sans aucun message était la raison principale pour
+   * laquelle « rien d'utile » ne semblait se produire.
+   */
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.configureZapCredentials', async () => {
-    const action = await vscode.window.showQuickPick([
-      { label: '$(key) Enregistrer ou remplacer le compte ZAP', value: 'set' },
-      { label: '$(trash) Supprimer le compte ZAP enregistré', value: 'clear' }
-    ], { title: 'Compte de test ZAP authentifié' });
-    if (!action) return;
-    if (action.value === 'clear') {
-      await context.secrets.delete(zapUsernameSecretKey);
-      await context.secrets.delete(zapPasswordSecretKey);
-      return vscode.window.showInformationMessage('Security Center : compte ZAP supprimé du stockage sécurisé pour ce workspace.');
+    const result = await configureZapTestAccount({
+      window: vscode.window,
+      secrets: context.secrets,
+      usernameKey: zapUsernameSecretKey,
+      passwordKey: zapPasswordSecretKey,
+      log: (message) => scanLog.appendLine(`ZAP — ${message}`),
+      // Le formulaire de la page d'abord ; les boîtes natives seulement si
+      // aucune surface Security Center n'est ouverte pour l'héberger.
+      requestForm: (state) => dashboardProvider.requestZapAccount(state)
+    });
+    if (result.status === 'saved' || result.status === 'cleared') {
+      await context.workspaceState.update(ZAP_ACCOUNT_UPDATED_AT_KEY, new Date().toISOString());
     }
-    const previousUsername = await context.secrets.get(zapUsernameSecretKey) || '';
-    const username = await vscode.window.showInputBox({ title: 'Compte de test ZAP', prompt: 'Adresse e-mail ou identifiant du compte local', value: previousUsername, ignoreFocusOut: true });
-    if (!username?.trim()) return;
-    const password = await vscode.window.showInputBox({ title: 'Mot de passe du compte de test ZAP', prompt: 'Stocké de manière sécurisée par VS Code, jamais dans le projet.', password: true, ignoreFocusOut: true });
-    if (!password) return;
-    await context.secrets.store(zapUsernameSecretKey, username.trim());
-    await context.secrets.store(zapPasswordSecretKey, password);
-    vscode.window.showInformationMessage('Security Center : compte ZAP enregistré dans le stockage sécurisé pour ce workspace.');
+    await publishZapTestAccount();
+    if (result.status === 'saved') {
+      return vscode.window.showInformationMessage(result.passwordKept
+        ? `Security Center : compte de test ZAP « ${result.account.username} » enregistré — mot de passe déjà stocké conservé dans SecretStorage.`
+        : `Security Center : compte de test ZAP « ${result.account.username} » enregistré — mot de passe stocké dans SecretStorage.`);
+    }
+    if (result.status === 'cleared') {
+      return vscode.window.showInformationMessage('Security Center : compte de test ZAP supprimé de SecretStorage pour ce workspace.');
+    }
+    if (result.status === 'password-required') {
+      return vscode.window.showWarningMessage('Security Center : aucun mot de passe saisi et aucun mot de passe enregistré — le compte de test ZAP n’a pas été enregistré.');
+    }
+    if (result.status === 'username-required') {
+      return vscode.window.showWarningMessage('Security Center : aucune adresse e-mail ni identifiant saisi — le compte de test ZAP n’a pas été enregistré.');
+    }
+    if (result.status === 'nothing-to-remove') {
+      return vscode.window.showInformationMessage('Security Center : aucun compte de test ZAP enregistré pour ce workspace.');
+    }
+    vscode.window.showInformationMessage('Security Center : configuration du compte de test ZAP annulée — identifiants inchangés.');
+  }));
+
+  /**
+   * L'arrêt manuel d'une analyse ZAP en cours.
+   *
+   * Il n'existait pas : une fois l'analyse lancée, seule la notification de
+   * progression pouvait l'annuler, et elle disparaît de l'écran. Un démon qui
+   * n'ouvre jamais son API laissait donc la carte « en cours » sans aucun geste
+   * possible.
+   *
+   * Ce n'est pas un second mécanisme d'annulation : c'est le contrôleur du scan
+   * courant qu'on abandonne, exactement comme le ferait le bouton Annuler de la
+   * notification. Le pipeline voit son signal, clôt le scanner en `cancelled`,
+   * ferme la campagne et le déroulé, et le `finally` du moteur arrête le démon.
+   *
+   * Seuls le processus et le conteneur possédés par ce run sont arrêtés — jamais
+   * un autre Java, jamais un conteneur qui n'est pas le nôtre.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.stopZapScan', async () => {
+    const run = dynamicEngines.zap?.run;
+    const running = run && !TERMINAL_RUN_STATUSES.includes(run.status);
+    if (!running && !scanInProgress) {
+      // Rien ne tourne. Si l'affichage disait le contraire, il est remis d'accord
+      // avec la réalité plutôt que laissé tel quel.
+      if (reconcileZapRun()) return vscode.window.showInformationMessage('Security Center : aucune analyse ZAP en cours — l’état a été corrigé.');
+      return vscode.window.showInformationMessage('Security Center : aucune analyse ZAP en cours.');
+    }
+    // Le processus possédé est déjà mort : inutile d'attendre une annulation.
+    const owned = activeZapProcess;
+    const ownedAlive = Boolean(owned) && owned.exitCode === null && owned.signalCode === null;
+    if (!ownedAlive && !scanInProgress) {
+      reconcileZapRun();
+      return vscode.window.showWarningMessage('Security Center : le démon ZAP n’existait plus — l’analyse a été clôturée.');
+    }
+    updateEngineRun('zap', { status: RUN_STATUS.STOPPING, phase: 'Arrêt demandé par l’utilisateur' });
+    publishDashboard();
+    scanLog.appendLine('ZAP — arrêt demandé depuis Dynamic Security.');
+    // Le signal d'abandon : les attentes d'API, de spider, de file passive et de
+    // scan actif l'observent toutes et s'arrêtent là où elles sont.
+    try { activeScanAbort?.abort(); } catch { /* un contrôleur déjà abandonné n'est pas une panne */ }
+    // Puis le processus de CE run, et lui seul.
+    if (ownedAlive) { try { owned.kill(); } catch { /* déjà terminé */ } }
+    if (activeZapContainer) await removeZapContainer(activeZapContainer).catch(() => {});
+    vscode.window.showInformationMessage('Security Center : arrêt de l’analyse ZAP demandé.');
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.scanSelected', async () => {
@@ -5146,14 +6632,103 @@ async function activate(context) {
     await vscode.commands.executeCommand('securityCenter.scanWorkspace', [tool]);
   }));
 
+  /**
+   * Le scan ZAP, lancé depuis sa carte Dynamic Security.
+   *
+   * Le bouton exigeait ZAP local **et** Java, et refusait donc le scan sur un
+   * poste où seul le moteur Docker est utilisable — alors que le pipeline sait
+   * s'en servir. Sa condition est maintenant la disponibilité réellement
+   * mesurée : un moteur utilisable suffit, quel qu'il soit. Le scan lui-même
+   * reste celui du pipeline existant, avec son préflight, son autorisation de
+   * cible, sa normalisation et sa persistance.
+   */
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.scanZap', async () => {
-    if (!(await javaAvailable()) || !detectLocalZap()) {
-      const selected = await vscode.window.showWarningMessage('ZAP local ou Java n’est pas détecté. Le scan dynamique reste optionnel.', 'Installer/configurer ZAP', 'Continuer sans ZAP');
-      if (selected === 'Installer/configurer ZAP') await vscode.commands.executeCommand('securityCenter.configureZap');
+    const zapCfg = vscode.workspace.getConfiguration('securityCenter');
+    if (!zapCfg.get('zap.enabled', true)) {
+      const choice = await vscode.window.showWarningMessage('Security Center : ZAP est désactivé (securityCenter.zap.enabled).', 'Configurer ZAP');
+      if (choice) await vscode.commands.executeCommand('securityCenter.configureZap');
+      return;
+    }
+    // La disponibilité est remesurée ici puis republiée : ce que le bouton
+    // décide et ce que la carte affiche viennent de la même observation.
+    const tool = await zapAvailability().catch(() => null);
+    if (tool) setEngineAvailability('zap', tool);
+    if (tool && !tool.usable) {
+      const choice = await vscode.window.showWarningMessage(`Security Center — ZAP indisponible. ${tool.reason}`, 'Configurer ZAP');
+      if (choice) await vscode.commands.executeCommand('securityCenter.configureZap');
       return;
     }
     await vscode.commands.executeCommand('securityCenter.scanWorkspace', ['ZAP']);
   }));
+
+  /**
+   * Le scan Nuclei, lancé depuis sa carte Dynamic Security.
+   *
+   * Le bouton passait par le sélecteur générique de scanners, où Nuclei ne
+   * figure pas : cliquer ne lançait jamais Nuclei. Cette commande vérifie ce qui
+   * peut l'être d'avance — scanner activé, outil réellement détecté —, puis
+   * confie le scan au pipeline existant, qui conserve l'autorisation de la
+   * cible, les templates vérifiés, la normalisation et la persistance. Aucun
+   * second moteur de scan.
+   */
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.scanNuclei', async () => {
+    const cfg = vscode.workspace.getConfiguration('securityCenter');
+    if (!cfg.get('nuclei.enabled', true)) {
+      const choice = await vscode.window.showWarningMessage('Security Center : Nuclei est désactivé (securityCenter.nuclei.enabled).', 'Ouvrir Scanner Configuration');
+      if (choice) await vscode.commands.executeCommand('securityCenter.openScannerSetup');
+      return;
+    }
+    // La disponibilité vient de la détection réelle de l'outil, jamais de l'historique de scans.
+    const tool = await nucleiToolModel().catch(() => null);
+    if (!tool?.installed) {
+      const choice = await vscode.window.showWarningMessage('Security Center : Nuclei n’est pas installé. Installez-le depuis Scanner Configuration.', 'Ouvrir Scanner Configuration');
+      if (choice) await vscode.commands.executeCommand('securityCenter.openScannerSetup');
+      return;
+    }
+    await vscode.commands.executeCommand('securityCenter.scanWorkspace', ['Nuclei']);
+  }));
+
+  // La carte ZAP compte tous ses findings ZAP persistés ; son bouton ouvre donc
+  // la vue qui les contient tous, filtrée sur ZAP et sur aucune sévérité. Il
+  // menait jusqu'ici à la section des seules priorités, où un ZAP sans HIGH ni
+  // CRITICAL semblait n'avoir rien trouvé.
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openZapFindings', () => {
+    // `zap` est l'identifiant stable du filtre Scanner de la page Findings,
+    // celui que `scannerIdForTool('ZAP')` produit.
+    dashboardProvider.openFindingsForTool('zap');
+  }));
+
+  // La carte Nuclei compte tous ses findings ; son bouton doit donc ouvrir la
+  // vue qui les contient tous, et non la section des seules priorités.
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openNucleiFindings', () => {
+    // `nuclei` est l'identifiant stable que le filtre Scanner de la page Findings
+    // utilise pour ses options, celui que `scannerId('Nuclei')` produit.
+    dashboardProvider.openFindingsForTool('nuclei');
+  }));
+
+  // Un scan ZAP ne survit pas davantage à la fenêtre. Le démon local est un
+  // processus, le scan Docker un conteneur : les deux continueraient d'envoyer
+  // du trafic vers la cible sans plus rien pour les arrêter.
+  context.subscriptions.push({
+    dispose: () => {
+      const child = activeZapProcess;
+      if (child && child.exitCode === null && child.signalCode === null) {
+        try { child.kill(); } catch { /* déjà terminé */ }
+      }
+      if (activeZapContainer) removeZapContainer(activeZapContainer).catch(() => {});
+    }
+  });
+
+  // Un scan Nuclei ne survit jamais à la fenêtre : un processus orphelin
+  // continuerait d'envoyer du trafic vers la cible sans interface pour l'arrêter.
+  context.subscriptions.push({
+    dispose: () => {
+      const child = activeNucleiProcess;
+      if (child && child.exitCode === null && child.signalCode === null) {
+        try { child.kill(); } catch { /* déjà terminé */ }
+      }
+    }
+  });
 
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.scanIncremental', async () => {
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -5208,6 +6783,408 @@ async function activate(context) {
     }
   }));
 
+  // ----------------------------------------------- proxy de capture managé
+  //
+  // Trois gestes seulement, et aucune commande de terminal : installer, démarrer,
+  // arrêter. Burp n'est pas touché — il reste le connecteur de ceux qui ont déjà
+  // Burp, et les deux sources alimentent le même modèle d'investigation.
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.installMitmproxy', async () => {
+    const detected = await detectMitmTool({ force: true });
+    if (detected?.installed) {
+      await refreshMitmModel();
+      return vscode.window.showInformationMessage(`Security Center : mitmproxy ${detected.version} est déjà installé.`);
+    }
+    mitmError = '';
+    try {
+      const result = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Security Center : installation de mitmproxy', cancellable: true },
+        async (progress, token) => {
+          const controller = new AbortController();
+          token.onCancellationRequested(() => controller.abort());
+          return mitmproxy.install(context.globalStorageUri.fsPath, {
+            signal: controller.signal,
+            onProgress: (event) => progress.report({ message: event.message })
+          });
+        }
+      );
+      scanLog.appendLine(`mitmproxy — installé en version ${result.version} (${result.executable})`);
+      // L'installation vient de vérifier la version : elle devient la détection
+      // connue, sans relancer `mitmdump --version` une fois de plus.
+      rememberMitmDetection(result);
+      await refreshMitmModel();
+      vscode.window.showInformationMessage(`Security Center : mitmproxy ${result.version} installé.`);
+    } catch (error) {
+      // Une installation interrompue a pu laisser un environnement partiel : la
+      // prochaine lecture doit le constater, pas relire l'état d'avant.
+      invalidateMitmDetection();
+      if (error?.cancelled) {
+        await refreshMitmModel();
+        return vscode.window.showInformationMessage('Security Center : installation de mitmproxy annulée.');
+      }
+      mitmError = error.message;
+      await refreshMitmModel();
+      vscode.window.showErrorMessage(`Security Center : installation de mitmproxy impossible — ${error.message}`);
+    }
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.startMitmproxyCapture', async () => {
+    if (mitmSession?.process && mitmSession.process.exitCode === null && mitmSession.process.signalCode === null) {
+      return vscode.window.showInformationMessage(`Security Center : capture déjà active sur ${mitmSession.proxyUrl}.`);
+    }
+    // Un démarrage est un geste de l'utilisateur : la détection est refaite, une
+    // fois, et transmise au démarrage du proxy pour qu'il ne la refasse pas.
+    const detected = await detectMitmTool({ force: true });
+    if (!detected?.installed) {
+      return vscode.window.showWarningMessage('Security Center : mitmproxy n’est pas installé. Installez-le depuis la page Dynamic Security.');
+    }
+    // Un navigateur resté ouvert d'une capture précédente vise un proxy mort :
+    // il est fermé avant qu'une nouvelle capture ne commence.
+    await closeTrackedCaptureBrowser();
+    mitmError = '';
+    mitmLostExchanges = 0;
+    mitmLostReason = '';
+    clearMitmLossFlush();
+    mitmStopRequested = false;
+    mitmState = mitmproxy.MITM_STATE.STARTING;
+    // L'exécution existe avant tout ce qui peut échouer : un démarrage refusé
+    // doit produire un état visible sur la carte, pas seulement une notification.
+    beginEngineRun('mitmproxy', { kind: RUN_KIND.CAPTURE, target: currentDynamicTargetUrl(), phase: 'Démarrage du proxy' });
+    await refreshMitmModel({ detect: false });
+    try {
+      // Le backend est la destination de chaque échange capturé. `backendBaseUrl()`
+      // résout une adresse mais ne démarre rien : sans cette garantie, le proxy
+      // pouvait tourner parfaitement pendant que l'addon déposait ses requêtes sur
+      // un port fermé — le trafic passait, et Security Center affichait zéro.
+      const backend = await ensureBackendOnline().catch(() => null);
+      if (!backend?.online) {
+        const reason = `Le service local Security Center ne répond pas${backend?.message ? ` (${backend.message})` : ''} : les échanges capturés n’auraient nulle part où être déposés.`;
+        failEngineRun('mitmproxy', RUN_ERROR.BACKEND_UNAVAILABLE, reason);
+        throw new Error(reason);
+      }
+      const backendUrl = backendBaseUrl().replace(/\/$/, '');
+      mitmSession = await mitmproxy.startCapture(context.globalStorageUri.fsPath, {
+        detected,
+        ingestUrl: `${backendUrl}/api/v1/integrations/mitmproxy/requests`,
+        apiKey: activeBackendKey,
+        addonPath: context.asAbsolutePath(path.join('connectors', 'security-center-mitm.py')),
+        maxBodyBytes: vscode.workspace.getConfiguration('securityCenter').get('mitmproxy.maxBodyBytes', 65536),
+        onExit: ({ code }) => {
+          // Une sortie que personne n'a demandée est un échec, pas un arrêt.
+          // Un arrêt demandé, lui, tue le processus : `code` vaut alors `null`
+          // et le prendre pour une panne faisait terminer chaque capture normale
+          // sur « mitmdump s'est arrêté (code null) ».
+          if (mitmStopRequested) return void refreshMitmModel({ detect: false }).catch(() => {});
+          if (mitmState === mitmproxy.MITM_STATE.CAPTURING && code !== 0) {
+            mitmError = `mitmdump s’est arrêté (code ${code}).`;
+            mitmState = mitmproxy.MITM_STATE.FAILED;
+            failEngineRun('mitmproxy', RUN_ERROR.PROCESS_EXITED, mitmError);
+            // Un navigateur de capture sans proxy n'a plus de raison d'être ouvert.
+            closeTrackedCaptureBrowser().catch(() => {});
+          }
+          refreshMitmModel({ detect: false }).catch(() => {});
+        },
+        onLog: (text) => {
+          const line = String(text).trim();
+          scanLog.appendLine(`mitmproxy — ${line}`);
+          // L'addon marque chaque échec d'ingestion. La capture continue — le
+          // proxy fonctionne —, mais l'exécution porte désormais la perte et la
+          // carte la montre, au lieu de laisser croire à une capture intacte.
+          const failure = line.match(/\[security-center\]\[ingest-error\]\s*(.+)$/);
+          if (!failure) return;
+          mitmLostExchanges += 1;
+          mitmLostReason = failure[1].trim();
+          // Une rafale d'échecs ne rend plus la page à chaque ligne : le compte
+          // est tenu ici, l'état est publié une fois par seconde au plus.
+          scheduleMitmLossFlush();
+        }
+      });
+      mitmState = mitmproxy.MITM_STATE.CAPTURING;
+      // Le proxy écoute : la capture tourne. Elle n'a encore rien vu, et le dit
+      // par sa phase plutôt qu'en prétendant être en attente de démarrage.
+      updateEngineRun('mitmproxy', { status: RUN_STATUS.RUNNING, phase: 'En attente de trafic', requestCount: 0 });
+      scanLog.appendLine(`mitmproxy — capture démarrée sur ${mitmSession.proxyUrl}`);
+      // Rien ne relisait le trafic pendant une capture : les échanges arrivaient
+      // bien dans le backend, mais la page gardait le compte qu'elle avait à
+      // l'ouverture — zéro — jusqu'à ce que l'utilisateur clique « Actualiser ».
+      dynamicRefresh.wake();
+      await refreshHttpTraffic().catch(() => {});
+      vscode.window.showInformationMessage(`Security Center : proxy de capture prêt sur ${mitmSession.proxyUrl}. Configurez votre navigateur ou client sur cette adresse.`);
+    } catch (error) {
+      mitmSession = null;
+      mitmError = error.message;
+      mitmState = mitmproxy.MITM_STATE.FAILED;
+      failEngineRun('mitmproxy', RUN_ERROR.MITMDUMP_START_FAILED, error.message);
+      await refreshMitmModel({ detect: false });
+      vscode.window.showErrorMessage(`Security Center : démarrage du proxy impossible — ${error.message}`);
+    }
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.stopMitmproxyCapture', async () => {
+    if (!mitmSession) return vscode.window.showInformationMessage('Security Center : aucune capture en cours.');
+    mitmStopRequested = true;
+    updateEngineRun('mitmproxy', { status: RUN_STATUS.STOPPING, phase: 'Arrêt du proxy' });
+    // Aucune publication différée ne viendra modifier une capture close : les
+    // pertes déjà comptées sont évaluées ci-dessous, directement.
+    clearMitmLossFlush();
+    // Le navigateur de capture n'a plus de proxy à traverser : il est fermé — lui
+    // seul, jamais le navigateur habituel de l'utilisateur.
+    await closeTrackedCaptureBrowser();
+    const outcome = await mitmproxy.stopCapture(mitmSession);
+    scanLog.appendLine(`mitmproxy — capture arrêtée (port ${outcome.port} libéré : ${outcome.stopped})`);
+    mitmState = mitmproxy.MITM_STATE.STOPPED;
+    // Un arrêt qui n'a pas été confirmé n'est pas un arrêt propre : la carte doit
+    // le dire, parce que le port peut rester occupé.
+    if (!outcome.stopped) {
+      failEngineRun('mitmproxy', RUN_ERROR.STOP_FAILED, `Le processus de capture n’a pas confirmé son arrêt ; le port ${outcome.port} peut rester occupé.`);
+    } else if (mitmLostExchanges > 0) {
+      // Une capture dont des échanges se sont perdus n'est pas une capture
+      // réussie, même si le proxy s'est arrêté proprement.
+      failEngineRun('mitmproxy', RUN_ERROR.INGESTION_FAILED,
+        `Capture arrêtée : ${mitmLostExchanges} échange(s) n’ont pas atteint Security Center (${mitmLostReason}).`);
+    } else {
+      updateEngineRun('mitmproxy', { status: RUN_STATUS.COMPLETED, phase: 'Capture arrêtée' });
+    }
+    await refreshMitmModel({ detect: false });
+    await refreshHttpTraffic().catch(() => {});
+    vscode.window.showInformationMessage(outcome.stopped
+      ? 'Security Center : capture arrêtée.'
+      : 'Security Center : le processus de capture n’a pas confirmé son arrêt. Vérifiez le journal.');
+  }));
+
+  /**
+   * Relit le trafic stocké et recompose le modèle d'investigation partagé.
+   *
+   * Renvoie `true` si quelque chose a bougé. Le coordinateur s'en sert pour
+   * publier une seule fois par cycle au lieu qu'une source publie pour elle
+   * seule — c'est ce qui rend une seule horloge suffisante.
+   */
+  async function readHttpTraffic() {
+    const backendUrl = backendBaseUrl();
+    const [scenarios, mitmStatus] = await Promise.all([
+      listHttpScenarios(backendUrl),
+      getMitmproxyStatus(backendUrl).catch(() => null)
+    ]);
+    const previousCount = currentDashboardOptions.httpScenarioCount || 0;
+    const previousActivity = currentDashboardOptions.mitmproxy?.lastActivity || '';
+    // Le sondage ne lance jamais `mitmdump --version` : il lit la détection connue.
+    const model = await mitmModel({ detect: false });
+    setEngineAvailability('mitmproxy', mitmAvailability(model));
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      httpScenarioCount: scenarios.length,
+      httpScenarios: scenarios,
+      mitmproxy: { ...model, ...(mitmStatus ? { capturedRequests: mitmStatus.received_requests, lastActivity: mitmStatus.last_seen, receiving: mitmStatus.capturing === true } : {}) }
+    };
+    // Du trafic reçu est la seule preuve qu'une capture fonctionne : c'est lui,
+    // et non le démarrage du processus, qui fait avancer l'exécution.
+    const capture = dynamicEngines.mitmproxy.run;
+    if (capture && mitmStatus) {
+      // Ce que **cette** capture a vu, et non tout l'historique mitmproxy : un
+      // compteur qui démarrerait à la hauteur des sessions précédentes ne dirait
+      // rien de la session en cours.
+      const captured = scenarios.filter((scenario) => scenario.source === 'mitmproxy'
+        && sinceRunStart(scenario, capture.startedAt)).length;
+      const advanced = recordActivity(capture, { requestCount: captured, at: mitmStatus.last_seen || undefined });
+      if (advanced !== capture) {
+        setEngineRun('mitmproxy', captured > 0 ? transitionRun(advanced, { phase: 'Capture en cours' }) : advanced);
+      }
+    }
+    return scenarios.length !== previousCount || (mitmStatus?.last_seen || '') !== previousActivity;
+  }
+
+  /** Relit le trafic et publie, pour les gestes explicites de l'utilisateur. */
+  async function refreshHttpTraffic() {
+    await readHttpTraffic();
+    publishDashboard();
+  }
+
+  /**
+   * Relit l'état du connecteur Burp. Même contrat : renvoie ce qui a changé.
+   */
+  async function readBurpConnector() {
+    const backendUrl = backendBaseUrl();
+    let burpStatus;
+    try {
+      burpStatus = await getBurpStatus(backendUrl);
+    } catch (error) {
+      // Le statut n'a pas pu être lu : la carte dit « backend injoignable », au
+      // lieu d'un « déconnecté » muet dont la cause restait dans le journal.
+      const previousReason = dynamicEngines.burp?.run?.errorReason || '';
+      const wasConnected = Boolean(currentDashboardOptions.burpConnected);
+      currentDashboardOptions = { ...currentDashboardOptions, burpConnected: false };
+      applyBurpConnectorState({ connected: false, backend_error: error?.message || 'service local injoignable' });
+      refreshBackendBadge().catch(() => {});
+      return wasConnected || (dynamicEngines.burp?.run?.errorReason || '') !== previousReason;
+    }
+    const previousConnected = Boolean(currentDashboardOptions.burpConnected);
+    const previousReceived = Number(currentDashboardOptions.burpStatus?.received_requests || 0);
+    currentDashboardOptions = {
+      ...currentDashboardOptions,
+      backendStatus: backendBadgeAfterSuccess(),
+      burpConnected: Boolean(burpStatus.connected),
+      burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }),
+      burpStatus,
+      burpEndpoint: `${backendUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
+    };
+    applyBurpConnectorState(burpStatus);
+    return Boolean(burpStatus.connected) !== previousConnected
+      || Number(burpStatus.received_requests || 0) !== previousReceived;
+  }
+
+  /**
+   * Le coordinateur de rafraîchissement de Dynamic Security.
+   *
+   * Une seule horloge remplace les deux qui se recouvraient : le sondage Burp
+   * permanent et le sondage de trafic pendant capture relisaient la même liste
+   * de scénarios et publiaient chacun de leur côté. Ici, les sources sont
+   * interrogées à leur cadence et la page reçoit **une** publication par cycle.
+   *
+   * Elle ne bat que pendant qu'une surface qui affiche ces données est ouverte :
+   * personne ne regarde, rien n'est interrogé. Toute donnée d'exécution est
+   * relue à l'ouverture, donc rien n'est perdu par ce silence.
+   */
+  const dynamicRefresh = createRefreshCoordinator({
+    sources: [
+      { name: 'traffic', activeIntervalMs: 3000, idleIntervalMs: 0, refresh: () => readHttpTraffic() },
+      { name: 'connector', activeIntervalMs: 5000, idleIntervalMs: 0, refresh: () => readBurpConnector() }
+    ],
+    publish: () => publishDashboard(),
+    onError: () => {
+      // Une indisponibilité passagère du backend n'interrompt pas VS Code, mais
+      // le badge cesse d'affirmer « online » : on lui redemande son état.
+      refreshBackendBadge().catch(() => {});
+    }
+  });
+  context.subscriptions.push({ dispose: () => dynamicRefresh.stop() });
+
+  /**
+   * Navigateurs capables de recevoir un proxy et un profil isolés en arguments.
+   *
+   * Le profil dédié est ce qui rend le geste sûr : le navigateur habituel de
+   * l'utilisateur, ses sessions et ses réglages ne sont jamais touchés, et le
+   * proxy ne vaut que pour cette fenêtre. Aucun réglage système n'est modifié.
+   */
+  function captureBrowserCandidates() {
+    if (process.platform !== 'win32') return [];
+    const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+    const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const localAppData = process.env.LOCALAPPDATA || '';
+    return [
+      { label: 'Microsoft Edge', file: path.join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
+      { label: 'Microsoft Edge', file: path.join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe') },
+      { label: 'Google Chrome', file: path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe') },
+      { label: 'Google Chrome', file: path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe') },
+      { label: 'Google Chrome', file: path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe') }
+    ];
+  }
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.openMitmproxyBrowser', async () => {
+    // Une session arrêtée garde son adresse : elle ne doit jamais servir à ouvrir
+    // un navigateur vers un proxy qui n'écoute plus.
+    const proxyRunning = Boolean(mitmSession?.process && mitmSession.process.exitCode === null && mitmSession.process.signalCode === null);
+    if (!mitmSession?.proxyUrl || !proxyRunning) {
+      return vscode.window.showWarningMessage('Security Center : démarrez d’abord la capture mitmproxy.');
+    }
+    const browser = captureBrowserCandidates().find((candidate) => candidate.file && fs.existsSync(candidate.file));
+    const target = vscode.workspace.getConfiguration('securityCenter').get('zap.targetUrl', 'http://127.0.0.1:3000');
+    if (!browser) {
+      // Aucun navigateur pilotable : des instructions précises valent mieux
+      // qu'un geste approximatif, et surtout mieux qu'une commande de terminal.
+      return void vscode.window.showInformationMessage(
+        `Security Center : configurez le proxy HTTP de votre navigateur sur ${mitmSession.host}:${mitmSession.port}, puis visitez ${target}.`,
+        'Copier l’adresse du proxy'
+      ).then((choice) => {
+        if (choice) vscode.env.clipboard.writeText(`${mitmSession.host}:${mitmSession.port}`);
+      });
+    }
+    // Un profil propre à CETTE capture. Chromium ne garde qu'une instance par
+    // profil : un profil partagé renvoyait les nouvelles pages vers le navigateur
+    // d'une capture précédente, encore réglé sur un proxy mort.
+    const captureId = mitmSession.captureId
+      || (mitmSession.captureId = dynamicEngines.mitmproxy.run?.id || `capture-${mitmSession.port}-${Date.now()}`);
+    const profile = mitmproxy.captureProfileDirectory(context.globalStorageUri.fsPath, captureId);
+    // Un navigateur suivi qui appartient à une AUTRE capture est fermé d'abord.
+    if (captureBrowser && captureBrowser.captureId !== captureId) await closeTrackedCaptureBrowser();
+    await fsp.mkdir(profile, { recursive: true }).catch(() => {});
+    try {
+      // Profil dédié à la capture, proxy imposé y compris pour la boucle locale :
+      // sans `--proxy-bypass-list=<-loopback>`, une cible 127.0.0.1 échappait au proxy.
+      const args = mitmproxy.captureBrowserArgs({ proxyUrl: mitmSession.proxyUrl, profile, target });
+      const child = spawn(browser.file, args, { detached: true, stdio: 'ignore', windowsHide: false });
+      // Déjà ouvert pour cette capture : le nouveau lancement ne fait qu'ajouter
+      // une fenêtre à l'instance suivie, qui reste celle que l'arrêt fermera.
+      if (!captureBrowser || captureBrowser.exited) {
+        const tracked = { process: child, profile, captureId, label: browser.label, exited: false };
+        child.once('exit', () => { tracked.exited = true; });
+        child.once('error', () => { tracked.exited = true; });
+        captureBrowser = tracked;
+      }
+      child.unref();
+      scanLog.appendLine(`mitmproxy — navigateur de capture (${browser.label}) lancé sur ${mitmSession.proxyUrl}, profil ${path.basename(profile)}`);
+      vscode.window.showInformationMessage(`Security Center : ${browser.label} ouvert dans un profil isolé, derrière le proxy de capture. Il sera fermé à l’arrêt de la capture ; votre navigateur habituel n’est pas modifié.`);
+    } catch (error) {
+      vscode.window.showErrorMessage(`Security Center : ouverture du navigateur de capture impossible — ${error.message}`);
+    }
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('securityCenter.refreshHttpTraffic', () => refreshHttpTraffic().catch((error) => {
+    vscode.window.showErrorMessage(`Security Center : trafic HTTP indisponible — ${error.message}`);
+  })));
+
+  // Le proxy ne survit jamais à la fenêtre : un mitmdump orphelin garderait un
+  // port ouvert et continuerait d'intercepter du trafic sans interface pour le dire.
+  context.subscriptions.push({ dispose: () => { dynamicRefresh.stop(); clearMitmLossFlush(); closeTrackedCaptureBrowser().catch(() => {}); if (mitmSession) mitmproxy.stopCapture(mitmSession).catch(() => {}); } });
+
+  /**
+   * La confirmation d'un replay, rendue dans une page Security Center.
+   *
+   * Même contrat que la boîte native qu'elle remplace : elle rend le libellé
+   * d'action quand l'utilisateur confirme, `undefined` quand il annule, ferme la
+   * page ou appuie sur Échap. Le flux de replay qui l'attend est inchangé. Si la
+   * page ne peut pas s'ouvrir, la boîte native d'origine reste le recours.
+   */
+  let replayConfirmationPanel = null;
+
+  function confirmHttpReplay(safePreview, { isWrite, confirmLabel, sensitiveHeaders, fallbackMessage }) {
+    // Une seule confirmation à la fois : une nouvelle demande annule la précédente.
+    if (replayConfirmationPanel) replayConfirmationPanel.dispose();
+    let panel;
+    try {
+      panel = vscode.window.createWebviewPanel(
+        'securityCenter.httpReplayConfirm',
+        'Security Center — Confirmer le replay',
+        vscode.ViewColumn.Active,
+        { enableScripts: true }
+      );
+    } catch (error) {
+      scanLog.appendLine(`Replay HTTP — confirmation intégrée indisponible, boîte native utilisée : ${error.message}`);
+      return vscode.window.showInformationMessage(fallbackMessage, { modal: true }, confirmLabel);
+    }
+    replayConfirmationPanel = panel;
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        if (replayConfirmationPanel === panel) replayConfirmationPanel = null;
+        resolve(value);
+        panel.dispose();
+      };
+      panel.webview.onDidReceiveMessage((message) => {
+        if (message?.type === 'replayConfirm') settle(confirmLabel);
+        if (message?.type === 'replayCancel') settle(undefined);
+      });
+      panel.onDidDispose(() => settle(undefined));
+      panel.webview.html = renderReplayConfirmationHtml(
+        safePreview,
+        { isWrite, confirmLabel, sensitiveHeaders },
+        crypto.randomBytes(16).toString('base64'),
+        dashboardProvider.selectedTheme
+      );
+    });
+  }
+
   context.subscriptions.push(vscode.commands.registerCommand('securityCenter.replayHttpScenario', async (requestedScenario) => {
     try {
       const backendUrl = backendBaseUrl();
@@ -5241,11 +7218,15 @@ async function activate(context) {
         'Paramètres/corps assainis:',
         ...(safePreview.parameters.length ? safePreview.parameters.map((parameter) => `${parameter.location} • ${parameter.name}=${parameter.value}`) : ['Aucun paramètre structuré affichable'])
       ].join('\n');
-      const previewConfirmation = await vscode.window.showInformationMessage(
-        `${isWrite ? '⚠ Cette requête peut modifier l’état de l’application.\n\n' : ''}${previewLines}`,
-        { modal: true },
-        isWrite ? 'Confirmer et rejouer' : 'Rejouer la requête'
-      );
+      // Confirmation rendue dans une page Security Center, au contrat identique à
+      // la boîte native d'origine — le libellé d'action ou rien —, qui reste le
+      // recours si la page ne peut pas s'ouvrir.
+      const previewConfirmation = await confirmHttpReplay(safePreview, {
+        isWrite,
+        confirmLabel: isWrite ? 'Confirmer et rejouer' : 'Rejouer la requête',
+        sensitiveHeaders: selected.scenario.request.sensitive_headers || [],
+        fallbackMessage: `${isWrite ? '⚠ Cette requête peut modifier l’état de l’application.\n\n' : ''}${previewLines}`
+      });
       if (!previewConfirmation) return;
       const fixedFindings = currentFindings.filter((finding) => finding.triageStatus === 'fixed');
       const linked = fixedFindings.length ? await vscode.window.showQuickPick([
@@ -5277,9 +7258,12 @@ async function activate(context) {
           scanLog.appendLine(`Replay HTTP — audit backend indisponible : ${error.message}`);
         }
       }
+      // Une origine distante est confirmée avant le premier envoi, et une seule
+      // fois par origine exacte.
+      if (!await authorizeReplayTarget(selected.scenario)) return;
       const beforeLinkedFindings = linkedFindingsForScenario(selected.scenario, currentFindings);
       const replayStartedAt = Date.now();
-      const replay = await replayScenario(selected.scenario, { allowWrite: isWrite, timeoutMs: 30000 });
+      const replay = await replayScenario(selected.scenario, { allowWrite: isWrite, timeoutMs: 30000, authorizedOrigins: replayAuthorizedOrigins() });
       replay.durationMs = Date.now() - replayStartedAt;
       replay.linkedFindingsBefore = beforeLinkedFindings.length;
       replay.linkedFindingsAfter = null;
@@ -5429,9 +7413,10 @@ async function activate(context) {
     if (!probeUrl) return;
     let interpreted;
     try {
+      if (!await authorizeReplayTarget({ request: { url: probeUrl } })) return;
       const response = await replayScenario(
         { request: { url: probeUrl, method: 'GET', headers: authHeadersFor(profile, secret) }, response: {} },
-        { allowWrite: false, timeoutMs: 15000 }
+        { allowWrite: false, timeoutMs: 15000, authorizedOrigins: replayAuthorizedOrigins() }
       );
       // `interpretValidation` reads `status`, and it needs the previous status to
       // tell an expired session apart from a credential that was never valid.
@@ -5497,9 +7482,10 @@ async function activate(context) {
       const profile = currentDashboardOptions.dynamicAuthProfile;
       const secret = profile?.selected && profile?.secretConfigured ? await context.secrets.get(secretKeyFor(profile.id)) : null;
       const headers = secret ? { ...scenario.request.headers, ...authHeadersFor(profile, secret) } : scenario.request.headers;
+      if (!await authorizeReplayTarget(scenario)) throw new Error('Re-test annulé : origine distante non autorisée pour le replay.');
       const replay = await replayScenario(
         { ...scenario, request: { ...scenario.request, headers } },
-        { allowWrite: ['POST', 'PUT', 'PATCH'].includes(method), timeoutMs: 30000 }
+        { allowWrite: ['POST', 'PUT', 'PATCH'].includes(method), timeoutMs: 30000, authorizedOrigins: replayAuthorizedOrigins() }
       );
       // Both sides are scenario-shaped wrappers: `retestVerdict` reads
       // `.response` from each, so a flat replay object would read as no response
@@ -5597,6 +7583,7 @@ async function activate(context) {
       await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Security Center : analyse multi-outils', cancellable: true }, async (progress, cancellationToken) => {
       try {
         const abortController = new AbortController();
+        activeScanAbort = abortController;
         cancellationToken.onCancellationRequested(() => abortController.abort());
         const timeoutMs = cfg.get('scan.timeoutSeconds', 300) * 1000;
         const scans = [{
@@ -5711,6 +7698,15 @@ async function activate(context) {
         }
         const zapRequested = zapPreflightRequired;
         let zapMode = preflightZapMode;
+        // Le moteur n'est connu qu'une fois choisi, et il l'est avant que ZAP
+        // ne démarre : la carte et l'historique citent le même.
+        let zapEngineUsed = '';
+        // Si ZAP a reçu une session vérifiée, dit par le moteur une fois la session
+        // obtenue. Faux jusque-là : un login configuré n'est pas une session.
+        let zapSessionAuthenticated = false;
+        // Le code d'une panne de démarrage, s'il y en a eu une. Il voyage jusqu'à
+        // la clôture du déroulé pour que la carte le nomme.
+        let zapStartErrorCode = '';
         if (zapRequested && zapMode !== 'baseline' && zapAuthorizedByPreflight) {
           const actor = cfg.get('audit.actor', '') || process.env.USERNAME || process.env.USER || 'local-user';
           const backendAddress = backendBaseUrl();
@@ -5762,27 +7758,185 @@ async function activate(context) {
         if (zapRequested) scans.push({
           tool: 'ZAP',
           mode: zapMode,
-          authenticated: Boolean(projectPolicy?.zapAuth?.login || projectPolicy?.zapContext || resolvedDynamicAuth),
-          execute: () => runZap({
-            targetUrl: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'),
-            timeoutMs,
-            signal: abortController.signal,
-            excludedRoutes: projectPolicy?.exclusions.zap_routes || [],
-            mode: zapMode,
-            engine: projectPolicy?.zapEngine || 'auto',
-            localPath: projectPolicy?.zapLocalPath || '',
-            workspacePath: folder.uri.fsPath,
-            openapi: projectPolicy?.zapOpenapi || '',
-            context: projectPolicy?.zapContext || '',
-            user: projectPolicy?.zapUser || '',
-            auth: projectPolicy?.zapAuth,
-            authEnv: zapAuthEnv,
-            resolvedAuth: resolvedDynamicAuth,
-            // Real lifecycle from ZAP's own API responses. Every state and every
-            // percentage that reaches the page comes through here.
-            onLifecycle: (event) => publishDynamicLifecycle(event)
-          }),
+          execute: async () => {
+            // A remote target with no confirmed authorisation stops here, before
+            // any engine starts. Throwing is what the scanner path expects: it
+            // records ZAP as FAILED with this reason, rather than leaving it
+            // running or starting a scan nobody agreed to.
+            assertTargetAuthorized(cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'), {
+              mode: cfg.get('zap.targetMode', TARGET_MODE.LOCAL),
+              remoteAuthorized: cfg.get('zap.remoteAuthorized', false) === true
+            });
+            // Le moteur est choisi sur ce que la détection vient de mesurer.
+            // Un moteur nommé dans la politique mais indisponible ne fait plus
+            // échouer un scan que l'autre moteur sait exécuter.
+            // Le déroulé s'ouvre ici : l'autorisation de la cible vient d'être
+            // vérifiée, et c'est la première étape réelle du scan.
+            publishZapExecution(applyZapStage(
+              // Le déroulé de CE run, ouvert au démarrage du scanner.
+              currentZapExecution || createZapExecution({ target: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'), mode: zapMode }),
+              { stage: ZAP_STAGE.PREFLIGHT, status: STAGE_STATUS.COMPLETED, detail: 'Cible autorisée pour ce workspace' }
+            ));
+            const detectedEngines = await zapEnginesDetected().catch(() => null);
+            if (detectedEngines) setEngineAvailability('zap', zapAvailabilityFrom(detectedEngines, projectPolicy?.zapEngine || 'auto'));
+            const choice = zapEngineChoice(projectPolicy?.zapEngine || 'auto', detectedEngines || {});
+            if (choice.substituted) {
+              scanLog.appendLine(`ZAP — moteur ${choice.requested} indisponible : exécution avec le moteur ${choice.engine}.`);
+            }
+            try {
+              return await runZap({
+                targetUrl: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'),
+                allowRemote: cfg.get('zap.targetMode', TARGET_MODE.LOCAL) === TARGET_MODE.REMOTE
+                  && cfg.get('zap.remoteAuthorized', false) === true,
+                // Un scan ZAP dure bien plus que le délai générique des scanners
+                // (300 s par défaut, taillé pour une analyse de fichiers) : il
+                // reçoit son propre budget, sans jamais descendre sous un délai
+                // global configuré plus long.
+                timeoutMs: Math.max(timeoutMs, ZAP_SCAN_TIMEOUT_MS),
+                signal: abortController.signal,
+                excludedRoutes: projectPolicy?.exclusions.zap_routes || [],
+                mode: zapMode,
+                engine: choice.engine,
+                localPath: projectPolicy?.zapLocalPath || '',
+                workspacePath: folder.uri.fsPath,
+                openapi: projectPolicy?.zapOpenapi || '',
+                context: projectPolicy?.zapContext || '',
+                user: projectPolicy?.zapUser || '',
+                auth: projectPolicy?.zapAuth,
+                authEnv: zapAuthEnv,
+                resolvedAuth: resolvedDynamicAuth,
+                // La session réellement transmise à ZAP. Le libellé de la carte
+                // suit ce constat, pas la politique qui déclare un login.
+                onAuthentication: ({ authenticated }) => {
+                  zapSessionAuthenticated = authenticated === true;
+                  currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, 'ZAP', 'running', { identity: scannerIdentity({ tool: 'ZAP', mode: zapMode }) });
+                  renderSnapshotProgress();
+                },
+                // Le moteur retenu, dit avant que quoi que ce soit démarre.
+                onEngine: (engine) => {
+                  zapEngineUsed = zapEngineLabel(engine);
+                  recordZapStage({
+                    stage: ZAP_STAGE.ENGINE, status: STAGE_STATUS.COMPLETED,
+                    detail: zapEngineUsed || String(engine)
+                  });
+                  updateEngineRun('zap', {
+                    status: RUN_STATUS.RUNNING,
+                    phase: `Moteur ${zapEngineUsed || engine} · Preparing`
+                  });
+                },
+                // Real lifecycle from ZAP's own API responses. Every state and every
+                // percentage that reaches the page comes through here.
+                onLifecycle: (event) => {
+                  publishDynamicLifecycle(event);
+                  // Le déroulé enregistre l'étape, ses métriques et l'heure de
+                  // l'observation : c'est lui que « Détails d'exécution » lit.
+                  if (currentZapExecution) {
+                    try { publishZapExecution(applyZapLifecycle(currentZapExecution, event)); } catch { /* un état inconnu ne casse pas un scan */ }
+                  }
+                  const phase = zapPhaseText(event, zapEngineUsed);
+                  if (phase) updateEngineRun('zap', { status: RUN_STATUS.RUNNING, phase, progress: event?.progress ?? null });
+                },
+                // Le démon local et le conteneur du scan : rien ne doit survivre
+                // à la fenêtre, ni à une annulation.
+                onProcess: (child) => {
+                  activeZapProcess = child;
+                  child.once('close', () => { if (activeZapProcess === child) activeZapProcess = null; });
+                },
+                onContainer: (name) => { activeZapContainer = name; },
+                // Le diagnostic technique du démon : commande, PID, verrous
+                // retirés, sortie et code de fin. Déjà assaini par `zap-local`.
+                onDiagnostic: (info) => logZapDiagnostic(info)
+              });
+            } catch (error) {
+              // Une panne de démarrage porte son code et la sortie du démon :
+              // c'est ce qui remplace « en attente de l'API » sur un processus mort.
+              if (error?.code) {
+                zapStartErrorCode = String(error.code);
+                logZapProcessOutput(error.diagnostics);
+              }
+              // L'appel qui a échoué, sa cause réseau, l'état du démon et de son
+              // port : le détail technique va au journal, la raison à la carte.
+              if (error?.details) scanLog.appendLine(`ZAP — détail technique : ${JSON.stringify(error.details)}`);
+              throw error;
+            } finally {
+              // `runZap` a déjà retiré le conteneur ; la référence ne doit pas
+              // survivre au scan et désigner plus tard un conteneur d'un autre.
+              activeZapContainer = '';
+            }
+          },
           normalize: (payload, workspacePath) => normalizeZapOutput(
+            payload,
+            workspacePath,
+            cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')
+          )
+        });
+        // Nuclei vise la même cible Dynamic Security que ZAP, avec la même
+        // autorisation : les deux envoient du trafic d'analyse vers l'adresse
+        // que l'utilisateur a explicitement confirmée. Ce qui les sépare, ce
+        // n'est pas la permission mais le moteur — templates communautaires
+        // signés d'un côté, spider et scanner OWASP de l'autre.
+        const nucleiStatus = cfg.get('nuclei.enabled', true) ? await scannerToolManager.status('nuclei') : null;
+        if (nucleiStatus?.installed) scans.push({
+          tool: 'Nuclei',
+          mode: 'templates',
+          authenticated: Boolean(resolvedDynamicAuth),
+          execute: async () => {
+            assertTargetAuthorized(cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'), {
+              mode: cfg.get('zap.targetMode', TARGET_MODE.LOCAL),
+              remoteAuthorized: cfg.get('zap.remoteAuthorized', false) === true
+            });
+            // Les templates sont un artefact distinct du binaire : sans eux
+            // Nuclei rendrait un scan vide qui ressemblerait à « aucune
+            // vulnérabilité ». Ils sont donc garantis avant tout scan, et un
+            // échec de mise à jour n'efface jamais le corpus déjà installé.
+            let manifest = await nucleiTemplatesManifest();
+            if (!manifest) {
+              updateEngineRun('nuclei', { phase: 'Installation des templates officiels' });
+              manifest = await ensureNucleiTemplates({ signal: abortController.signal });
+            }
+            scanLog.appendLine(`Nuclei — templates ${manifest.version} (${manifest.templates} templates) depuis ${manifest.directory}`);
+            updateEngineRun('nuclei', { phase: `Démarrage de Nuclei (${manifest.templates} templates)` });
+            return runNuclei({
+              targetUrl: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'),
+              allowRemote: cfg.get('zap.targetMode', TARGET_MODE.LOCAL) === TARGET_MODE.REMOTE
+                && cfg.get('zap.remoteAuthorized', false) === true,
+              executable: nucleiStatus.executable,
+              templatesPath: manifest.directory,
+              severities: cfg.get('nuclei.severities', []),
+              rateLimit: cfg.get('nuclei.rateLimit', NUCLEI_DEFAULT_RATE_LIMIT),
+              concurrency: cfg.get('nuclei.concurrency', NUCLEI_DEFAULT_CONCURRENCY),
+              headers: resolvedDynamicAuth ? [`${resolvedDynamicAuth.header}: ${resolvedDynamicAuth.value}`] : [],
+              // Un scan Nuclei complet dure bien plus que le délai global des
+              // scanners (300 s par défaut) : il reçoit son propre budget mesuré,
+              // sans jamais descendre sous un délai global plus long.
+              timeoutMs: Math.max(timeoutMs, NUCLEI_SCAN_TIMEOUT_MS),
+              signal: abortController.signal,
+              // Le processus existe : le scan tourne réellement. Il est suivi pour
+              // être arrêté si la fenêtre se ferme en plein scan.
+              onStart: (child) => {
+                activeNucleiProcess = child;
+                child.once('close', () => { if (activeNucleiProcess === child) activeNucleiProcess = null; });
+                // Le processus tourne, mais Nuclei commence par compiler ses
+                // templates : mesuré à environ 3 minutes avant la première requête.
+                updateEngineRun('nuclei', { status: RUN_STATUS.RUNNING, phase: 'Nuclei charge ses templates (plusieurs minutes possibles)' });
+              },
+              // L'avancement réel du moteur (`-stats-json`) va au journal et à
+              // l'exécution commune de Nuclei, jamais à la campagne dynamique :
+              // celle-ci modélise un run ZAP, avec ses propres états (SPIDERING,
+              // ACTIVE_SCANNING…), et y injecter un autre moteur la ferait lever.
+              onLifecycle: (event) => {
+                scanLog.appendLine(
+                  `Nuclei — ${event.percent}% (${event.requests}/${event.total} requêtes, ${event.matched} correspondances, ${event.errors} erreurs)`
+                );
+                updateEngineRun('nuclei', {
+                  status: RUN_STATUS.RUNNING,
+                  progress: event.percent,
+                  phase: `${event.requests}/${event.total} requêtes · ${event.matched} correspondance(s)`
+                });
+              }
+            });
+          },
+          normalize: (payload, workspacePath) => normalizeNucleiOutput(
             payload,
             workspacePath,
             cfg.get('zap.targetUrl', 'http://127.0.0.1:3000')
@@ -5834,7 +7988,11 @@ async function activate(context) {
         const scanStartedAt = Date.now();
         scanLog.appendLine(`[${new Date().toISOString()}] Analyse démarrée — ${folder.uri.fsPath}`);
         scanLog.appendLine(`Scanners : ${scans.map((scan) => scan.tool).join(', ')}`);
-        const scannerIdentity = (scan) => ({ tool: scan.tool, ...(scan.tool === 'ZAP' ? { mode: scan.mode, authenticated: scan.authenticated } : {}) });
+        // Le moteur rejoint l'identité du scanner ZAP : la carte affichait
+        // « Local ZAP or Docker » faute que quiconque ait jamais écrit lequel.
+        // Un run ZAP garde son identifiant et son mode de résultat : c'est ce qui
+        // permet à l'historique et aux findings de dire passif ou actif.
+        const scannerIdentity = (scan) => ({ tool: scan.tool, ...(scan.tool === 'ZAP' ? { mode: scan.mode, scanMode: zapScanMode(scan.mode), ...(dynamicEngines.zap?.run?.id ? { runId: dynamicEngines.zap.run.id } : {}), authenticated: zapSessionAuthenticated, ...(zapEngineUsed ? { engine: zapEngineUsed } : {}) } : {}) });
         const liveStatuses = scans.map((scan) => ({ ...scannerIdentity(scan), status: 'pending' }));
         let completedProgress = 0;
         const runScanner = async (scan, index) => {
@@ -5847,7 +8005,26 @@ async function activate(context) {
             // A dynamic run gets its identity before it produces anything, so the
             // lifecycle events that follow have a campaign to belong to.
             if (scan.tool === 'ZAP') beginZapCampaign();
-            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'running', { startedAt: new Date(scannerStartedAt).toISOString() });
+            // ZAP et Nuclei sont deux analyses finies : elles partagent la même
+            // exécution commune, quelle que soit la richesse d'étapes que ZAP
+            // publie par ailleurs dans sa campagne.
+            const dynamicEngine = dynamicEngineOf(scan.tool);
+            if (dynamicEngine) {
+              beginEngineRun(dynamicEngine, { kind: RUN_KIND.SCAN, target: currentDynamicTargetUrl(), phase: dynamicEngine === 'nuclei' ? 'Préparation du scan Nuclei' : dynamicEngine === 'zap' ? 'Preparing' : 'Analyse en cours' });
+              // Nuclei ne passe en RUNNING qu'une fois son processus réellement
+              // démarré (`onStart`, plus bas) : avant, il prépare ses templates,
+              // et l'annoncer « en cours » serait prématuré.
+              if (dynamicEngine !== 'nuclei') updateEngineRun(dynamicEngine, { status: RUN_STATUS.RUNNING });
+            }
+            if (scan.tool === 'ZAP') {
+              // Un nouveau run n'hérite de rien du précédent : ni de son déroulé en
+              // échec, ni de sa session. Sans cela, la carte affichait EN COURS à
+              // côté des « Détails d'exécution » ÉCHEC du run d'avant, le temps que
+              // ce run-ci atteigne sa première étape.
+              zapSessionAuthenticated = false;
+              publishZapExecution(createZapExecution({ target: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'), mode: scan.mode }));
+            }
+            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'running', { startedAt: new Date(scannerStartedAt).toISOString(), identity: scannerIdentity(scan) });
             
             const isRetry = activeExecution && activeExecution.type === 'retry';
             await createAuditEvent(backendAddress, {
@@ -5866,7 +8043,18 @@ async function activate(context) {
             const result = await scan.execute();
             if (scan.onSuccess) await scan.onSuccess(result);
             if (result.stderr?.trim()) scanLog.appendLine(`${scan.tool} — informations : ${result.stderr.trim()}`);
-            const scanFindings = scan.normalize(result.payload, folder.uri.fsPath);
+            // Normaliser et persister prend un temps réel : l'étape est dite
+            // plutôt que laissée dans le silence qui suivait la collecte.
+            if (scan.tool === 'ZAP') recordZapStage({ stage: ZAP_STAGE.NORMALIZING, status: STAGE_STATUS.RUNNING });
+            const normalizedFindings = scan.normalize(result.payload, folder.uri.fsPath);
+            // Chaque finding ZAP porte le run et le mode qui l'ont produit.
+            const scanFindings = scan.tool === 'ZAP'
+              ? stampZapFindings(normalizedFindings, { runId: dynamicEngines.zap?.run?.id || '', scanMode: scan.mode })
+              : normalizedFindings;
+            if (scan.tool === 'ZAP') recordZapStage({
+              stage: ZAP_STAGE.NORMALIZING, status: STAGE_STATUS.COMPLETED,
+              detail: `${scanFindings.length} finding(s) normalisé(s)`, metrics: { findings: scanFindings.length }
+            });
             for (let findingIndex = findings.length - 1; findingIndex >= 0; findingIndex -= 1) {
               if (findings[findingIndex].tool === scan.tool) findings.splice(findingIndex, 1);
             }
@@ -5884,19 +8072,45 @@ async function activate(context) {
             // A ZAP run that completed is proof the target answered. Recording it
             // keeps the target badge from reading « non vérifiée » right next to a
             // finished dynamic scan.
+            if (dynamicEngine) {
+              const finished = dynamicEngines[dynamicEngine]?.run;
+              if (finished) setEngineRun(dynamicEngine, completeRun(finished, { findingCount: scanFindings.length, phase: 'Analyse terminée' }));
+            }
+            // Le statut du scanner est clos avant toute publication du déroulé :
+            // moteur, scanner et « Détails d'exécution » passent terminés ensemble,
+            // au lieu de laisser la carte « en cours » pendant les écritures qui suivent.
+            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'completed', {
+              details,
+              durationMs,
+              findings: scanFindings,
+              completedAt: new Date().toISOString(),
+              identity: scannerIdentity(scan)
+            });
+            renderSnapshotProgress();
             if (scan.tool === 'ZAP') {
+              // Le dernier run terminé de ce mode pour cette cible : la carte
+              // compare passif et actif par empreinte, pas par compteur.
+              currentDashboardOptions = {
+                ...currentDashboardOptions,
+                zapRunResults: recordZapRunResult(currentDashboardOptions.zapRunResults, {
+                  target: cfg.get('zap.targetUrl', 'http://127.0.0.1:3000'),
+                  runId: dynamicEngines.zap?.run?.id || '',
+                  scanMode: scan.mode,
+                  completedAt: new Date().toISOString(),
+                  findings: scanFindings
+                })
+              };
+              recordZapStage({
+                stage: ZAP_STAGE.COMPLETED, status: STAGE_STATUS.COMPLETED,
+                detail: `${scanFindings.length} finding(s) · ${Math.round(durationMs / 1000)} s`
+              });
+              await persistZapExecution();
               refreshDynamicTargetModel('online', { source: 'zap-scan' });
               // The campaign closes with the findings this run is answerable for.
               await finishZapCampaign(DYNAMIC_STATUS.COMPLETED, {
                 findingIds: scanFindings.map((finding) => finding.id)
               });
             }
-            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'completed', {
-              details,
-              durationMs,
-              findings: scanFindings,
-              completedAt: new Date().toISOString()
-            });
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — terminé en ${Math.round(durationMs / 1000)} s (${scanFindings.length} résultat(s))`);
 
             await createAuditEvent(backendAddress, {
@@ -5913,8 +8127,16 @@ async function activate(context) {
               cancelled = true;
               scanStatuses[index] = { ...scannerIdentity(scan), status: 'cancelled', error: error.message, durationMs };
               liveStatuses[index] = { ...scannerIdentity(scan), status: 'cancelled', error: error.message, durationMs };
-              if (scan.tool === 'ZAP') await finishZapCampaign(DYNAMIC_STATUS.CANCELLED);
-              currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'cancelled', { error: error.message, durationMs });
+              // Moteur et scanner d'abord, déroulé ensuite : aucune publication ne
+              // peut montrer le run annulé à côté d'un moteur encore « en cours ».
+              if (dynamicEngineOf(scan.tool)) failEngineRun(dynamicEngineOf(scan.tool), RUN_ERROR.CANCELLED, 'Analyse annulée par l’utilisateur.');
+              currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'cancelled', { error: error.message, durationMs, identity: scannerIdentity(scan) });
+              renderSnapshotProgress();
+              if (scan.tool === 'ZAP') {
+                failZapExecutionNow('Analyse annulée par l’utilisateur.', 'ZAP_RUN_CANCELLED');
+                await persistZapExecution();
+                await finishZapCampaign(DYNAMIC_STATUS.CANCELLED);
+              }
               scanLog.appendLine(`[${new Date().toISOString()}] Analyse annulée par l’utilisateur.`);
               return;
             }
@@ -5931,8 +8153,20 @@ async function activate(context) {
             }
             scanStatuses[index] = { ...scannerIdentity(scan), status: 'failed', error: error.message, durationMs };
             liveStatuses[index] = { ...scannerIdentity(scan), status: 'failed', error: error.message, durationMs };
-            if (scan.tool === 'ZAP') await finishZapCampaign(DYNAMIC_STATUS.FAILED);
-            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'failed', { error: error.message, durationMs });
+            // Moteur et scanner passent en échec AVANT que le déroulé ne publie son
+            // ÉCHEC. L'ordre inverse était la contradiction observée : le déroulé
+            // disait ÉCHEC pendant que la carte restait « EN COURS · Scan actif
+            // 37 % · Analysis in progress », le temps des écritures de clôture.
+            if (dynamicEngineOf(scan.tool)) failEngineRun(dynamicEngineOf(scan.tool), RUN_ERROR.SCAN_FAILED, error.message);
+            currentSecuritySnapshot = updateRefresh(currentSecuritySnapshot, scan.tool, 'failed', { error: error.message, durationMs, identity: scannerIdentity(scan) });
+            renderSnapshotProgress();
+            if (scan.tool === 'ZAP') {
+              // L'étape qui tournait porte la panne : c'est elle que « Détails
+              // d'exécution » montre en FAILED, et non le run entier sans lieu.
+              failZapExecutionNow(error.message, zapStartErrorCode || 'ZAP_SCAN_FAILED');
+              await persistZapExecution();
+              await finishZapCampaign(DYNAMIC_STATUS.FAILED);
+            }
             scanLog.appendLine(`[${new Date().toISOString()}] ${scan.tool} — ÉCHEC : ${error.message}`);
 
             await createAuditEvent(backendAddress, {
@@ -6137,6 +8371,13 @@ async function activate(context) {
         }
         const finalScanStatus = aggregateRunStatus(scanStatuses, { cancelled });
         currentDashboardOptions = {
+          // L'état publié en dehors du scan — déroulé ZAP, moteurs dynamiques,
+          // compte de test, cible, campagne — survit à la consolidation. Le
+          // reconstruire à partir de rien effaçait « Détails d'exécution » et
+          // renvoyait le compte de test à « non vérifié » dès la fin d'un run.
+          ...currentDashboardOptions,
+          restoredFromCache: false,
+          activeExecution: null,
           workspace: currentWorkspaceIdentity().label,
           scanStatus: finalScanStatus,
           backendStatus,
@@ -6217,6 +8458,7 @@ async function activate(context) {
       });
     } finally {
       scanInProgress = false;
+      activeScanAbort = null;
       currentScanRunning = false;
       liveCompanionProvider.render();
     }
@@ -6242,21 +8484,59 @@ async function activate(context) {
     if (choice === 'Voir les journaux') await vscode.commands.executeCommand('securityCenter.showBackendLogs');
   }).catch(() => {});
 
+  /**
+   * La disponibilité ZAP, mesurée dès l'activation et pour elle-même.
+   *
+   * Elle n'était publiée qu'à l'intérieur de la chaîne qui interroge le backend :
+   * si l'une de ces requêtes échouait, la mesure n'atteignait jamais le registre
+   * et le moteur restait sur « disponibilité non encore vérifiée », que la carte
+   * affiche INDISPONIBLE. Or Java et le chemin ZAP ne dépendent pas du backend.
+   *
+   * La détection est donc indépendante, refaite à chaque activation — donc à
+   * chaque rechargement de fenêtre — et ne réutilise aucune valeur persistée.
+   */
+  zapAvailability()
+    .then((tool) => { setEngineAvailability('zap', tool); publishDashboard(); })
+    .catch((error) => scanLog.appendLine(`ZAP — disponibilité non mesurable : ${error.message}`));
+
   // Le trafic capture et l'etat du connecteur Burp sont des DONNEES du backend.
   // Leur indisponibilite ne dit rien du workspace et ne doit rien decider du
   // badge : en cas d'echec on redemande son etat au gestionnaire, au lieu de
   // laisser l'interface sur « unknown » comme elle le faisait.
   const configuredBackendUrl = backendBaseUrl();
-  Promise.all([listHttpScenarios(configuredBackendUrl), getBurpStatus(configuredBackendUrl)]).then(([scenarios, burpStatus]) => {
+  Promise.all([
+    listHttpScenarios(configuredBackendUrl),
+    getBurpStatus(configuredBackendUrl),
+    // Le proxy managé publie son état au même moment que Burp : la page ne doit
+    // jamais afficher « non installé » simplement parce que personne n'a demandé.
+    getMitmproxyStatus(configuredBackendUrl).catch(() => null),
+    mitmModel().catch(() => null),
+    // L'état outil de Nuclei est publié dès l'activation : après un rechargement
+    // de fenêtre, la page ne doit pas repartir d'un « non installé » par défaut.
+    nucleiToolModel().catch(() => null),
+    // La disponibilité de ZAP est mesurée, jamais déduite d'un historique de
+    // scans : un ZAP parfaitement installé et jamais lancé doit être PRÊT.
+    zapAvailability().catch(() => null)
+  ]).then(([scenarios, burpStatus, mitmStatus, mitm, nucleiTool, zapTool]) => {
     currentDashboardOptions = {
       ...currentDashboardOptions,
       httpScenarioCount: scenarios.length,
       httpScenarios: scenarios,
+      mitmproxy: mitm ? { ...mitm, ...(mitmStatus ? { capturedRequests: mitmStatus.received_requests, lastActivity: mitmStatus.last_seen, receiving: mitmStatus.capturing === true } : {}) } : null,
+      nucleiTool,
       burpConnected: Boolean(burpStatus.connected),
       burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }),
       burpStatus,
       burpEndpoint: `${configuredBackendUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
     };
+    // La disponibilité des quatre moteurs entre dans le registre commun, et
+    // l'état d'exécution restauré est confronté à la réalité du moment : un
+    // rechargement de fenêtre a tué les processus, jamais les données.
+    if (zapTool) setEngineAvailability('zap', zapTool);
+    if (nucleiTool) setEngineAvailability('nuclei', nucleiAvailability(nucleiTool));
+    if (mitm) setEngineAvailability('mitmproxy', mitmAvailability(mitm));
+    applyBurpConnectorState(burpStatus);
+    reconcileRestoredRuns();
     publishDashboard();
   }).catch(() => {
     // Le dashboard reste utilisable meme si le backend local est arrete : seul
@@ -6264,31 +8544,16 @@ async function activate(context) {
     refreshBackendBadge().catch(() => {});
   });
 
-  const burpPolling = setInterval(() => {
-    const pollUrl = backendBaseUrl();
-    Promise.all([listHttpScenarios(pollUrl), getBurpStatus(pollUrl)]).then(([scenarios, burpStatus]) => {
-      const previousCount = currentDashboardOptions.httpScenarioCount || 0;
-      const previousBurpConnected = Boolean(currentDashboardOptions.burpConnected);
-      currentDashboardOptions = {
-        ...currentDashboardOptions,
-        backendStatus: backendBadgeAfterSuccess(),
-        httpScenarioCount: scenarios.length,
-        httpScenarios: scenarios,
-        burpConnected: Boolean(burpStatus.connected),
-      burpSession: captureSessionFrom(burpStatus, { campaign: currentDynamicCampaign() }),
-        burpStatus,
-        burpEndpoint: `${pollUrl.replace(/\/$/, '')}/api/v1/integrations/burp`
-      };
-      if (scenarios.length !== previousCount || Boolean(burpStatus.connected) !== previousBurpConnected) {
-        publishDashboard();
-      }
-    }).catch(() => {
-      // Une indisponibilite temporaire du backend ne doit pas interrompre VS Code,
-      // mais le badge doit cesser d'affirmer « online » : on redemande l'etat.
-      refreshBackendBadge().catch(() => {});
-    });
-  }, 5000);
-  context.subscriptions.push({ dispose: () => clearInterval(burpPolling) });
+  // Le rafraîchissement de Dynamic Security est confié au coordinateur : il ne
+  // bat que pendant qu'une surface qui affiche ces données est ouverte, et il
+  // publie une fois par cycle quel que soit le nombre de sources qui ont bougé.
+  dashboardProvider.onDynamicSurfaceChange = (open) => {
+    dynamicRefresh.setActive(open);
+    // À l'ouverture, l'état est relu tout de suite : la page ne doit pas
+    // attendre le premier battement pour montrer ce qui est vrai maintenant.
+    if (open) dynamicRefresh.refreshNow().catch(() => {});
+  };
+  dynamicRefresh.setActive(dashboardProvider.hasDynamicSurface());
 }
 
 function deactivate() {
@@ -6305,5 +8570,8 @@ module.exports = {
   DashboardProvider,
   zapRequestedForScan,
   zapModeFromPolicy,
-  resolveZapActiveScanConsent
+  resolveZapActiveScanConsent,
+  readZapTestAccount,
+  configureZapTestAccount,
+  promptZapTestAccountInputs
 };

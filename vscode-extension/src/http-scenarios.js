@@ -7,7 +7,24 @@ const MAX_BODY_LENGTH = 256 * 1024;
 const READ_METHODS = new Set(['GET', 'HEAD']);
 const CONTROLLED_WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH']);
 
-function validateLocalUrl(value) {
+const LOOPBACK_HOSTS = Object.freeze(['127.0.0.1', 'localhost', '::1']);
+
+/** Replay decisions the model exposes, and the page will later render. */
+const REPLAY_STATE = Object.freeze({
+  ALLOWED: 'allowed',
+  AUTHORIZATION_REQUIRED: 'authorization-required'
+});
+
+/**
+ * A URL that can be recorded.
+ *
+ * Importing a HAR or receiving a Burp capture is passive: nothing is sent
+ * anywhere. Refusing a remote address here rejected evidence about a test
+ * environment the user is entitled to investigate, for no gain — the structural
+ * checks, the redaction and the size limits are what protect this path, and
+ * they are unchanged.
+ */
+function validateCapturedUrl(value) {
   let target;
   try {
     target = new URL(value);
@@ -15,7 +32,52 @@ function validateLocalUrl(value) {
     throw new Error('URL HTTP invalide.');
   }
   if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Seules les URL HTTP et HTTPS sont acceptées.');
-  if (!['127.0.0.1', 'localhost', '::1'].includes(target.hostname)) {
+  if (!target.hostname) throw new Error('URL HTTP invalide.');
+  return target;
+}
+
+/** Whether a URL points at this machine. */
+function isLocalScenarioHost(hostname) {
+  return LOOPBACK_HOSTS.includes(String(hostname || '').toLowerCase().replace(/^\[|\]$/g, ''));
+}
+
+/**
+ * The exact origin a replay would reach: scheme, host and port.
+ *
+ * Authorisation is granted against this string and nothing broader. Another
+ * port on the same host is another origin, and needs its own confirmation.
+ */
+function replayOrigin(value) {
+  const target = validateCapturedUrl(value);
+  return target.origin;
+}
+
+/**
+ * Whether this scenario may be sent, and why not when it may not.
+ *
+ * Local replay is unchanged and needs no confirmation. A remote origin must
+ * have been confirmed for replay specifically — a ZAP scan authorisation is a
+ * different decision about a different action, and is never read here.
+ */
+function replayAuthorization(scenario, { authorizedOrigins = [] } = {}) {
+  const target = validateCapturedUrl(scenario?.request?.url);
+  const origin = target.origin;
+  const scope = isLocalScenarioHost(target.hostname) ? 'local' : 'remote';
+  if (scope === 'local') return { state: REPLAY_STATE.ALLOWED, origin, scope };
+  const authorized = (Array.isArray(authorizedOrigins) ? authorizedOrigins : [])
+    .map((entry) => { try { return new URL(String(entry)).origin; } catch { return ''; } })
+    .filter(Boolean);
+  return {
+    state: authorized.includes(origin) ? REPLAY_STATE.ALLOWED : REPLAY_STATE.AUTHORIZATION_REQUIRED,
+    origin,
+    scope
+  };
+}
+
+/** Kept for callers that genuinely require a loopback address. */
+function validateLocalUrl(value) {
+  const target = validateCapturedUrl(value);
+  if (!isLocalScenarioHost(target.hostname)) {
     throw new Error('Le replay MVP est limité aux applications locales autorisées.');
   }
   return target;
@@ -49,7 +111,7 @@ function bodySha256(body) {
 function normalizeHarEntry(entry, index = 0) {
   const request = entry?.request || {};
   const response = entry?.response || {};
-  const target = validateLocalUrl(request.url);
+  const target = validateCapturedUrl(request.url);
   const requestHeaders = normalizeHeaders(request.headers);
   const responseHeaders = normalizeHeaders(response.headers);
   const responseBody = limitedBody(response.content?.text || '');
@@ -70,7 +132,7 @@ function normalizeHarEntry(entry, index = 0) {
       body: responseBody,
       bodySha256: bodySha256(responseBody)
     },
-    tags: ['imported', 'local']
+    tags: ['imported', isLocalScenarioHost(target.hostname) ? 'local' : 'remote']
   };
 }
 
@@ -99,7 +161,11 @@ function replayScenario(scenario, options = 30000) {
   if (CONTROLLED_WRITE_METHODS.has(method) && settings.allowWrite !== true) {
     throw new Error('Les méthodes POST/PUT/PATCH exigent une confirmation interactive et une autorisation auditée.');
   }
-  const target = validateLocalUrl(scenario.request.url);
+  const authorization = replayAuthorization(scenario, { authorizedOrigins: settings.authorizedOrigins });
+  if (authorization.state !== REPLAY_STATE.ALLOWED) {
+    throw new Error(`Replay refusé : l’origine distante ${authorization.origin} n’a pas été autorisée pour le replay HTTP.`);
+  }
+  const target = validateCapturedUrl(scenario.request.url);
   const transport = target.protocol === 'https:' ? https : http;
   const headers = Object.fromEntries(
     Object.entries(scenario.request.headers || {}).filter(([name, value]) => value !== '[REDACTED]' && !['host', 'content-length'].includes(name.toLowerCase()))
@@ -137,6 +203,7 @@ function replayScenario(scenario, options = 30000) {
 }
 
 module.exports = {
-  validateLocalUrl, normalizeHeaders, bodySha256, normalizeHarEntry, normalizeHar, replayScenario,
-  READ_METHODS, CONTROLLED_WRITE_METHODS, MAX_BODY_LENGTH
+  validateLocalUrl, validateCapturedUrl, isLocalScenarioHost, replayOrigin, replayAuthorization,
+  normalizeHeaders, bodySha256, normalizeHarEntry, normalizeHar, replayScenario,
+  READ_METHODS, CONTROLLED_WRITE_METHODS, MAX_BODY_LENGTH, REPLAY_STATE, LOOPBACK_HOSTS
 };

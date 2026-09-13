@@ -26,13 +26,26 @@ test('importe un HAR local et masque les secrets HTTP', () => {
   assert.equal(result.scenarios[0].timestamp, '2026-08-12T10:00:00.000Z');
 });
 
-test('rejette les cibles HTTP externes pendant l’import', () => {
-  const result = normalizeHar({ log: { entries: [{
+test('importe une cible distante, refuse ce qui n’est pas une requête HTTP', () => {
+  // L'import est passif : rien n'est émis, donc une origine distante est une
+  // preuve à investiguer et non une action à autoriser.
+  const accepted = normalizeHar({ log: { entries: [{
     request: { method: 'GET', url: 'https://example.com', headers: [] },
     response: { status: 200, headers: [], content: { text: '' } }
   }] } });
-  assert.equal(result.scenarios.length, 0);
-  assert.equal(result.rejected.length, 1);
+  assert.equal(accepted.scenarios.length, 1);
+  assert.equal(accepted.rejected.length, 0);
+  assert.deepEqual(accepted.scenarios[0].tags, ['imported', 'remote']);
+
+  // La validation structurelle ne bouge pas.
+  const refused = normalizeHar({ log: { entries: [
+    { request: { method: 'GET', url: 'ftp://example.com', headers: [] }, response: { status: 200, headers: [], content: { text: '' } } },
+    { request: { method: 'GET', url: 'pas-une-url', headers: [] }, response: { status: 200, headers: [], content: { text: '' } } }
+  ] } });
+  assert.equal(refused.scenarios.length, 0);
+  assert.equal(refused.rejected.length, 2);
+
+  // Le validateur strictement local reste disponible pour le replay.
   assert.throws(() => validateLocalUrl('https://example.com'), /applications locales/);
 });
 

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { localArgs, dockerArgs } = require('../src/semgrep');
+const { localArgs, dockerArgs, scanEnvironment } = require('../src/semgrep');
 
 test('construit une invocation locale avec une configuration explicite', () => {
   assert.deepEqual(localArgs('p/security-audit'), ['scan', '--config', 'p/security-audit', '--json', '--metrics=off', '.']);
@@ -24,4 +24,14 @@ test('limite Semgrep aux fichiers modifiés en mode incrémental', () => {
   const args = dockerArgs('C:\\repo', 'security-rules/semgrep.yml', {}, ['src/app.ts', 'src/api.js']);
   assert.deepEqual(args.slice(-2), ['src/app.ts', 'src/api.js']);
   assert.ok(!args.includes('.'));
+});
+
+// Régression : Semgrep lisait les règles YAML avec l'encodage local de Windows,
+// ce qui transformait « L’usage » en « Lâ€™usage » jusque dans le titre du
+// finding affiché. Reproduit sur security-rules/semgrep.yml avec le Semgrep
+// managé (1.176.1) contre Juice Shop.
+test('force le mode UTF-8 de Python pour ne pas corrompre les règles non ASCII', () => {
+  const environment = scanEnvironment({ PATH: '/usr/bin' });
+  assert.equal(environment.PYTHONUTF8, '1');
+  assert.equal(environment.PATH, '/usr/bin');
 });

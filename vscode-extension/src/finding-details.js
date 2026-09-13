@@ -289,9 +289,10 @@ function renderVerification(finding) {
   const status = String(finding?.triageStatus || 'new');
   const verification = finding?.verification;
   const relevant = verification || ['fixed', 'validating', 'validated', 'still_present', 'validation_failed', 'inconclusive', 'regressed'].includes(status);
+  const note = 'Une correction n’est validée qu’après relance du scanner concerné : appliquer un patch ne suffit pas.';
   if (!relevant) {
-    return `<div class="actions"><button data-verify="1">Vérifier la correction</button></div>
-      <p class="muted">Une correction n’est validée qu’après relance du scanner concerné : appliquer un patch ne suffit pas.</p>`;
+    return `<div class="verification-action-row"><button data-verify="1" class="verification-action">Vérifier la correction</button>
+      <p class="verification-note">${note}</p></div>`;
   }
   const rows = [
     ['Résultat', escapeHtml(VERIFICATION_LABELS[status] || status)],
@@ -304,12 +305,12 @@ function renderVerification(finding) {
     verification?.evidence?.detail ? ['Détail', escapeHtml(verification.evidence.detail)] : null
   ].filter(Boolean);
   const actions = [
-    status === 'validated' ? '' : `<button data-verify="1">${status === 'fixed' ? 'Vérifier la correction' : 'Relancer la vérification'}</button>`,
+    status === 'validated' ? '' : `<button data-verify="1" class="verification-action">${status === 'fixed' ? 'Vérifier la correction' : 'Relancer la vérification'}</button>`,
     finding?.fixSource === 'ai' ? '<button data-rollback="1" class="context-action">Annuler le patch IA</button>' : ''
   ].filter(Boolean).join('');
-  return `<h2>Vérification</h2><div class="grid block">
+  return `<div class="verification-results grid">
       ${rows.map(([label, value]) => `<div class="label">${label}</div><div>${value}</div>`).join('')}
-    </div>${actions ? `<div class="actions">${actions}</div>` : ''}
+    </div>${actions ? `<div class="verification-action-row">${actions}<p class="verification-note">${note}</p></div>` : ''}
     ${status === 'fixed' ? '<p class="muted">Le correctif est appliqué, mais aucun scanner ne l’a encore confirmé.</p>' : ''}`;
 }
 
@@ -371,7 +372,7 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
   const correlation = finding.correlatedTools?.length
     ? `<h2>Corrélation multi-outils</h2><div class="block"><strong>${escapeHtml(finding.correlatedTools.join(' + '))}</strong><br><span class="muted">Confiance ${escapeHtml(finding.correlationConfidence || 'medium')} — cette correspondance aide à prioriser, mais ne remplace pas une validation manuelle.</span></div>`
     : '';
-  const triage = `<h2>Suivi</h2><div class="grid block"><div class="label">Statut</div><div><strong>${escapeHtml(VERIFICATION_LABELS[finding.triageStatus] || finding.triageStatus || 'new')}</strong></div><div class="label">Contexte</div><div>${escapeHtml(finding.sourceContext || 'non classé')}</div></div>${renderVerification(finding)}`;
+  const triage = `<div class="verification-panel"><div class="verification-status-grid"><div class="label">Statut</div><div><strong>${escapeHtml(VERIFICATION_LABELS[finding.triageStatus] || finding.triageStatus || 'new')}</strong></div><div class="label">Contexte</div><div>${escapeHtml(finding.sourceContext || 'non classé')}</div></div>${renderVerification(finding)}</div>`;
   const aiAction = finding.absolutePath || finding.file ? '<button id="ai-fix" class="ai-action primary-action">✨ Proposer une correction avec Ollama</button>' : '<p class="muted">Correction IA indisponible : aucun fichier source local associé à ce finding.</p>';
   const relatedTraffic = Array.isArray(navigation.relatedTraffic) ? navigation.relatedTraffic : [];
   const backAction = Number.isInteger(navigation.backTrafficIndex) ? `<button class="context-action" data-back-traffic="${navigation.backTrafficIndex}">← Retour à la requête HTTP</button>` : '';
@@ -487,6 +488,17 @@ function renderFindingDetailsHtml(finding, nonce, navigation = {}) {
     .label, .muted { color: var(--vscode-descriptionForeground); }
     code, pre { background: var(--vscode-textCodeBlock-background); border-radius: 4px; padding: 3px 5px; overflow-wrap: anywhere; white-space: pre-wrap; }
     .block { border: 1px solid var(--vscode-widget-border); border-radius: 6px; padding: 12px; }
+    .verification-panel { display: grid; gap: 12px; }
+    .verification-status-grid { display: grid; grid-template-columns: max-content minmax(0,1fr); gap: 7px 18px; align-items: center; max-width: 430px; padding: 2px 0; }
+    .verification-status-grid .label { font-size: 10px; font-weight: 850; letter-spacing: .55px; text-transform: uppercase; }
+    .verification-status-grid strong { color: var(--sc-text); }
+    .verification-results { padding-top: 12px; border-top: 1px solid var(--sc-border); }
+    .verification-action-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; padding-top: 10px; border-top: 1px solid var(--sc-border); }
+    .verification-action { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; margin: 0; padding: 0 13px; border: 1px solid var(--sc-border); border-radius: 10px; color: var(--sc-primary); background: var(--sc-surface); font: inherit; font-size: 12px; font-weight: 850; line-height: 1; cursor: pointer; }
+    .verification-action:hover { border-color: color-mix(in srgb, var(--sc-primary) 38%, var(--sc-border)); background: var(--sc-primary-soft); }
+    .verification-action:focus-visible { outline: none; border-color: var(--sc-primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc-primary) 20%, transparent); }
+    .verification-action:disabled { cursor: progress; opacity: .72; }
+    .verification-note { flex: 1 1 260px; margin: 0; color: var(--sc-muted); font-size: 11px; line-height: 1.45; }
     a { color: var(--vscode-textLink-foreground); }
     .explanation { margin: 22px 0; padding: 18px; border-radius: 7px; border: 1px solid var(--vscode-widget-border); border-left: 4px solid var(--vscode-focusBorder); background: var(--vscode-editor-inactiveSelectionBackground); }
     .explanation p { font-size: 16px; line-height: 1.55; margin: 8px 0 0; }

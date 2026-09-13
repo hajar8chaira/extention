@@ -88,9 +88,23 @@ function writeDiscoveryFile(record, { home = os.homedir() } = {}) {
     mode: record.mode || 'auto',
     version: record.version || '',
     api_key: record.apiKey || '',
+    // Les origines que Burp peut verser en plus du local : la cible Dynamic
+    // Security autorisée. Réduites à des origines valides, jamais à des URL.
+    capture_origins: [...new Set((Array.isArray(record.captureOrigins) ? record.captureOrigins : [])
+      .map((entry) => { try { return new URL(String(entry)).origin; } catch { return ''; } })
+      .filter((origin) => /^https?:\/\//.test(origin)))],
     updated_at: new Date().toISOString()
   };
-  fs.writeFileSync(file, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
+  // Écrit à côté puis renommé : Burp relit ce fichier à chaque battement, et ne
+  // doit jamais lire une adresse neuve avec une clé tronquée ou ancienne.
+  const staging = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(staging, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.renameSync(staging, file);
+  } catch (error) {
+    try { fs.unlinkSync(staging); } catch { /* déjà parti */ }
+    throw error;
+  }
   try { fs.chmodSync(file, 0o600); } catch { /* best effort on filesystems without modes */ }
   return file;
 }

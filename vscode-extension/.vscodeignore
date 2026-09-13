@@ -10,6 +10,7 @@ tmp/**
 temp/**
 .cache/**
 .pytest_cache/**
+**/__pycache__/**
 .runtime-python/**
 *.log
 *.aux
@@ -33,6 +34,8 @@ benchmarks/**
 # Anciennes copies complètes des sources, conservées hors du paquet : elles
 # doublent le code livré et exposeraient des versions non maintenues.
 .codex-backups/**
+.codex-chrome-profile/**
+.codex-edge-profile/**
 
 # Base d'indexation CodeGraph : artefact de développement, jamais du produit.
 .codegraph/**

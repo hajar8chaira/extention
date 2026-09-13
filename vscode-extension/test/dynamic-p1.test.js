@@ -528,9 +528,14 @@ test('l’inventaire réutilise le moteur d’association existant', () => {
   assert.ok(!/function\s+associationFor/.test(source), 'aucun second moteur d’association');
 });
 
-test('la protection de cible locale du replay reste intacte', () => {
-  const { validateLocalUrl } = require('../src/http-scenarios');
+test('la protection du replay reste intacte : locale libre, distante sur autorisation', () => {
+  const { validateLocalUrl, replayAuthorization, REPLAY_STATE } = require('../src/http-scenarios');
+  // Le validateur strictement local existe toujours pour qui l'exige.
   assert.throws(() => validateLocalUrl('http://example.com/x'), /locales autorisées/);
   assert.throws(() => validateLocalUrl('file:///etc/passwd'), /HTTP et HTTPS/);
   assert.ok(validateLocalUrl('http://127.0.0.1:3000/x'));
+  // Et le replay decide desormais par origine exacte.
+  const scenario = (url) => ({ request: { url, method: 'GET', headers: {} }, response: {} });
+  assert.equal(replayAuthorization(scenario('http://127.0.0.1:3000/x')).state, REPLAY_STATE.ALLOWED);
+  assert.equal(replayAuthorization(scenario('http://example.com/x')).state, REPLAY_STATE.AUTHORIZATION_REQUIRED);
 });

@@ -17,9 +17,18 @@ const {
   buildDeliveryModel, notConfiguredModel
 } = require('./delivery-contract');
 const { jenkinsDeliveryAdapter } = require('./delivery-jenkins');
+const { gitlabDeliveryAdapter } = require('./delivery-gitlab');
+const { githubDeliveryAdapter } = require('./delivery-github');
 const { DELIVERY_CATALOGUE, deliveryCatalogueEntry } = require('./delivery-catalogue');
 
-const ADAPTERS = Object.freeze([jenkinsDeliveryAdapter].map(assertDeliveryAdapter));
+// Catalogue presence and adapter existence stay two separate facts: a platform
+// joins this list the day its adapter is written against the real API, and not
+// before. Azure Pipelines, CircleCI and Bitbucket remain catalogue-only.
+const ADAPTERS = Object.freeze([
+  jenkinsDeliveryAdapter,
+  gitlabDeliveryAdapter,
+  githubDeliveryAdapter
+].map(assertDeliveryAdapter));
 
 /**
  * Implementation state, kept internal.

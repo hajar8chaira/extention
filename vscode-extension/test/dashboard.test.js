@@ -180,14 +180,18 @@ test('affiche la page Dynamic Security et conserve les actions ZAP/Burp', () => 
   assert.match(html, /Requêtes conservées<\/span><strong>1<\/strong>/);
   assert.match(html, /Endpoints uniques<\/span><strong>1<\/strong>/);
   assert.match(html, /GET \/api\/users/);
-  assert.match(html, /<h2>Burp<\/h2>[\s\S]*Connecté/);
+  // La carte porte désormais le nom du produit ; l'invariant testé reste que
+  // l'état de la connexion est rendu avec elle.
+  assert.match(html, /<h2>Burp Suite<\/h2>[\s\S]*CONNECTÉ/);
   assert.match(html, /securityCenter\.openBurpSettingsPage/);
   assert.doesNotMatch(html, /disabled title="Importez d’abord/);
   assert.match(html, /securityCenter\.scanZap/);
   assert.doesNotMatch(html, /securityCenter\.replayHttpScenario/);
   assert.match(html, /Lancer ZAP/);
   assert.match(html, /Voir les findings/);
-  assert.match(html, />Paramètres<\/button>/);
+  // L'action est vérifiée par la commande qu'elle déclenche, pas par son libellé :
+  // la carte Burp s'intitule désormais « Configurer / Connecter ».
+  assert.match(html, /data-command="securityCenter\.openBurpSettingsPage"[^>]*>Configurer \/ Connecter<\/button>/);
 });
 
 test('propose directement le compte ZAP après un refus d’authentification', () => {
@@ -329,7 +333,17 @@ test('construit à la demande un aperçu HTTP sûr, tronqué et lié aux finding
   assert.equal(preview.method, 'GET');
   assert.equal(preview.statusCode, 200);
   assert.equal(preview.responseType, 'application/json');
-  assert.equal(preview.duration, '0 s');
+  // Un échange se mesure en millisecondes : arrondie à la seconde, cette
+  // requête de 145 ms s'affichait « 0 s ».
+  assert.equal(preview.duration, '145 ms');
+  // La durée mesurée par la capture fait autorité quand elle existe…
+  assert.equal(buildSafeHttpPreview({ ...scenario, capture: { duration_ms: 32 } }, findings).duration, '32 ms');
+  // …et une durée réellement absente se dit, au lieu d'être inventée.
+  assert.equal(buildSafeHttpPreview({
+    source: 'burp',
+    request: { method: 'GET', url: 'http://127.0.0.1:3000/a', headers: {}, body: '' },
+    response: { statusCode: 200, headers: {}, body: '{}' }
+  }, []).duration, 'Not available');
   assert.equal(preview.headers.find((header) => header.name === 'authorization').value, '[REDACTED]');
   assert.equal(preview.headers.find((header) => header.name === 'cookie').value, '[REDACTED]');
   assert.equal(preview.parameters.find((parameter) => parameter.name === 'token').value, '[REDACTED]');
@@ -759,6 +773,32 @@ test('Activité de sécurité - unique scan', () => {
   assert.match(html, /cx="260\.00"/);
   assert.doesNotMatch(html, /class="chart-line"/);
   assert.doesNotMatch(html, /fill="url\(#chart-area-gradient\)"/);
+});
+
+test('Activité de sécurité - un scan en échec ne crée pas de chute artificielle à 0', () => {
+  // Historique local réel : des exécutions ZAP en échec enregistrées avec 0 finding
+  // entre des exécutions complètes (207 → 0 → 0 → 209).
+  const zap = (status) => [{ tool: 'ZAP', status }];
+  const findings = (count) => Array.from({ length: count }, (_, i) => ({ id: `f${i}`, tool: 'ZAP', rawSeverity: 'MEDIUM' }));
+  const history = [
+    { savedAt: '2026-09-12T20:03:37Z', findings: findings(207), scanners: zap('completed') },
+    { savedAt: '2026-09-12T20:16:48Z', findings: [], scanners: zap('failed') },
+    { savedAt: '2026-09-12T22:14:45Z', findings: [], scanners: zap('failed') },
+    { savedAt: '2026-09-12T22:20:45Z', findings: findings(209), scanners: zap('completed') }
+  ];
+  const html = renderDashboardHtml(buildDashboardModel([], [], { scanHistory: history }), 'nonce', 'full');
+  const chart = html.slice(html.indexOf('<svg class="activity-chart"'), html.indexOf('</svg>', html.indexOf('<svg class="activity-chart"')));
+  // La courbe ne passe que par les deux exécutions comparables.
+  const line = chart.match(/<path d="([^"]+)" class="chart-line"/);
+  assert.ok(line, 'la courbe relie les exécutions comparables');
+  assert.equal((line[1].match(/ C /g) || []).length, 1, 'un seul segment : 207 → 209');
+  // Les échecs restent visibles, sans valeur : marqueur creux, aucune donnée de comptage.
+  assert.equal((chart.match(/chart-dot-noncomparable/g) || []).length, 2);
+  assert.doesNotMatch(chart, /data-noncomparable="true"[^>]*data-active=/);
+  assert.match(chart, /data-reason="ZAP : failed"/);
+  // La tendance compare 207 et 209, pas 207 et 0.
+  assert.match(html, /\+1 %/);
+  assert.match(html, /sur 2 scans/);
 });
 
 test('Activité de sécurité - script de positionnement tooltip local et clamping', () => {

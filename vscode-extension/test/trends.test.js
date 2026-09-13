@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildTrendReport, renderTrendReportHtml } = require('../src/trends');
+const { buildTrendReport, renderTrendReportHtml, comparabilityRule } = require('../src/trends');
 
 function scan(id, date, findings) {
   return { scan_id: id, result: { finished_at: date, findings } };
@@ -271,6 +271,72 @@ test('real zero finding snapshot can produce a valid trend', () => {
 // NEW TESTS: chart upgrade
 // ============================================================
 
+test('adaptive visualization: 0 comparable snapshots uses compact insufficient-data state', () => {
+  const scans = [
+    scanWithScanners(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }], [{ tool: 'Semgrep', status: 'failed' }]),
+    scanWithScanners(2, '2026-08-02T00:00:00Z', [{ id: 'b', rawSeverity: 'LOW', triageStatus: 'new' }], [{ tool: 'ZAP', status: 'cancelled' }])
+  ];
+  const report = buildTrendReport(scans, [], 90, new Date('2026-08-03T00:00:00Z'));
+  assert.equal(report.comparableCount, 0);
+
+  const html = renderTrendReportHtml({ 7: report }, 'nonce', 'dark');
+  assert.match(html, /function renderCompactTrendState/);
+  assert.match(html, /Pas assez de données pour calculer une tendance\./);
+  assert.match(html, /comparableCount < 2/);
+  assert.match(html, /chartWrapper\.style\.display = 'none'/);
+});
+
+test('adaptive visualization: exactly 1 comparable snapshot reports current count, date, excluded scans, no line chart', () => {
+  const scans = [];
+  for (let i = 1; i <= 14; i++) {
+    const date = new Date(Date.UTC(2026, 7, i, 10, 0, 0)).toISOString();
+    const findings = [{ id: `f${i}`, rawSeverity: 'HIGH', triageStatus: 'new' }];
+    const scanners = i === 14
+      ? [{ tool: 'Semgrep', status: 'completed' }, { tool: 'ZAP', status: 'completed' }]
+      : [{ tool: 'Semgrep', status: 'completed' }];
+    scans.push(scanWithScanners(i, date, findings, scanners));
+  }
+  const report = buildTrendReport(scans, [], 90, new Date('2026-08-15T00:00:00Z'));
+  assert.equal(report.points.length, 14);
+  assert.equal(report.comparableCount, 1);
+
+  const html = renderTrendReportHtml({ 7: report }, 'nonce', 'dark');
+  assert.match(html, /Alertes comparables/);
+  assert.match(html, /Snapshot/);
+  assert.match(html, /Tendance non calculable/);
+  assert.match(html, /Scans exclus/);
+  assert.match(html, /excludedCount/);
+  assert.match(html, /1 \/ ' \+ report\.points\.length \+ ' comparable/);
+});
+
+test('adaptive visualization: 2 comparable snapshots keep real trend chart', () => {
+  const scans = [
+    scanWithScanners(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }], [{ tool: 'Semgrep', status: 'completed' }]),
+    scanWithScanners(2, '2026-08-02T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH', triageStatus: 'new' }, { id: 'b', rawSeverity: 'LOW', triageStatus: 'new' }], [{ tool: 'Semgrep', status: 'completed' }])
+  ];
+  const report = buildTrendReport(scans, [], 90, new Date('2026-08-03T00:00:00Z'));
+  assert.equal(report.comparableCount, 2);
+  const html = renderTrendReportHtml({ 7: report }, 'nonce', 'dark');
+  assert.match(html, /chartWrapper\.style\.display = ''/);
+  assert.match(html, /pathCoords\.length >= 2/);
+  assert.match(html, /Comparable actuel/);
+});
+
+test('adaptive visualization: many comparable snapshots may use the brush, sparse comparable history may not', () => {
+  const now = new Date('2026-08-20T00:00:00Z');
+  const scans = [];
+  for (let i = 0; i < 10; i++) {
+    scans.push(scanWithScanners(i + 1, new Date(now.getTime() - (10 - i) * 86400000).toISOString(), [{ id: `f${i}`, rawSeverity: 'HIGH', triageStatus: 'new' }], [{ tool: 'Semgrep', status: 'completed' }]));
+  }
+  const report = buildTrendReport(scans, [], 90, now);
+  assert.equal(report.comparableCount, 10);
+
+  const html = renderTrendReportHtml({ 7: report }, 'nonce', 'dark');
+  assert.match(html, /const comparablePs = allPoints\.filter\(p => p\.isComparable\)/);
+  assert.match(html, /comparablePs\.length < 8/);
+  assert.match(html, /brushContainer\.style\.display = 'block'/);
+});
+
 test('default visible series: Total, Critical, High enabled — Medium, Low disabled', () => {
   const html = renderTrendReportHtml(
     { 7: buildTrendReport([scan(1, '2026-08-01T00:00:00Z', [])], [], 7, new Date('2026-08-02T00:00:00Z')) },
@@ -291,14 +357,14 @@ test('default visible series: Total, Critical, High enabled — Medium, Low disa
   assert.match(html, /low:\s*false/);
 });
 
-test('chart viewBox is 900x400 (large chart)', () => {
+test('chart keeps the 900x400 drawing coordinate space with a compact wrapper', () => {
   const html = renderTrendReportHtml(
     { 7: buildTrendReport([scan(1, '2026-08-01T00:00:00Z', [])], [], 7, new Date('2026-08-02T00:00:00Z')) },
     'nonce', 'dark'
   );
   assert.match(html, /viewBox="0 0 900 400"/);
-  // Chart wrapper height should be 400px
-  assert.match(html, /height:\s*400px/);
+  assert.match(html, /height:\s*320px/);
+  assert.match(html, /height:\s*340px/);
 });
 
 test('chart footer container exists in HTML output', () => {
@@ -372,7 +438,9 @@ test('non-comparable points: rendered with transparent fill and dashed stroke (n
   // The renderChart script should skip non-comparable from path coordinates
   const html = renderTrendReportHtml({ 7: report }, 'nonce', 'dark');
   assert.match(html, /filter\(cp => cp\.pt\.isComparable\)/);
-  // Non-comparable points get transparent fill and dashed stroke
+  // Non-comparable scans get transparent, dashed status markers, not line values.
+  assert.match(html, /chart-status-marker/);
+  assert.match(html, /padTop \+ plotHeight \+ 25/);
   assert.match(html, /fill', 'transparent'/);
   assert.match(html, /stroke-dasharray', '3,2'/);
 });
@@ -446,13 +514,12 @@ test('brush timeline has drag interaction handlers', () => {
   assert.match(html, /brush-handle/);
 });
 
-test('brush is hidden for fewer than 8 points', () => {
+test('brush is hidden for fewer than 8 comparable points', () => {
   const html = renderTrendReportHtml(
     { 7: buildTrendReport([scan(1, '2026-08-01T00:00:00Z', [])], [], 7, new Date('2026-08-02T00:00:00Z')) },
     'nonce', 'dark'
   );
-  // The threshold is allPoints.length < 8
-  assert.match(html, /allPoints\.length < 8/);
+  assert.match(html, /comparablePs\.length < 8/);
   // Brush starts hidden
   assert.match(html, /id="brush-container" style="display: none;"/);
 });
@@ -491,7 +558,7 @@ test('responsive: chart wrapper has responsive media queries', () => {
   assert.match(html, /@media \(max-width: 768px\)/);
   assert.match(html, /@media \(max-width: 480px\)/);
   // Chart wrapper height changes at breakpoints
-  assert.match(html, /height:\s*280px/);
+  assert.match(html, /height:\s*260px/);
   assert.match(html, /height:\s*220px/);
 });
 
@@ -515,6 +582,63 @@ test('area fill gradient uses fallback hex color for Total series', () => {
   );
   assert.match(html, /colorsFallback\.total/);
   assert.match(html, /total-area-grad/);
+});
+
+test('backend en erreur : le script de la page garde « — » et n’écrit jamais 0', () => {
+  const empty = { 7: buildTrendReport([], [], 7), 30: buildTrendReport([], [], 30), 90: buildTrendReport([], [], 90) };
+  const html = renderTrendReportHtml(empty, 'nonce', 'dark', 'Clé API refusée — http://127.0.0.1:8765 : Backend HTTP 401');
+  // Le rendu serveur affichait « — », puis updateUI() le remplaçait par latest.active (0).
+  assert.match(html, /const historyUnavailable = true;/);
+  assert.match(html, /latest \? latest\.active : '—'/);
+  assert.doesNotMatch(html, /innerText = report\.latest\.active/);
+  assert.match(html, /<strong>Données indisponibles<\/strong>/);
+  assert.match(html, /id="chart-empty" hidden/);
+});
+
+test('aucun snapshot : latest reste null, jamais un zéro inventé', () => {
+  const report = buildTrendReport([], [], 7, new Date('2026-08-03T00:00:00Z'));
+  assert.equal(report.latest, null);
+  assert.equal(report.change, null);
+  assert.equal(report.comparableCount, 0);
+  const html = renderTrendReportHtml({ 7: report }, 'nonce', 'dark', '');
+  assert.match(html, /id="kpi-active-val">—</);
+  assert.match(html, /const historyUnavailable = false;/);
+});
+
+test('la variation se mesure contre le précédent snapshot comparable, pas contre un scan en échec', () => {
+  const scans = [
+    scanWithScanners(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH' }, { id: 'b', rawSeverity: 'HIGH' }], [{ tool: 'ZAP', status: 'completed' }]),
+    scanWithScanners(2, '2026-08-02T00:00:00Z', [], [{ tool: 'ZAP', status: 'failed' }]),
+    scanWithScanners(3, '2026-08-03T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH' }, { id: 'b', rawSeverity: 'HIGH' }, { id: 'c', rawSeverity: 'LOW' }], [{ tool: 'ZAP', status: 'completed' }])
+  ];
+  const report = buildTrendReport(scans, [], 90, new Date('2026-08-04T00:00:00Z'));
+  assert.equal(report.comparableCount, 2);
+  // 3 − 2, et non 3 − 0 : le scan en échec n'est pas une mesure.
+  assert.equal(report.change, 1);
+});
+
+test('la page n’embarque pas la sortie brute des scanners : un </script> ne coupe plus le graphique', () => {
+  const scans = [
+    scanWithScanners(1, '2026-08-01T00:00:00Z', [{ id: 'a', rawSeverity: 'HIGH' }], [
+      { tool: 'ZAP', status: 'completed', output: '<html><script>alert(1)</script></html>', error: '</script><script>x()</script>' }
+    ])
+  ];
+  const report = buildTrendReport(scans, [], 90, new Date('2026-08-02T00:00:00Z'));
+  assert.deepEqual(report.points[0].scanners, [{ tool: 'ZAP', status: 'completed' }]);
+  const html = renderTrendReportHtml({ 7: report, 30: report, 90: report }, 'nonce', 'dark', 'x </script><script>evil()</script>');
+  const script = html.slice(html.indexOf('const reports = '));
+  assert.doesNotMatch(script.slice(0, script.indexOf('\n')), /</);
+  assert.doesNotMatch(html, /<script>evil\(\)/);
+});
+
+test('comparabilityRule : un échec ou une couverture différente n’est jamais comparable', () => {
+  const lists = [
+    [{ tool: 'ZAP', status: 'completed' }],
+    [{ tool: 'ZAP', status: 'failed' }],
+    [{ tool: 'Nuclei', status: 'completed' }]
+  ];
+  const comparable = comparabilityRule(lists);
+  assert.deepEqual(lists.map(comparable), [true, false, false]);
 });
 
 test('old persisted scan compatibility: maps snake_case properties and computes trends correctly', () => {

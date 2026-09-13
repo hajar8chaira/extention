@@ -6,6 +6,15 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
 
+/** JSON safe to embed in an inline script: `<` can never close the script. */
+function scriptJson(value) {
+  // `<` and U+2028/U+2029 become unicode escapes: none can close or break the
+  // inline script. Built from code points so no raw separator sits in this file.
+  const unsafe = new RegExp('[<' + String.fromCharCode(0x2028, 0x2029) + ']', 'g');
+  const escape = (c) => String.fromCharCode(92) + 'u' + c.charCodeAt(0).toString(16).padStart(4, '0');
+  return JSON.stringify(value).replace(unsafe, escape);
+}
+
 const INACTIVE = new Set(['false_positive', 'fixed', 'validated', 'accepted']);
 
 /**
@@ -32,36 +41,47 @@ const RESOLUTION_ACTIONS = new Set([
   'status:validated'
 ]);
 
-function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
-  const cutoff = new Date(now.getTime() - days * 86400000);
-  const ordered = [...scans].filter((scan) => new Date(scan.result.finished_at) >= cutoff)
-    .sort((a, b) => new Date(a.result.finished_at) - new Date(b.result.finished_at));
-  
-  // Get standard/full completed tools across all scans in the period
-  let maxToolsSize = -1;
+/**
+ * Which snapshots measure the same thing.
+ *
+ * A snapshot is comparable when no scanner failed or was cancelled and it
+ * completed exactly the widest scanner set seen in the series. A failed run
+ * carries no findings for the tool that failed: plotting it would draw a drop
+ * to 0 that never happened (210 → 0 → 210). Shared by Trends and the Dashboard
+ * activity graph so both apply one rule.
+ *
+ * @param {Array<Array<{tool: string, status: string}>>} scannerLists
+ * @returns {(scanners: Array<{tool: string, status: string}>) => boolean}
+ */
+function comparabilityRule(scannerLists) {
+  const completedTools = (scanners) => new Set((scanners || []).filter((s) => s.status === 'completed').map((s) => s.tool));
   let targetTools = new Set();
-  
-  ordered.forEach(scan => {
-    const scanners = scan.result.scanners || [];
-    const completed = new Set(scanners.filter(s => s.status === 'completed').map(s => s.tool));
-    if (completed.size > maxToolsSize) {
-      maxToolsSize = completed.size;
+  let seen = false;
+  for (const scanners of scannerLists) {
+    const completed = completedTools(scanners);
+    if (!seen || completed.size > targetTools.size) {
       targetTools = completed;
+      seen = true;
     }
-  });
-  
-  const isScanComparable = (scan) => {
-    const scanners = scan.result.scanners || [];
-    const hasFailedOrCancelled = scanners.some(s => s.status === 'failed' || s.status === 'cancelled');
-    if (hasFailedOrCancelled) return false;
-    
-    const completed = new Set(scanners.filter(s => s.status === 'completed').map(s => s.tool));
+  }
+  return (scanners) => {
+    if ((scanners || []).some((s) => s.status === 'failed' || s.status === 'cancelled')) return false;
+    const completed = completedTools(scanners);
     if (completed.size !== targetTools.size) return false;
     for (const tool of targetTools) {
       if (!completed.has(tool)) return false;
     }
     return true;
   };
+}
+
+function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
+  const cutoff = new Date(now.getTime() - days * 86400000);
+  const ordered = [...scans].filter((scan) => new Date(scan.result.finished_at) >= cutoff)
+    .sort((a, b) => new Date(a.result.finished_at) - new Date(b.result.finished_at));
+
+  const comparable = comparabilityRule(ordered.map((scan) => scan.result.scanners || []));
+  const isScanComparable = (scan) => comparable(scan.result.scanners || []);
 
   const points = ordered.map((scan) => {
     const active = scan.result.findings.filter((finding) => !INACTIVE.has(finding.triageStatus));
@@ -74,7 +94,10 @@ function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
       high: active.filter((finding) => ['HIGH', 'ERROR'].includes(String(finding.rawSeverity).toUpperCase())).length,
       medium: active.filter((finding) => ['MEDIUM', 'WARNING'].includes(String(finding.rawSeverity).toUpperCase())).length,
       low: active.filter((finding) => !['CRITICAL', 'HIGH', 'ERROR', 'MEDIUM', 'WARNING'].includes(String(finding.rawSeverity).toUpperCase())).length,
-      scanners: scan.result.scanners || [],
+      // Only what comparability needs. The raw scanner payload (tool output, target
+      // HTML) was embedded in the page script: 27 MB for 14 real scans, and a
+      // `</script>` inside a ZAP response ended the script before the chart drew.
+      scanners: (scan.result.scanners || []).map((scanner) => ({ tool: scanner.tool, status: scanner.status })),
       isComparable: isScanComparable(scan)
     };
   });
@@ -149,10 +172,22 @@ function buildTrendReport(scans, auditEvents, days = 90, now = new Date()) {
   }
 
   const mttrHours = resolutionHours.length ? resolutionHours.reduce((sum, value) => sum + value, 0) / resolutionHours.length : null;
-  const latest = points.at(-1) || { active: 0, critical: 0, high: 0, medium: 0, low: 0 };
-  const previous = points.at(-2);
-  
-  return { days, points, latest, change: previous ? latest.active - previous.active : null, mttrHours, resolvedCount: resolutionHours.length };
+  // No snapshot means nothing was measured: `latest` stays null so no page can
+  // present it as « 0 alerte ». The change is only measured between comparable
+  // snapshots, never against a failed or partial run.
+  const latest = points.at(-1) || null;
+  const comparablePoints = points.filter((point) => point.isComparable);
+  const previousComparable = latest?.isComparable && comparablePoints.length >= 2 ? comparablePoints.at(-2) : null;
+
+  return {
+    days,
+    points,
+    latest,
+    comparableCount: comparablePoints.length,
+    change: previousComparable ? latest.active - previousComparable.active : null,
+    mttrHours,
+    resolvedCount: resolutionHours.length
+  };
 }
 
 /**
@@ -166,15 +201,17 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
   if (reports && (reports.points || reports.latest)) {
     reportsObj = { 7: reports, 30: reports, 90: reports };
   }
-  const defaultReport = reportsObj[7] || { latest: { active: 0, critical: 0, high: 0, medium: 0, low: 0 }, change: null, mttrHours: null, resolvedCount: 0, points: [] };
+  const defaultReport = reportsObj[7] || { latest: null, change: null, mttrHours: null, resolvedCount: 0, points: [] };
   // Backend injoignable : aucune mesure n'a ete faite. Un « 0 » affirmerait
   // qu'aucune alerte n'est active, ce que rien n'etablit. « — » est le seul
   // rendu honnete, et c'est deja celui du MTTR juste en dessous. Un 0 sur
-  // cette page ne doit representer qu'un zero reellement observe.
+  // cette page ne doit representer qu'un zero reellement observe — ni un
+  // backend en erreur, ni une periode sans snapshot.
   const historyUnavailable = Boolean(backendError);
-  const initialActive = historyUnavailable ? '—' : defaultReport.latest.active;
-  const initialCritical = historyUnavailable ? '—' : defaultReport.latest.critical;
-  const initialCritHigh = historyUnavailable ? '—' : defaultReport.latest.critical + defaultReport.latest.high;
+  const initialLatest = historyUnavailable ? null : defaultReport.latest;
+  const initialActive = initialLatest ? initialLatest.active : '—';
+  const initialCritical = initialLatest ? initialLatest.critical : '—';
+  const initialCritHigh = initialLatest ? initialLatest.critical + initialLatest.high : '—';
 
   let initialMttr = '—';
   let initialMttrSub = 'Temps moyen de résolution';
@@ -188,7 +225,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
 
   const sortedPoints = [...defaultReport.points].reverse();
   const recentScansPts = sortedPoints.slice(0, 5);
-  const initialRecentScans = recentScansPts.length === 0
+  const initialRecentScans = historyUnavailable
+    ? '<li class="recent-scan-item" style="color: var(--vscode-descriptionForeground)">Données indisponibles.</li>'
+    : recentScansPts.length === 0
     ? '<li class="recent-scan-item" style="color: var(--vscode-descriptionForeground)">Aucune analyse enregistrée.</li>'
     : recentScansPts.map(pt => {
         const trend = pt.trend || { display: '—', color: 'muted', tooltip: '' };
@@ -219,7 +258,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
         `;
       }).join('');
 
-  const initialRows = defaultReport.points.length === 0
+  const initialRows = historyUnavailable
+    ? '<tr><td colspan="8" style="text-align: center; color: var(--vscode-descriptionForeground)">Données indisponibles.</td></tr>'
+    : defaultReport.points.length === 0
     ? '<tr><td colspan="8" style="text-align: center; color: var(--vscode-descriptionForeground)">Aucun scan dans cette période.</td></tr>'
     : defaultReport.points.map(pt => {
       const trend = pt.trend || { display: '—', color: 'muted', tooltip: '' };
@@ -246,7 +287,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
     return `${count} snapshot${count > 1 ? 's' : ''} • dernière analyse ${dateStr}`;
   };
 
-  const initialSummary = getChartSummary(defaultReport.points);
+  const initialSummary = historyUnavailable ? '— • données indisponibles' : getChartSummary(defaultReport.points);
 
   const content = `
   ${backendError ? `<section class="backend-banner" role="alert"><strong>Backend indisponible</strong><p>${escapeHtml(backendError)}</p><p class="backend-hint">Les tendances nécessitent l’historique persistant du backend. Tant qu’il ne répond pas, aucune tendance n’est calculée et aucun indicateur n’est estimé à sa place — les compteurs affichent «&nbsp;—&nbsp;» et non zéro.</p><div class="backend-actions"><button data-command="securityCenter.showTrends">Réessayer</button><button data-command="securityCenter.configureBackend">Configurer le backend</button></div></section>` : ''}
@@ -316,6 +357,8 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       <svg class="trend-chart" id="svg-chart" viewBox="0 0 900 400" preserveAspectRatio="xMidYMid meet"></svg>
       <div class="trend-tooltip" id="tooltip"></div>
     </div>
+    <!-- Empty / error state: replaces the chart instead of an empty 400px frame -->
+    <div class="chart-empty-state" id="chart-empty" hidden></div>
 
     <!-- Brush timeline for dense histories -->
     <div class="brush-container" id="brush-container" style="display: none;">
@@ -578,25 +621,27 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       font-weight: 400;
     }
     .comparability-warning {
-      background: var(--vscode-editor-inactiveSelectionBackground, rgba(200, 200, 200, 0.08));
-      border-left: 3px solid var(--vscode-charts-orange, #F59E42);
-      padding: 8px 12px;
+      background: color-mix(in srgb, var(--trend-high) 14%, var(--card-background));
+      border: 1px solid color-mix(in srgb, var(--trend-high) 45%, var(--vscode-panel-border));
+      border-left: 4px solid var(--trend-high);
+      padding: 10px 12px;
       font-size: 12px;
       margin-bottom: 16px;
-      border-radius: 4px;
+      border-radius: 6px;
       color: var(--vscode-foreground);
+      line-height: 1.45;
     }
 
     /* Chart styles */
     .trend-chart-wrapper {
       position: relative;
       width: 100%;
-      height: 400px;
+      height: 320px;
       margin-bottom: 8px;
     }
     @media (min-width: 769px) {
       .trend-chart-wrapper {
-        height: 480px;
+        height: 340px;
       }
     }
     .trend-chart {
@@ -604,6 +649,111 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       height: 100%;
       overflow: visible;
       cursor: crosshair;
+    }
+    .chart-empty-state {
+      padding: 16px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--card-background) 94%, var(--trend-total));
+    }
+    .chart-empty-state[hidden] { display: none; }
+    .chart-empty-state strong {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 14px;
+      color: var(--vscode-foreground);
+    }
+    .chart-empty-state p {
+      margin: 0;
+      line-height: 1.45;
+    }
+    .chart-state-panel {
+      display: grid;
+      gap: 12px;
+    }
+    .chart-state-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }
+    .chart-state-title {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .state-badge {
+      display: inline-flex;
+      align-items: center;
+      align-self: flex-start;
+      border: 1px solid color-mix(in srgb, var(--trend-high) 55%, var(--vscode-panel-border));
+      color: var(--vscode-foreground);
+      background: color-mix(in srgb, var(--trend-high) 16%, transparent);
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .chart-state-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .chart-state-metric {
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--card-background);
+      min-width: 0;
+    }
+    .chart-state-label {
+      display: block;
+      color: var(--vscode-descriptionForeground);
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-bottom: 5px;
+    }
+    .chart-state-value {
+      display: block;
+      color: var(--vscode-foreground);
+      font-size: 16px;
+      font-weight: 700;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+    .scan-status-strip {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+      min-height: 18px;
+      overflow: hidden;
+    }
+    .scan-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex: 0 0 auto;
+      background: var(--trend-total);
+      border: 1px solid var(--trend-total);
+    }
+    .scan-status-dot.non-comparable {
+      background: transparent;
+      border-color: var(--trend-high);
+      border-style: dashed;
+      opacity: 0.9;
+    }
+    .scan-status-more {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-left: 2px;
+      white-space: nowrap;
     }
     .grid-line {
       stroke: var(--vscode-panel-border);
@@ -642,6 +792,13 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       stroke: var(--vscode-descriptionForeground, #a0a0a0) !important;
       stroke-width: 1.5 !important;
       stroke-dasharray: 3,2 !important;
+      pointer-events: auto;
+    }
+    .chart-status-marker {
+      fill: var(--card-background);
+      stroke: var(--trend-high);
+      stroke-width: 1.5;
+      stroke-dasharray: 3,2;
       pointer-events: auto;
     }
     .chart-point.highlighted {
@@ -872,16 +1029,16 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
     .trend-legend {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 24px;
-      justify-content: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      justify-content: flex-start;
       align-items: center;
     }
     .legend-info {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 6px 14px;
+      padding: 5px 9px;
       font-size: 12px;
       font-weight: 500;
       color: var(--vscode-descriptionForeground);
@@ -893,8 +1050,8 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       background: var(--vscode-button-secondaryBackground, rgba(120,120,120,0.1));
       color: var(--vscode-descriptionForeground);
       border: 1px solid var(--vscode-panel-border, transparent);
-      padding: 6px 14px;
-      border-radius: 20px;
+      padding: 5px 10px;
+      border-radius: 6px;
       font-size: 12px;
       font-weight: 500;
       cursor: pointer;
@@ -1009,7 +1166,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
         padding-right: 0;
       }
       .trend-chart-wrapper {
-        height: 280px;
+        height: 260px;
       }
       .brush-container {
         height: 40px;
@@ -1022,6 +1179,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       .trend-chart-wrapper {
         height: 220px;
       }
+      .chart-state-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
       .chart-footer-value {
         font-size: 12px;
       }
@@ -1031,7 +1191,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
     script: `    const vscode = window.__scShellApi || acquireVsCodeApi();
     
     // Loaded reports mapped by days
-    const reports = ${JSON.stringify(reportsObj)};
+    const reports = ${scriptJson(reportsObj)};
+    // The backend history could not be read: every value stays « — ».
+    const historyUnavailable = ${historyUnavailable ? 'true' : 'false'};
     let currentPeriod = 7;
     let activeSeries = {
       total: true,
@@ -1085,6 +1247,15 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       return label;
     }
 
+    function escapeClientHtml(value) {
+      return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+    }
+
+    function formatDateTime(value) {
+      if (!value) return '—';
+      return new Date(value).toLocaleString('fr-FR');
+    }
+
     function getChartSummary(pts) {
       if (pts.length === 0) return '0 snapshot • aucune analyse';
       const count = pts.length;
@@ -1099,13 +1270,18 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       const report = reports[currentPeriod];
       if (!report) return;
 
-      // Update KPIs
-      document.getElementById('kpi-active-val').innerText = report.latest.active;
-      document.getElementById('kpi-critical-val').innerText = report.latest.critical || 0;
-      document.getElementById('kpi-critical-high-val').innerText = (report.latest.critical || 0) + (report.latest.high || 0);
-      
+      // Update KPIs. No reading (backend error, or no snapshot in the period)
+      // is « — », never 0: a 0 here must be a zero that was actually observed.
+      const latest = historyUnavailable ? null : report.latest;
+      document.getElementById('kpi-active-val').innerText = latest ? latest.active : '—';
+      document.getElementById('kpi-critical-val').innerText = latest ? latest.critical : '—';
+      document.getElementById('kpi-critical-high-val').innerText = latest ? latest.critical + latest.high : '—';
+
       const mttrVal = report.mttrHours;
-      if (mttrVal !== null) {
+      if (historyUnavailable) {
+        document.getElementById('kpi-mttr-val').innerText = '—';
+        document.getElementById('kpi-mttr-sub').innerText = 'Historique indisponible';
+      } else if (mttrVal !== null) {
         document.getElementById('kpi-mttr-val').innerText = formatMttr(mttrVal, report.resolvedCount);
         document.getElementById('kpi-mttr-sub').innerText = 'Temps moyen de résolution';
       } else {
@@ -1114,16 +1290,18 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       }
 
       // Update summary above chart
-      document.getElementById('chart-summary-text').innerText = getChartSummary(report.points);
+      document.getElementById('chart-summary-text').innerText = historyUnavailable ? '— • données indisponibles' : getChartSummary(report.points);
 
       // Recent activity (max 5) - compact format
       const listContainer = document.getElementById('recent-activity-list');
       listContainer.innerHTML = '';
-      
+
       const sortedPoints = [...report.points].reverse();
       const recentScans = sortedPoints.slice(0, 5);
 
-      if (recentScans.length === 0) {
+      if (historyUnavailable) {
+        listContainer.innerHTML = '<li class="recent-scan-compact" style="color: var(--vscode-descriptionForeground)">Données indisponibles.</li>';
+      } else if (recentScans.length === 0) {
         listContainer.innerHTML = '<li class="recent-scan-compact" style="color: var(--vscode-descriptionForeground)">Aucune analyse enregistrée.</li>';
       } else {
         recentScans.forEach(pt => {
@@ -1149,7 +1327,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       const tbody = document.getElementById('raw-scans-tbody');
       tbody.innerHTML = '';
       
-      if (report.points.length === 0) {
+      if (historyUnavailable) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--vscode-descriptionForeground)">Données indisponibles.</td></tr>';
+      } else if (report.points.length === 0) {
         tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--vscode-descriptionForeground)">Aucun scan dans cette période.</td></tr>';
       } else {
         report.points.forEach(pt => {
@@ -1204,19 +1384,74 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       return pt[seriesName] || 0;
     }
 
-    // Helper: compute nice rounded Y ticks
-    function niceYTicks(maxVal, count) {
-      if (maxVal <= 0) maxVal = 10;
-      const rawStep = maxVal / (count - 1);
-      const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
-      const niceCandidates = [1, 2, 2.5, 5, 10];
-      let niceStep = magnitude;
-      for (const c of niceCandidates) {
-        if (c * magnitude >= rawStep) { niceStep = c * magnitude; break; }
+    // Why the chart has nothing to draw for this period, or '' when it has.
+    function chartEmptyMessage(report) {
+      if (historyUnavailable) {
+        return '<strong>Données indisponibles</strong>L’historique du backend n’a pas pu être lu : aucune courbe et aucun zéro ne sont affichés à sa place.';
+      }
+      if (!report || report.points.length === 0) {
+        const longer = [30, 90].find((days) => days > currentPeriod && reports[days] && reports[days].points.length > 0);
+        return '<strong>Pas assez de données pour calculer une tendance.</strong>' + (longer
+          ? reports[longer].points.length + ' snapshot(s) disponible(s) sur ' + longer + ' jours.'
+          : 'Aucune analyse n’a encore été enregistrée par le backend.');
+      }
+      return '';
+    }
+
+    function renderScanStatusStrip(points) {
+      if (!points || points.length === 0) return '';
+      const visible = points.slice(-28);
+      const hiddenCount = Math.max(0, points.length - visible.length);
+      const dots = visible.map((pt) => {
+        const label = 'Scan #' + escapeClientHtml(pt.scanId) + ' • ' + formatDateTime(pt.date) + ' • ' + (pt.isComparable ? 'comparable' : 'non comparable');
+        return '<span class="scan-status-dot ' + (pt.isComparable ? 'comparable' : 'non-comparable') + '" title="' + label + '"></span>';
+      }).join('');
+      return '<div class="scan-status-strip" aria-label="Statut de comparabilité des scans">' + dots + (hiddenCount ? '<span class="scan-status-more">+' + hiddenCount + '</span>' : '') + '</div>';
+    }
+
+    function renderCompactTrendState(report, comparablePoints, excludedCount) {
+      if (comparablePoints.length === 0) {
+        const scanLabel = report.points.length + ' scan' + (report.points.length > 1 ? 's' : '');
+        return '<div class="chart-state-panel">' +
+          '<div class="chart-state-header">' +
+            '<div class="chart-state-title"><strong>Pas assez de données pour calculer une tendance.</strong><p>' + scanLabel + ' dans la période, aucun snapshot comparable.</p></div>' +
+            '<span class="state-badge">Tendance non calculable</span>' +
+          '</div>' +
+          renderScanStatusStrip(report.points) +
+        '</div>';
+      }
+
+      const currentComparable = comparablePoints[comparablePoints.length - 1];
+      return '<div class="chart-state-panel">' +
+        '<div class="chart-state-header">' +
+          '<div class="chart-state-title"><strong>Tendance non calculable</strong><p>Un seul snapshot comparable est disponible dans la période sélectionnée.</p></div>' +
+          '<span class="state-badge">1 / ' + report.points.length + ' comparable</span>' +
+        '</div>' +
+        '<div class="chart-state-grid">' +
+          '<div class="chart-state-metric"><span class="chart-state-label">Alertes comparables</span><span class="chart-state-value">' + currentComparable.active + '</span></div>' +
+          '<div class="chart-state-metric"><span class="chart-state-label">Snapshot</span><span class="chart-state-value">' + escapeClientHtml(formatDateTime(currentComparable.date)) + '</span></div>' +
+          '<div class="chart-state-metric"><span class="chart-state-label">Tendance</span><span class="chart-state-value">Non calculable</span></div>' +
+          '<div class="chart-state-metric"><span class="chart-state-label">Scans exclus</span><span class="chart-state-value">' + excludedCount + '</span></div>' +
+        '</div>' +
+        renderScanStatusStrip(report.points) +
+      '</div>';
+    }
+
+    // Helper: Y ticks on an integer step (1, 2, 5 × 10^n), at most 5 intervals,
+    // ending just above the highest value — no half-empty chart above the data.
+    function niceYTicks(maxVal) {
+      if (maxVal <= 0) maxVal = 5;
+      const niceCandidates = [1, 2, 5];
+      let step = 1;
+      search: for (let magnitude = 1; ; magnitude *= 10) {
+        for (const c of niceCandidates) {
+          step = c * magnitude;
+          if (Math.ceil(maxVal / step) <= 5) break search;
+        }
       }
       const ticks = [];
-      for (let i = 0; i < count; i++) {
-        ticks.push(Math.round(niceStep * i));
+      for (let value = 0; value <= Math.ceil(maxVal / step) * step; value += step) {
+        ticks.push(value);
       }
       return ticks;
     }
@@ -1262,8 +1497,10 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       footer.innerHTML = '';
       if (allPoints.length === 0) return;
 
-      const latest = allPoints[allPoints.length - 1];
-      const prevComp = latest.isComparable ? findPrevComparable(allPoints, allPoints.length - 1) : null;
+      const comparable = allPoints.filter(p => p.isComparable);
+      const latest = comparable[comparable.length - 1];
+      const prevComp = comparable.length >= 2 ? comparable[comparable.length - 2] : null;
+      if (!latest) return;
 
       function calculateChange(currVal, prevVal) {
         const diff = currVal - prevVal;
@@ -1276,7 +1513,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       }
 
       const items = [];
-      items.push({ label: 'Actuel', value: String(latest.active), sub: '', cls: '' });
+      items.push({ label: 'Comparable actuel', value: String(latest.active), sub: '', cls: '' });
       if (prevComp) {
         items.push({ label: 'Précédent comparable', value: String(prevComp.active), sub: '', cls: '' });
         
@@ -1325,21 +1562,47 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       pinnedPointIndex = null;
       
       const report = reports[currentPeriod];
-      if (!report || report.points.length === 0) {
-        const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        text.setAttribute('x', '450');
-        text.setAttribute('y', '200');
-        text.setAttribute('text-anchor', 'middle');
-        text.setAttribute('fill', 'var(--vscode-descriptionForeground)');
-        text.setAttribute('font-size', '14');
-        text.textContent = 'Aucune donnée disponible pour cette période';
-        svg.appendChild(text);
+      const chartWrapper = document.getElementById('chart-wrapper');
+      const emptyState = document.getElementById('chart-empty');
+      const legend = document.querySelector('.trend-legend');
+      const emptyMessage = chartEmptyMessage(report);
+      const allPoints = report ? report.points : [];
+      const comparablePoints = allPoints.filter(p => p.isComparable);
+      const comparableCount = comparablePoints.length;
+      const excludedCount = Math.max(0, allPoints.length - comparableCount);
+      const compWarning = document.getElementById('comparability-warning');
+      if (emptyMessage) {
+        // A compact explanation replaces the chart: no empty 400px frame, no
+        // zero line standing in for a measurement that does not exist.
+        chartWrapper.style.display = 'none';
+        legend.style.display = 'none';
+        emptyState.hidden = false;
+        emptyState.innerHTML = emptyMessage;
+        compWarning.style.display = 'none';
         document.getElementById('chart-footer-metrics').innerHTML = '';
         document.getElementById('brush-container').style.display = 'none';
         return;
       }
+      if (comparableCount < 2) {
+        chartWrapper.style.display = 'none';
+        legend.style.display = 'none';
+        emptyState.hidden = false;
+        emptyState.innerHTML = renderCompactTrendState(report, comparablePoints, excludedCount);
+        if (allPoints.length > 0) {
+          compWarning.style.display = 'block';
+          compWarning.innerText = comparableCount + ' snapshot' + (comparableCount > 1 ? 's' : '') + ' comparable' + (comparableCount > 1 ? 's' : '') + ' sur ' + allPoints.length + ' — la courbe reste masquée tant qu’au moins deux snapshots comparables ne sont pas disponibles.';
+        } else {
+          compWarning.style.display = 'none';
+        }
+        document.getElementById('chart-footer-metrics').innerHTML = '';
+        document.getElementById('brush-container').style.display = 'none';
+        updateChartSummary(allPoints);
+        return;
+      }
+      chartWrapper.style.display = '';
+      legend.style.display = '';
+      emptyState.hidden = true;
 
-      const allPoints = report.points;
       const width = 900;
       const height = 400;
       const padLeft = 65;
@@ -1383,22 +1646,18 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       }
 
       // Check comparability counts to show warning banner
-      const compWarning = document.getElementById('comparability-warning');
-      const comparableCount = allPoints.filter(p => p.isComparable).length;
-      if (comparableCount === 1 && allPoints.length > 1) {
+      if (excludedCount > 0) {
         compWarning.style.display = 'block';
-        compWarning.innerText = '1 snapshot comparable sur ' + allPoints.length + ' — davantage de scans complets sont nécessaires pour calculer une tendance fiable.';
-      } else if (comparableCount === 0 && allPoints.length > 0) {
-        compWarning.style.display = 'block';
-        compWarning.innerText = '0 snapshot comparable sur ' + allPoints.length + ' — davantage de scans complets sont nécessaires pour calculer une tendance fiable.';
+        compWarning.innerText = comparableCount + ' snapshots comparables sur ' + allPoints.length + ' — seuls les snapshots comparables forment les lignes; les autres scans sont indiqués comme jalons de statut.';
       } else {
         compWarning.style.display = 'none';
       }
 
-      // Compute maxY from visible points
+      // Compute maxY from visible comparable points only. Non-comparable scans
+      // are status markers, not values in the trend scale.
       let maxY = 0;
       const seriesList = ['total', 'critical', 'high', 'medium', 'low'];
-      visiblePoints.forEach(pt => {
+      visiblePoints.filter(pt => pt.isComparable).forEach(pt => {
         seriesList.forEach(s => {
           if (activeSeries[s]) {
             const v = getSeriesVal(pt, s);
@@ -1409,7 +1668,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       if (maxY === 0) maxY = 10;
 
       // Nice Y-axis ticks
-      const yTicks = niceYTicks(maxY, 6);
+      const yTicks = niceYTicks(maxY);
       const yMax = yTicks[yTicks.length - 1] || maxY;
 
       // Draw Y grid + labels
@@ -1477,6 +1736,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       const targetLabels = wrapperWidth < 500 ? 4 : (wrapperWidth < 700 ? 5 : 7);
       const xLabelTimes = generateXLabels(viewMinT, viewMaxT, targetLabels);
 
+      const usedXLabels = new Set();
       xLabelTimes.forEach(t => {
         const x = viewSpan === 0 ? padLeft + plotWidth / 2 : padLeft + ((t - viewMinT) / viewSpan) * plotWidth;
         if (x < padLeft - 5 || x > width - padRight + 5) return;
@@ -1491,6 +1751,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
         const pad = (n) => String(n).padStart(2, '0');
         const dateStr = pad(d.getDate()) + '/' + pad(d.getMonth() + 1);
         const timeStr = pad(d.getHours()) + ':' + pad(d.getMinutes());
+        const labelKey = viewSpan < 2 * 86400000 ? dateStr + ' ' + timeStr : dateStr;
+        if (usedXLabels.has(labelKey)) return;
+        usedXLabels.add(labelKey);
 
         const tspanDate = document.createElementNS('http://www.w3.org/2000/svg', 'tspan');
         tspanDate.setAttribute('x', x.toFixed(1));
@@ -1503,7 +1766,8 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
         tspanTime.textContent = timeStr;
 
         txt.appendChild(tspanDate);
-        txt.appendChild(tspanTime);
+        // Hours only matter over a short span; over days they are noise.
+        if (viewSpan < 2 * 86400000) txt.appendChild(tspanTime);
         svg.appendChild(txt);
       });
 
@@ -1624,21 +1888,21 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
         });
       });
 
-      // Draw non-comparable points as unique gray markers (only once per scan, at active/total height)
+      // Draw non-comparable scans as status markers below the axis, never at a
+      // finding-count height that could be read as a trend value.
       chartPoints.forEach(cp => {
         if (cp.pt.isComparable) return;
-        const val = getSeriesVal(cp.pt, 'total');
-        const y = padTop + plotHeight - (val / yMax) * plotHeight;
+        const y = padTop + plotHeight + 25;
 
         const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
         circle.setAttribute('cx', cp.x.toFixed(1));
         circle.setAttribute('cy', y.toFixed(1));
-        circle.setAttribute('class', 'chart-point');
+        circle.setAttribute('class', 'chart-point chart-status-marker');
         circle.setAttribute('data-index', cp.index.toString());
         circle.setAttribute('data-series', 'total');
-        circle.setAttribute('r', '4.5');
+        circle.setAttribute('r', '4');
         circle.setAttribute('fill', 'transparent');
-        circle.setAttribute('stroke', 'var(--vscode-descriptionForeground, #a0a0a0)');
+        circle.setAttribute('stroke', 'var(--trend-high)');
         circle.setAttribute('stroke-width', '1.5');
         circle.setAttribute('stroke-dasharray', '3,2');
         svg.appendChild(circle);
@@ -1697,7 +1961,7 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
         tooltip.style.left = leftPos + 'px';
 
         const yVal = getSeriesVal(cp.pt, 'total');
-        const ySvg = padTop + plotHeight - (yVal / yMax) * plotHeight;
+        const ySvg = cp.pt.isComparable ? padTop + plotHeight - (yVal / yMax) * plotHeight : padTop + plotHeight + 25;
         const yPx = (ySvg / height) * svgRect.height;
         if (yPx - tooltip.offsetHeight - 14 > 0) {
           tooltip.style.top = (yPx - tooltip.offsetHeight - 14) + 'px';
@@ -1828,8 +2092,9 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
     function renderBrush(allPoints) {
       const brushContainer = document.getElementById('brush-container');
       const brushSvg = document.getElementById('brush-svg');
+      const comparablePs = allPoints.filter(p => p.isComparable);
 
-      if (allPoints.length < 8) {
+      if (comparablePs.length < 8) {
         brushContainer.style.display = 'none';
         brushRange = null;
         return;
@@ -1854,11 +2119,10 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
       const bMaxT = Math.max(...allTs);
       const bSpan = bMaxT - bMinT;
       let bMaxY = 0;
-      allPoints.forEach(p => { if (p.active > bMaxY) bMaxY = p.active; });
+      comparablePs.forEach(p => { if (p.active > bMaxY) bMaxY = p.active; });
       if (bMaxY === 0) bMaxY = 10;
 
-      const comparablePs = allPoints.filter(p => p.isComparable);
-      if (comparablePs.length > 1) {
+      if (comparablePs.length > 1 && bSpan > 0) {
         let d = '';
         comparablePs.forEach((p, i) => {
           const t = new Date(p.date).getTime();
@@ -1994,4 +2258,4 @@ function renderTrendReportHtml(reports, nonce, selectedTheme = 'light', backendE
   });
 }
 
-module.exports = { RESOLUTION_ACTIONS, buildTrendReport, renderTrendReportHtml };
+module.exports = { RESOLUTION_ACTIONS, comparabilityRule, buildTrendReport, renderTrendReportHtml };
