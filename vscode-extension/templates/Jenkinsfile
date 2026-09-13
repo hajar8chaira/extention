@@ -979,6 +979,26 @@ pipeline {
               def scenterHome = env.SCENTER_HOME ?: "${env.JENKINS_HOME ?: '/var/jenkins_home'}/.security-center"
               def enginePrefix = env.SCENTER_ENGINE_PREFIX ?: (env.SCENTER_HOME ? "${scenterHome}/engine" : (env.SCENTER_TOOLS_DIR ? "${env.SCENTER_TOOLS_DIR}/security-center" : "${scenterHome}/engine"))
               env.SC_ENGINE_BIN = "${enginePrefix}/bin"
+              // Le Node.js du runtime, résolu comme le bootstrap : `security-center`
+              // démarre par #!/usr/bin/env node et doit le trouver dans PATH.
+              env.SC_NODE_BIN = sh(returnStdout: true, label: 'Resolve Node.js for Security Center', script: '''
+                set +x
+                node_bin=""
+                if [ -n "${SCENTER_NODE_HOME:-}" ]; then
+                  for candidate in "$SCENTER_NODE_HOME/bin/node" "$SCENTER_NODE_HOME/node"; do
+                    if [ -x "$candidate" ]; then node_bin="$candidate"; break; fi
+                  done
+                else
+                  candidate="${SCENTER_TOOLS_DIR:-/var/jenkins_home/tools}/node22/bin/node"
+                  if [ -x "$candidate" ]; then node_bin="$candidate"; fi
+                fi
+                if [ -z "$node_bin" ]; then node_bin="$(command -v node 2>/dev/null || true)"; fi
+                if [ -z "$node_bin" ] || ! "$node_bin" --version >/dev/null 2>&1; then
+                  echo "Security Center : Node.js introuvable sur ce runtime CI (SCENTER_NODE_HOME=${SCENTER_NODE_HOME:-non défini}). Relancez Configure CI Runtime." >&2
+                  exit 1
+                fi
+                dirname "$node_bin"
+              ''').trim()
               // Le commit résolu par l'agent principal, sans reclone complet.
               scenterCheckoutAnalysedCommit()
               // Les preuves d'un build précédent ne doivent jamais être attribuées à celui-ci.
@@ -1044,7 +1064,7 @@ pipeline {
               }
 
               withCredentials(bindings) {
-                withEnv(["PATH+SCENTER_ENGINE=${env.SC_ENGINE_BIN}"]) {
+                withEnv(["PATH+SCENTER_ENGINE=${env.SC_ENGINE_BIN}", "PATH+SCENTER_NODE=${env.SC_NODE_BIN}"]) {
                   // `returnStatus` : on LIT le code de sortie au lieu de laisser Jenkins
                   // interrompre le pipeline avant l'archivage des preuves.
                   def status = sh(

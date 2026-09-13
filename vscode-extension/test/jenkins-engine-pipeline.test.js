@@ -311,7 +311,7 @@ test('le pipeline suit exactement le flux attendu', () => {
   assert.doesNotMatch(JENKINSFILE, /SCENTER_TOOLS_DIR = '|tools\/security-center\/bin/);
   assert.match(JENKINSFILE, /def scenterHome = env\.SCENTER_HOME \?: "\$\{env\.JENKINS_HOME \?: '\/var\/jenkins_home'\}\/\.security-center"/);
   assert.match(JENKINSFILE, /def enginePrefix = env\.SCENTER_ENGINE_PREFIX \?: \(env\.SCENTER_HOME \? "\$\{scenterHome\}\/engine" : \(env\.SCENTER_TOOLS_DIR \? "\$\{env\.SCENTER_TOOLS_DIR\}\/security-center" : "\$\{scenterHome\}\/engine"\)\)/);
-  assert.match(JENKINSFILE, /withEnv\(\["PATH\+SCENTER_ENGINE=\$\{env\.SC_ENGINE_BIN\}"\]\) \{\s*\/\/[^\n]*\n[^\n]*\n\s*def status = sh\(\s*returnStatus: true,\s*label: 'Security Center Analysis'/);
+  assert.match(JENKINSFILE, /withEnv\(\["PATH\+SCENTER_ENGINE=\$\{env\.SC_ENGINE_BIN\}", "PATH\+SCENTER_NODE=\$\{env\.SC_NODE_BIN\}"\]\) \{\s*\/\/[^\n]*\n[^\n]*\n\s*def status = sh\(\s*returnStatus: true,\s*label: 'Security Center Analysis'/);
   assert.match(JENKINSFILE, /triggers \{\s*pollSCM\('H\/2 \* \* \* \*'\)\s*\}/);
   assert.match(JENKINSFILE, /git\(repository\)/);
   assert.doesNotMatch(JENKINSFILE_CODE, /vscode-extension|npm pack|docker exec/);
