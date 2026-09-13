@@ -198,7 +198,7 @@ test('manifest registers Delivery provider configuration keys and no Delivery se
   assert.equal(manifest.preview, true);
   assert.equal(manifest.pricing, 'Free');
   assert.equal(manifest.publisher, 'ChairaHajar');
-  assert.equal(manifest.version, '0.9.0');
+  assert.equal(manifest.version, '1.0.0');
 });
 
 test('no build is not rendered as failed and offline is not a failed pipeline', () => {

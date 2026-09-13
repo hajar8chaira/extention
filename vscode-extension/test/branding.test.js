@@ -76,7 +76,7 @@ test('le manifeste porte l’icône SCenter sans casser la compatibilité', () =
   // continuer à être la même extension après cette mise à jour.
   assert.equal(manifest.name, 'security-center-vscode');
   assert.equal(manifest.publisher, 'ChairaHajar');
-  assert.equal(manifest.version, '0.9.0');
+  assert.equal(manifest.version, '1.0.0');
 });
 
 test('la barre d activites emploie la variante SVG monochrome, jamais un PNG', () => {
