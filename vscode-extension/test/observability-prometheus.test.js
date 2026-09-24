@@ -22,7 +22,7 @@ const path = require('path');
 
 const {
   PROMETHEUS_STATUS, METRIC_REASON, fetchPrometheusStatus,
-  valuesByInstance, valuesByFilesystem, pairedFilesystems, selectHost, targetsFrom, unknownTargets
+  valuesByInstance, valuesByFilesystem, pairedFilesystems, selectHost, targetsFrom, unknownTargets, secondsAgo
 } = require('../src/integrations/observability');
 const { IntegrationHttpError } = require('../src/integrations/http');
 
@@ -301,6 +301,13 @@ test('O1 : l inventaire ne designe plus une cible arbitraire comme « l hote »'
   assert.equal(targets.up, 1);
   assert.equal(targets.total, 2);
   assert.equal(targets.items.length, 2);
+});
+
+test('O1 : lastScrape protege un leger decalage futur sans toucher au passe', () => {
+  const now = Date.parse('2026-08-20T10:00:30Z');
+
+  assert.equal(secondsAgo('2026-08-20T10:00:49Z', now), 0);
+  assert.equal(secondsAgo('2026-08-20T10:00:08Z', now), 22);
 });
 
 // ===========================================================================

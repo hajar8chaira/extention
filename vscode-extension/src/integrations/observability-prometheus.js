@@ -174,8 +174,8 @@ function secondsAgo(value, now = Date.now()) {
   const scrapeMs = new Date(value || '').getTime();
   const nowMs = Number(now);
   if (!Number.isFinite(scrapeMs) || !Number.isFinite(nowMs)) return null;
-  const seconds = (nowMs - scrapeMs) / 1000;
-  return seconds < 0 && seconds > -1 ? 0 : Math.round(seconds);
+  const diffSeconds = Math.floor((nowMs - scrapeMs) / 1000);
+  return Math.max(0, diffSeconds);
 }
 
 // ---------------------------------------------------------------------------
