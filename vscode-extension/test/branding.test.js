@@ -20,6 +20,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const manifest = require('../package.json');
+const expectedExtensionVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
 const { renderSidebarLauncherHtml } = require('../src/sidebar-launcher');
 const { renderSecurityCenterShell } = require('../src/security-center-shell');
 const { renderDashboardHtml, buildDashboardModel } = require('../src/dashboard');
@@ -76,7 +77,7 @@ test('le manifeste porte l’icône SCenter sans casser la compatibilité', () =
   // continuer à être la même extension après cette mise à jour.
   assert.equal(manifest.name, 'security-center-vscode');
   assert.equal(manifest.publisher, 'ChairaHajar');
-  assert.equal(manifest.version, '1.0.0');
+  assert.equal(manifest.version, expectedExtensionVersion);
 });
 
 test('la barre d activites emploie la variante SVG monochrome, jamais un PNG', () => {

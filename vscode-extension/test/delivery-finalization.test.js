@@ -18,6 +18,7 @@ const { deliveryAdapter, deliveryProvider } = require('../src/integrations/deliv
 const { buildDashboardModel, renderDashboardHtml } = require('../src/dashboard');
 const { renderIntegrationPageHtml } = require('../src/integrations-page');
 const manifest = require('../package.json');
+const expectedExtensionVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
 
 const syntheticDelivery = (extra = {}) => buildDeliveryModel({
   providerId: 'gitlab-ci',
@@ -198,7 +199,7 @@ test('manifest registers Delivery provider configuration keys and no Delivery se
   assert.equal(manifest.preview, true);
   assert.equal(manifest.pricing, 'Free');
   assert.equal(manifest.publisher, 'ChairaHajar');
-  assert.equal(manifest.version, '1.0.0');
+  assert.equal(manifest.version, expectedExtensionVersion);
 });
 
 test('no build is not rendered as failed and offline is not a failed pipeline', () => {
