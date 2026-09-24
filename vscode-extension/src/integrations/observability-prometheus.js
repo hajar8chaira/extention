@@ -171,9 +171,11 @@ function inventoryFrom(payload) {
 }
 
 function secondsAgo(value, now = Date.now()) {
-  const time = Date.parse(value || '');
-  if (!Number.isFinite(time)) return null;
-  return Math.max(0, Math.round((now - time) / 1000));
+  const scrapeMs = new Date(value || '').getTime();
+  const nowMs = Number(now);
+  if (!Number.isFinite(scrapeMs) || !Number.isFinite(nowMs)) return null;
+  const seconds = (nowMs - scrapeMs) / 1000;
+  return seconds < 0 && seconds > -1 ? 0 : Math.round(seconds);
 }
 
 // ---------------------------------------------------------------------------

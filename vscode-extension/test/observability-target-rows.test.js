@@ -48,6 +48,16 @@ const vector = (samples) => ({
 
 const scrapedAt = () => new Date(Date.now() - 9000).toISOString();
 
+async function withNow(iso, run) {
+  const original = Date.now;
+  Date.now = () => Date.parse(iso);
+  try {
+    return await run();
+  } finally {
+    Date.now = original;
+  }
+}
+
 const target = (instance, job, extra = {}) => ({
   labels: { instance, job },
   health: 'up',
@@ -120,6 +130,40 @@ test('cibles : la date de collecte reelle est affichee', async () => {
     assert.match(row, /Last scrape: \d+ seconds? ago/);
     assert.doesNotMatch(row, /Last scrape: Unavailable/);
   }
+});
+
+test('cibles : un lastScrape RFC3339 en Z est lu comme un instant absolu', async () => {
+  await withNow('2026-08-20T10:00:20Z', async () => {
+    const rows = rowsOf(await read(server({
+      metricHost: '',
+      targets: [target(FICTIONAL.selfInstance, FICTIONAL.selfJob, { lastScrape: '2026-08-20T10:00:08Z' })]
+    })));
+
+    assert.match(rows[0], /Last scrape: 12 seconds ago/);
+    assert.doesNotMatch(rows[0], /Last scrape: -\d+ seconds ago/);
+  });
+});
+
+test('cibles : un lastScrape avec offset explicite ne subit aucun decalage horaire ajoute', async () => {
+  await withNow('2026-08-20T10:00:20Z', async () => {
+    const rows = rowsOf(await read(server({
+      metricHost: '',
+      targets: [target(FICTIONAL.selfInstance, FICTIONAL.selfJob, { lastScrape: '2026-08-20T11:00:08+01:00' })]
+    })));
+
+    assert.match(rows[0], /Last scrape: 12 seconds ago/);
+    assert.doesNotMatch(rows[0], /Last scrape: -35\d\d seconds ago/);
+    assert.doesNotMatch(rows[0], /Last scrape: 36\d\d seconds ago/);
+  });
+});
+
+test('cibles : les lignes reutilisent le calcul Prometheus sans recalcul timezone local', () => {
+  const pages = source('src/enterprise-domain-pages.js');
+  const rows = pages.slice(pages.indexOf('function targetRows'), pages.indexOf('function hostHealthSubtitle'));
+
+  assert.match(rows, /secondsAgo\(entity\.lastSeen\)/);
+  assert.doesNotMatch(rows, /Date\.parse\(entity\.lastSeen\)/);
+  assert.doesNotMatch(rows, /getTimezoneOffset|toLocaleString/);
 });
 
 test('cibles : 2/2 UP en resume et UP sur chaque ligne', async () => {

@@ -2,7 +2,7 @@
 
 const { compactIcon, renderSecurityCenterShell } = require('./security-center-shell');
 const {
-  PROMETHEUS_STATUS, buildPrometheusStatus, displaySecondsAgo,
+  PROMETHEUS_STATUS, buildPrometheusStatus, displaySecondsAgo, secondsAgo,
   OBSERVABILITY_PROVIDERS, observabilityProvider, observabilityAdapter,
   isSupportedObservabilityProvider, supportedObservabilityProviders, plannedObservabilityProviders,
   resolveCapabilities: resolveObservabilityCapabilities, visibleSections: visibleObservabilitySections,
@@ -868,7 +868,7 @@ function targetRows(model) {
     <div><strong>${escapeHtml(entity.name || 'Monitored target')}</strong><span>${escapeHtml(entity.endpoint)}</span></div>
     <em class="${entity.healthy ? 'ok' : 'bad'}">● ${escapeHtml((entity.status || 'unknown').toUpperCase())}</em>
     <span>${escapeHtml(entity.identifier || 'Instance unavailable')}</span>
-    <span>Last scrape: ${escapeHtml(entity.lastSeen ? displaySecondsAgo((Date.now() - Date.parse(entity.lastSeen)) / 1000) : 'Unavailable')}</span>
+    <span>Last scrape: ${escapeHtml(entity.lastSeen ? displaySecondsAgo(secondsAgo(entity.lastSeen)) : 'Unavailable')}</span>
   </article>`).join('') || '<div class="empty-state">No targets returned by the observability provider.</div>';
 }
 
